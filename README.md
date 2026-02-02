@@ -12,7 +12,7 @@ A hybrid Java/Python application for video annotation and particle tracking in b
 ### One-Command Installation
 
 ```bash
-./quickstart.sh
+bash quickstart.sh
 ```
 
 That's it! The script will:
