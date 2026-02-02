@@ -1,0 +1,20023 @@
+package com.ripple;
+
+import ij.IJ;
+import ij.ImagePlus;
+import ij.io.FileInfo;
+import ij.io.FileOpener;
+import ij.io.Opener;
+import ij.plugin.frame.ContrastAdjuster;
+import ij.process.ImageProcessor;
+
+import javax.swing.*;
+import javax.swing.filechooser.FileNameExtensionFilter;
+import javax.swing.event.PopupMenuListener;
+import javax.swing.event.PopupMenuEvent;
+import java.awt.*;
+import java.awt.event.*;
+import java.awt.geom.AffineTransform;
+import java.awt.image.BufferedImage;
+import java.io.*;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.net.StandardProtocolFamily;
+import java.net.UnixDomainSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.SocketChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import javax.swing.Timer;
+import java.util.*;
+import java.util.List;
+import java.util.Properties;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.json.JSONArray;
+import org.json.JSONObject;
+import org.json.JSONException;
+import javax.swing.event.ChangeListener;
+import javax.swing.event.ChangeEvent;
+
+
+public class VideoAnnotationTool {
+    private JFrame frame;
+    private JLabel imageLabel;
+    private JLabel statusLabel;
+    private BufferedImage currentImage;
+    private double zoomFactor = 1.0;
+    private double imageOffsetX = 0.0;  // Horizontal translation for viewport centering and panning operations
+    private double imageOffsetY = 0.0;  // Vertical translation for viewport centering and panning operations
+    private ImagePlus imp;
+    
+    // Execution mode (set by RIPPLE_MODE environment variable from launcher)
+    // Determines which features are available in the UI
+    private static final String executionMode = detectExecutionMode();
+    private static final boolean isGpuAvailable = Constants.MODE_GPU.equals(executionMode);
+    private static final boolean isCpuOnly = !isGpuAvailable;
+    
+    /**
+     * Detect the execution mode from the RIPPLE_MODE environment variable.
+     * Falls back to CPU mode if not set.
+     */
+    private static String detectExecutionMode() {
+        String mode = System.getenv(Constants.ENV_RIPPLE_MODE);
+        if (mode == null || mode.isEmpty()) {
+            // Try system property as fallback
+            mode = System.getProperty("ripple.mode", Constants.MODE_CPU);
+        }
+        // Normalize and validate
+        mode = mode.toLowerCase().trim();
+        if (!mode.equals(Constants.MODE_GPU) && !mode.equals(Constants.MODE_CPU)) {
+            System.out.println("[RIPPLE] Unknown execution mode: " + mode + ", defaulting to CPU");
+            mode = Constants.MODE_CPU;
+        }
+        System.out.println("[RIPPLE] Running in " + mode.toUpperCase() + " mode");
+        return mode;
+    }
+    
+    /**
+     * Check if a flow method requires GPU and is therefore unavailable in CPU mode.
+     */
+    private static boolean isGpuOnlyFlowMethod(String method) {
+        for (String gpuMethod : Constants.GPU_ONLY_FLOW_METHODS) {
+            if (gpuMethod.equals(method)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    /**
+     * Check if an interpolation kernel requires GPU and is therefore unavailable in CPU mode.
+     */
+    private static boolean isGpuOnlyKernel(String kernel) {
+        for (String gpuKernel : Constants.GPU_ONLY_KERNELS) {
+            if (gpuKernel.equals(kernel)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    /**
+     * Get the default optical flow method based on execution mode.
+     * Returns DIS for CPU mode (OpenCV-based, works on CPU).
+     * Returns RAFT for GPU mode (requires CUDA).
+     */
+    private static String getDefaultFlowMethod() {
+        return isCpuOnly ? Constants.FLOW_METHOD_DIS : Constants.FLOW_METHOD_RAFT;
+    }
+    
+    /**
+     * Get the total system memory in GB.
+     * Used to auto-detect if incremental allocation should be enabled.
+     * Tries multiple approaches for cross-platform compatibility.
+     */
+    private static double getSystemMemoryGB() {
+        // Method 1: Try com.sun.management.OperatingSystemMXBean (works on most JVMs)
+        try {
+            java.lang.management.OperatingSystemMXBean osBean = 
+                java.lang.management.ManagementFactory.getOperatingSystemMXBean();
+            // Use reflection to avoid compile-time dependency on com.sun.management
+            java.lang.reflect.Method method = osBean.getClass().getMethod("getTotalMemorySize");
+            method.setAccessible(true);
+            long totalMem = (Long) method.invoke(osBean);
+            if (totalMem > 0) {
+                return totalMem / (1024.0 * 1024.0 * 1024.0);
+            }
+        } catch (Exception ignored) {
+            // Method not available, try fallback
+        }
+        
+        // Method 2: Try getTotalPhysicalMemorySize (older JDKs)
+        try {
+            java.lang.management.OperatingSystemMXBean osBean = 
+                java.lang.management.ManagementFactory.getOperatingSystemMXBean();
+            java.lang.reflect.Method method = osBean.getClass().getMethod("getTotalPhysicalMemorySize");
+            method.setAccessible(true);
+            long totalMem = (Long) method.invoke(osBean);
+            if (totalMem > 0) {
+                return totalMem / (1024.0 * 1024.0 * 1024.0);
+            }
+        } catch (Exception ignored) {
+            // Method not available, try fallback
+        }
+        
+        // Method 3: Platform-specific commands
+        String osName = System.getProperty("os.name", "").toLowerCase();
+        try {
+            if (osName.contains("linux")) {
+                // Linux: read /proc/meminfo
+                java.io.BufferedReader reader = new java.io.BufferedReader(
+                    new java.io.FileReader("/proc/meminfo"));
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (line.startsWith("MemTotal:")) {
+                        // Format: "MemTotal:       16384000 kB"
+                        String[] parts = line.split("\\s+");
+                        if (parts.length >= 2) {
+                            long kB = Long.parseLong(parts[1]);
+                            reader.close();
+                            return kB / (1024.0 * 1024.0);
+                        }
+                    }
+                }
+                reader.close();
+            } else if (osName.contains("mac") || osName.contains("darwin")) {
+                // macOS: use sysctl
+                Process proc = Runtime.getRuntime().exec(new String[]{"sysctl", "-n", "hw.memsize"});
+                java.io.BufferedReader reader = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(proc.getInputStream()));
+                String line = reader.readLine();
+                reader.close();
+                proc.waitFor();
+                if (line != null && !line.isEmpty()) {
+                    return Long.parseLong(line.trim()) / (1024.0 * 1024.0 * 1024.0);
+                }
+            } else if (osName.contains("win")) {
+                // Windows: use wmic
+                Process proc = Runtime.getRuntime().exec(
+                    new String[]{"wmic", "ComputerSystem", "get", "TotalPhysicalMemory"});
+                java.io.BufferedReader reader = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(proc.getInputStream()));
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    line = line.trim();
+                    if (!line.isEmpty() && !line.startsWith("Total")) {
+                        try {
+                            long bytes = Long.parseLong(line);
+                            reader.close();
+                            proc.waitFor();
+                            return bytes / (1024.0 * 1024.0 * 1024.0);
+                        } catch (NumberFormatException ignored) {}
+                    }
+                }
+                reader.close();
+                proc.waitFor();
+            }
+        } catch (Exception ignored) {
+            // Platform-specific approach failed
+        }
+        
+        // Fallback: Return 32GB (threshold value) so auto-detection won't trigger incremental
+        // This is safer than returning JVM heap which is often only 4-8GB
+        System.err.println("Warning: Could not detect system memory. Using 32GB default.");
+        return 32.0;
+    }
+    
+    // Zoom level limits (matching ImageJ's approach for stability at high zoom)
+    private static final double MIN_ZOOM = 1.0 / 72.0;  // ~1.4%
+    private static final double MAX_ZOOM = 32.0;  // 3200%
+    
+    // ====== COORDINATE CONVERSION HELPERS ======
+    // These methods ensure consistent mapping between image pixels and screen coordinates.
+    // The coordinate system matches exactly what drawImage uses internally.
+    // 
+    // For drawImage(currentImage, dstX, dstY, dstX+dstW, dstY+dstH, 0, 0, imgW, imgH):
+    // - Image pixel (imgX, imgY) maps to screen rectangle starting at:
+    //   screenX = dstX + imgX * dstW / imgW
+    //   screenY = dstY + imgY * dstH / imgH
+    // - The pixel occupies a rectangle of size (dstW/imgW) x (dstH/imgH)
+    
+    /**
+     * Convert screen X coordinate to image X coordinate.
+     * Uses the same math as drawImage's internal pixel mapping.
+     */
+    private int screenToImageX(double screenX) {
+        if (currentImage == null) return 0;
+        int imgW = currentImage.getWidth();
+        int dstX = (int) Math.floor(imageOffsetX);
+        int dstW = (int) Math.ceil(imgW * zoomFactor);
+        // Inverse of: screenX = dstX + imgX * dstW / imgW
+        return (int) Math.floor((screenX - dstX) * imgW / dstW);
+    }
+    
+    /**
+     * Convert screen Y coordinate to image Y coordinate.
+     * Uses the same math as drawImage's internal pixel mapping.
+     */
+    private int screenToImageY(double screenY) {
+        if (currentImage == null) return 0;
+        int imgH = currentImage.getHeight();
+        int dstY = (int) Math.floor(imageOffsetY);
+        int dstH = (int) Math.ceil(imgH * zoomFactor);
+        // Inverse of: screenY = dstY + imgY * dstH / imgH
+        return (int) Math.floor((screenY - dstY) * imgH / dstH);
+    }
+    
+    /**
+     * Convert image X coordinate to screen X coordinate (top-left corner of pixel).
+     * Uses the same math as drawImage's internal pixel mapping.
+     */
+    private int imageToScreenX(double imgX) {
+        if (currentImage == null) return 0;
+        int imgW = currentImage.getWidth();
+        int dstX = (int) Math.floor(imageOffsetX);
+        int dstW = (int) Math.ceil(imgW * zoomFactor);
+        return dstX + (int) Math.floor(imgX * dstW / imgW);
+    }
+    
+    /**
+     * Convert image Y coordinate to screen Y coordinate (top-left corner of pixel).
+     * Uses the same math as drawImage's internal pixel mapping.
+     */
+    private int imageToScreenY(double imgY) {
+        if (currentImage == null) return 0;
+        int imgH = currentImage.getHeight();
+        int dstY = (int) Math.floor(imageOffsetY);
+        int dstH = (int) Math.ceil(imgH * zoomFactor);
+        return dstY + (int) Math.floor(imgY * dstH / imgH);
+    }
+    
+    /**
+     * Get the screen pixel size for rendering a single image pixel.
+     * At zoom > 1, this is ceil(zoomFactor) to ensure full coverage.
+     * At zoom <= 1, this is 1.
+     */
+    private int getScreenPixelSize() {
+        return Math.max(1, (int) Math.ceil(zoomFactor));
+    }
+    
+    // Offscreen buffer for smooth rendering (like ImageJ's paintDoubleBuffered)
+    private Image offScreenImage;
+    private int offScreenWidth, offScreenHeight;
+    
+    // Background thread for slice loading (like ImageJ's StackWindow)
+    // This decouples slider responsiveness from image loading
+    private Thread sliceLoaderThread;
+    private volatile boolean sliceLoaderDone = false;
+    private volatile int pendingSlice = 0;
+    private final Object sliceLoaderLock = new Object();
+    
+    // ====== THEME SYSTEM (Dark Mode Only) ======
+    // Current theme colors (dark mode only)
+    private static Color PRIMARY_BG;
+    private static Color SECONDARY_BG;
+    private static Color PANEL_BG;
+    private static Color BORDER_COLOR;
+    private static Color ACCENT_BLUE = new Color(66, 133, 244);       // Primary accent (Google Blue) - same for both themes
+    private static Color ACCENT_BLUE_HOVER = new Color(82, 150, 255); // Hover state
+    private static Color ACCENT_GREEN = new Color(52, 168, 83);       // Success/positive
+    private static Color ACCENT_RED = new Color(234, 67, 53);         // Delete/negative
+    private static Color ACCENT_YELLOW = new Color(251, 188, 4);      // Warning/attention
+    private static Color TEXT_PRIMARY_COLOR;
+    private static Color TEXT_SECONDARY_COLOR;
+    private static Color TEXT_DISABLED_COLOR;
+    private static Color SURFACE_HOVER_COLOR;
+    
+    // Dark Theme Colors (only theme supported)
+    private static final Color DARK_PRIMARY = new Color(25, 28, 33);
+    private static final Color DARK_SECONDARY = new Color(32, 36, 42);
+    private static final Color DARK_PANEL = new Color(40, 44, 52);
+    private static final Color DARK_BORDER = new Color(55, 60, 70);
+    private static final Color DARK_TEXT_PRIMARY = new Color(232, 234, 237);
+    private static final Color DARK_TEXT_SECONDARY = new Color(154, 160, 166);
+    private static final Color DARK_TEXT_DISABLED = new Color(95, 99, 104);
+    private static final Color DARK_SURFACE_HOVER = new Color(50, 54, 62);
+    
+    // Legacy color references (for backward compatibility)
+    private static Color PRIMARY_DARK;
+    private static Color SECONDARY_DARK;
+    private static Color PANEL_DARK;
+    private static Color BORDER_DARK;
+    private static Color TEXT_PRIMARY;
+    private static Color TEXT_SECONDARY;
+    private static Color TEXT_DISABLED;
+    private static Color SURFACE_HOVER;
+    
+    // Initialize theme colors (dark mode only)
+    static {
+        applyThemeColors();
+    }
+    
+    private static void applyThemeColors() {
+        // Apply dark theme colors (only theme supported)
+        PRIMARY_BG = DARK_PRIMARY;
+        SECONDARY_BG = DARK_SECONDARY;
+        PANEL_BG = DARK_PANEL;
+        BORDER_COLOR = DARK_BORDER;
+        TEXT_PRIMARY_COLOR = DARK_TEXT_PRIMARY;
+        TEXT_SECONDARY_COLOR = DARK_TEXT_SECONDARY;
+        TEXT_DISABLED_COLOR = DARK_TEXT_DISABLED;
+        SURFACE_HOVER_COLOR = DARK_SURFACE_HOVER;
+        // Update legacy references
+        PRIMARY_DARK = PRIMARY_BG;
+        SECONDARY_DARK = SECONDARY_BG;
+        PANEL_DARK = PANEL_BG;
+        BORDER_DARK = BORDER_COLOR;
+        TEXT_PRIMARY = TEXT_PRIMARY_COLOR;
+        TEXT_SECONDARY = TEXT_SECONDARY_COLOR;
+        TEXT_DISABLED = TEXT_DISABLED_COLOR;
+        SURFACE_HOVER = SURFACE_HOVER_COLOR;
+    }
+    // Note: originalImp field was removed - it was never used and doubled memory requirements
+    private int currentSlice = 1;
+    private int totalSlices = 1;
+
+    // Trajectory-based annotation data structures
+    // Using HashMap for better performance - ordering preserved via iteration over sorted keys when needed
+    private final Map<String, Map<Integer, Point>> trackAnnotations = new HashMap<>(32);
+    private final Map<String, Color> trackColors = new HashMap<>(32);
+    private String selectedTrackId = null;
+    private int trackCounter = 1;
+    private int colorIndex = 0;
+
+    private Double viewMin = null, viewMax = null;
+
+    // Optical flow computation and visualization state
+    private boolean opticalFlowComputed = false;
+    private String currentVideoPath = null;         // Original video path (for display/export)
+    private String workingVideoPath = null;         // Path used for backend operations (may be compressed temp file)
+    private String tempCompressedVideoPath = null;  // Path to temporary compressed video file (to clean up on exit)
+    private File lastOpenedVideoDirectory = null;   // Remember last directory for file explorer (persists across sessions)
+    private ImagePlus flowVisualization = null;
+    private boolean showingFlowViz = false;
+    
+    // Detection preview overlay state (shared by DoG and Trackpy)
+    private boolean previewModeActive = false;      // True when in preview mode (UI locked)
+    private String previewType = null;              // "dog" or "trackpy" or "trackpy_trajectories"
+    private List<double[]> previewSpots = null;     // Each spot: {x, y, quality}
+    private int previewSpotCount = 0;
+    private double previewRadius = 2.5;             // Store radius/diameter for circle sizing
+    private int previewFrame = 1;                   // Frame (1-indexed) where preview was generated
+    private JDialog savedConfigDialog = null;       // Saved reference to config dialog
+    
+    // Trackpy trajectory preview state (allows free frame navigation)
+    private boolean trajectoryPreviewActive = false;  // True when in trajectory preview mode
+    private List<Map<String, Object>> previewTrajectories = null;  // List of trajectories with positions per frame
+    private Map<Integer, List<double[]>> previewDetectionsPerFrame = null;  // Frame -> list of {x, y, mass}
+    private int previewTrajCount = 0;  // Number of trajectories
+    private int previewStartFrame = 0;  // Start frame of preview data
+    private int previewEndFrame = -1;   // End frame of preview data
+    
+    // UI components that need to be disabled during preview mode
+    private JPanel previewModeToolbar = null;       // Replacement toolbar during preview
+    private Container normalToolbarParent = null;   // Parent container of normal toolbar
+    private Component normalToolbarComponent = null; // Reference to normal toolbar for restore
+    private JTextField gotoFrameField = null;       // Frame input field (disable in preview)
+    private JButton gotoFrameButton = null;         // Go To button (disable in preview)
+    private JButton playButton = null;              // Play button (disable in preview)
+    private JTextField fpsField = null;             // FPS input (disable in preview)
+    private JButton openButton = null;              // Open File button (disable in preview)
+    private JButton importButton = null;            // Import button (disable in preview)
+    private JButton exportButton = null;            // Export button (disable in preview)
+    private JButton helpButton = null;              // Help button (disable in preview)
+    private JButton flowVizToggle = null;           // Flow Viz button (disable in preview)
+    private JButton fineTuneButton = null;          // Fine-Tune LocoTrack button (GPU only, disable in preview)
+    private boolean hideTracksInPreview = false;    // Flag to hide tracks during preview
+    
+    // Zoom controls in toolbar
+    private JLabel zoomLabel = null;                // Shows current zoom level (e.g., "100%")
+    private JButton zoomInButton = null;            // Zoom in button
+    private JButton zoomOutButton = null;           // Zoom out button
+    private JButton zoomFitButton = null;           // Fit to window button
+    private JButton zoomResetButton = null;         // Reset to 100% button
+    
+    // Left Configuration Panel (collapsible settings panel)
+    private JPanel configurationSection = null;     // Main container for left config panel
+    private JPanel configurationContent = null;     // Content area inside the panel
+    private boolean configPanelCollapsed = false;   // Whether the panel is collapsed
+    private int configPanelWidth = 420;             // Width of config panel when expanded
+    
+    // Right Annotation Panel (collapsible tracks panel)
+    private JPanel annotationSection = null;        // Main container for right annotation panel
+    private boolean annotationPanelCollapsed = false; // Whether the annotation panel is collapsed
+    private int annotationPanelWidth = 340;         // Width of annotation panel when expanded
+    
+    // Split panes for resizable panels
+    private JSplitPane leftSplitPane = null;        // Split pane for left panel and center
+    private JSplitPane rightSplitPane = null;       // Split pane for center and right panel
+    
+    // Configuration panel UI components (need to be accessible for save/load)
+    private JComboBox<String> cfgFlowMethodCombo = null;
+    private JComboBox<String> cfgRaftModelCombo = null;
+    private JSpinner cfgDisDownsampleSpinner = null;
+    private JCheckBox cfgFlowIncrementalAllocCheckbox = null;  // General flow setting, not DIS-specific
+    private JSpinner cfgRadiusSpinner = null;
+    private JSpinner cfgDogThresholdSpinner = null;
+    private JCheckBox cfgMedianFilterCheckbox = null;
+    private JCheckBox cfgSubpixelCheckbox = null;
+    private JSpinner cfgOcclusionSpinner = null;
+    private JComboBox<String> cfgLocotrackKernelCombo = null;
+    private JSpinner cfgTpDiameterSpinner = null;
+    private JSpinner cfgTpMinmassSpinner = null;
+    private JSpinner cfgSearchRangeSpinner = null;
+    private JSpinner cfgMemorySpinner = null;
+    private JCheckBox cfgRequirePersistentCheck = null;
+    private JSpinner cfgSmoothFactorSpinner = null;
+    private JSpinner cfgFlowSmoothingSpinner = null;
+    private JComboBox<String> cfgKernelCombo = null;
+    private JCheckBox cfgAutoComputeCheck = null;
+    private JComboBox<String> cfgTrackingModeCombo = null;
+    private JCheckBox cfgLocalCorrectionCheckbox = null;
+    private JSpinner cfgLocalWindowSpinner = null;
+    private JCheckBox cfgBlobDetectionCheckbox = null;
+    private JSpinner cfgBlobSearchRadiusSpinner = null;
+    private JSpinner cfgBlobRadiusSpinner = null;
+    private JPanel cfgBlobParamsPanel = null;
+    private JComboBox<String> cfgCorrectionMethodCombo = null;  // Correction method: full_blend, blob_assisted, or corridor_dp
+    private JSpinner cfgLinearInterpThresholdSpinner = null;  // Min frames threshold for using linear interpolation
+    private boolean isUpdatingConfigPanel = false;  // Flag to prevent recursive config updates
+    
+    // Segmentation-Assisted Tracking (SAT) module configuration and state
+    private boolean satEnabled = false;
+    private double satThresholdMin = 0.0;
+    private double satThresholdMax = 255.0;
+    private int satMaskOpacity = 70; // Segmentation overlay opacity (range: 0-255, where 255 is fully opaque)
+    private BufferedImage segmentationMask = null;
+    private boolean showRegionBoundaries = false; // Controls visibility of segmented region boundary visualization (default: disabled)
+    private boolean showMask = false; // Controls visibility of segmentation mask overlay (default: disabled)
+    private JCheckBox satCheckbox; // UI component for toggling SAT functionality
+    private JCheckBox showMaskCheckbox; // UI component for mask overlay visibility
+    private JCheckBox showRegionsCheckbox; // UI component for region boundary visibility
+    private JButton satAdjustButton; // UI component for threshold adjustment interface
+    // Spatial-temporal connectivity structure dimensions (height × width × temporal depth)
+    private int connectivityWidth = 3;   // Spatial connectivity kernel width (X-axis dimension)
+    private int connectivityHeight = 3;  // Spatial connectivity kernel height (Y-axis dimension)
+    private int connectivityDepth = 1;   // Temporal connectivity kernel depth (T-axis dimension)
+    
+    // Segmentation region tracking data structures
+    private Map<Integer, Map<Integer, SegmentedRegion>> frameRegions = new HashMap<>(); // Maps frame index → region ID → region descriptor
+    private Map<String, Integer> trackToRegion = new HashMap<>(); // Maps trajectory ID → associated region ID (established at frame 1)
+    
+    // Efficient pixel-to-region lookup structure for real-time hover feedback (frame index → Y-coordinate → X-coordinate → region ID)
+    private Map<Integer, int[][]> framePixelToRegion = new HashMap<>();
+    
+    /**
+     * Encapsulates properties and operations for individual segmented regions.
+     * Each region represents a connected component in the binary segmentation mask.
+     * Optimized: Uses primitive int arrays instead of Point objects to reduce GC pressure.
+     */
+    private static class SegmentedRegion {
+        int id;
+        double centroidX;
+        double centroidY;
+        // Use primitive arrays instead of List<Point> for better memory efficiency
+        private int[] pixelX;
+        private int[] pixelY;
+        private int pixelCount = 0;
+        private int capacity;
+        int minX, maxX, minY, maxY; // Axis-aligned bounding box coordinates
+        // HashSet for O(1) contains() checks - key = y * 65536 + x
+        private Set<Long> pixelSet;
+        
+        SegmentedRegion(int id) {
+            this(id, 256); // Default initial capacity
+        }
+        
+        SegmentedRegion(int id, int initialCapacity) {
+            this.id = id;
+            this.capacity = initialCapacity;
+            this.pixelX = new int[capacity];
+            this.pixelY = new int[capacity];
+            this.pixelSet = new HashSet<>(capacity);
+            this.minX = Integer.MAX_VALUE;
+            this.maxX = Integer.MIN_VALUE;
+            this.minY = Integer.MAX_VALUE;
+            this.maxY = Integer.MIN_VALUE;
+        }
+        
+        void addPixel(int x, int y) {
+            // Grow arrays if needed
+            if (pixelCount >= capacity) {
+                capacity = capacity * 2;
+                pixelX = Arrays.copyOf(pixelX, capacity);
+                pixelY = Arrays.copyOf(pixelY, capacity);
+            }
+            pixelX[pixelCount] = x;
+            pixelY[pixelCount] = y;
+            pixelCount++;
+            pixelSet.add(((long)y << 16) | (x & 0xFFFFL));
+            minX = Math.min(minX, x);
+            maxX = Math.max(maxX, x);
+            minY = Math.min(minY, y);
+            maxY = Math.max(maxY, y);
+        }
+        
+        int getPixelCount() { return pixelCount; }
+        int getPixelX(int index) { return pixelX[index]; }
+        int getPixelY(int index) { return pixelY[index]; }
+        
+        void computeCentroid() {
+            if (pixelCount == 0) {
+                centroidX = centroidY = 0;
+                return;
+            }
+            long sumX = 0, sumY = 0;
+            for (int i = 0; i < pixelCount; i++) {
+                sumX += pixelX[i];
+                sumY += pixelY[i];
+            }
+            centroidX = (double) sumX / pixelCount;
+            centroidY = (double) sumY / pixelCount;
+        }
+        
+        boolean contains(int x, int y) {
+            // Quick bounding box check first
+            if (x < minX || x > maxX || y < minY || y > maxY) return false;
+            // O(1) HashSet lookup instead of O(n) linear scan
+            return pixelSet.contains(((long)y << 16) | (x & 0xFFFFL));
+        }
+        
+        /**
+         * Identifies the spatial point within this region nearest to the specified target coordinates.
+         * Optimized: Uses squared distance to avoid sqrt() calls, returns reusable Point.
+         * @param targetX Target X-coordinate
+         * @param targetY Target Y-coordinate
+         * @return The closest pixel within the region boundary
+         */
+        Point findClosestPoint(int targetX, int targetY) {
+            if (pixelCount == 0) return new Point(targetX, targetY);
+            
+            int closestX = pixelX[0];
+            int closestY = pixelY[0];
+            int minDistSq = distanceSquared(targetX, targetY, closestX, closestY);
+            
+            for (int i = 1; i < pixelCount; i++) {
+                int distSq = distanceSquared(targetX, targetY, pixelX[i], pixelY[i]);
+                if (distSq < minDistSq) {
+                    minDistSq = distSq;
+                    closestX = pixelX[i];
+                    closestY = pixelY[i];
+                }
+            }
+            return new Point(closestX, closestY);
+        }
+        
+        // Use squared distance to avoid expensive sqrt() call
+        private static int distanceSquared(int x1, int y1, int x2, int y2) {
+            int dx = x2 - x1;
+            int dy = y2 - y1;
+            return dx * dx + dy * dy;
+        }
+        
+        /**
+         * Determines the pixel with maximum intensity within this segmented region.
+         * Optimized: Uses primitive arrays for iteration.
+         * @param ip Image processor containing pixel intensity values
+         * @return The coordinates of the brightest pixel, or null if region is empty
+         */
+        Point findBrightestPixel(ImageProcessor ip) {
+            if (pixelCount == 0) return null;
+            
+            int brightestX = pixelX[0];
+            int brightestY = pixelY[0];
+            float maxValue = ip.getf(brightestX, brightestY);
+            
+            for (int i = 1; i < pixelCount; i++) {
+                float value = ip.getf(pixelX[i], pixelY[i]);
+                if (value > maxValue) {
+                    maxValue = value;
+                    brightestX = pixelX[i];
+                    brightestY = pixelY[i];
+                }
+            }
+            
+            return new Point(brightestX, brightestY);
+        }
+    }
+    
+    // Video format metadata for coordinate system transformations
+    private boolean isAviDownsampled = false;
+    private double scaleFactorX = 1.0;
+    private double scaleFactorY = 1.0;
+    
+    // Application configuration management
+    private Properties config = new Properties();
+    private static final String CONFIG_FILE = "config.properties";
+    
+    // GPU information (detected at startup)
+    private List<String[]> availableGpus = new ArrayList<>();  // List of [index, name, memory] for each GPU
+
+    private final Map<String, List<Anchor>> trackAnchors = new LinkedHashMap<>();
+    private boolean correctionMode = false;
+    
+    // Multi-seed trajectory optimization state tracking
+    private final Map<String, Boolean> trackOptimized = new HashMap<>();  // Maintains optimization completion status per trajectory
+    private final Map<String, Boolean> trackSelected = new HashMap<>();   // Maintains selection state for batch optimization operations
+    
+    // Time tracking for user productivity metrics
+    // Tracks how long each track takes to complete (create + all corrections)
+    private final Map<String, Long> trackTotalTime = new HashMap<>();     // Total accumulated time in milliseconds
+    private final Map<String, Long> trackStartTime = new HashMap<>();     // Timestamp when track work started (0 if paused/completed)
+    private final Map<String, Boolean> trackCompleted = new HashMap<>();  // Whether track is marked as complete
+    private long sessionStartTime = 0;  // When the first track was created (for total session time)
+    
+    // Track trimming/clipping state
+    // Stores the original (untrimmed) track data so editing can restore to pre-trim state
+    private final Map<String, Map<Integer, Point>> trackUntrimmedAnnotations = new HashMap<>();  // Original annotations before trim
+    private final Map<String, List<Anchor>> trackUntrimmedAnchors = new HashMap<>();  // Original anchors before trim
+    private final Map<String, int[]> trackTrimRange = new HashMap<>();  // [startFrame, endFrame] inclusive (0-indexed)
+    
+    // Occlusion segments state (for LocoTrack fine-tuning)
+    // Stores OCCLUSION segments (frames where object is NOT visible)
+    // Each segment is an int[2] array: [startFrame, endFrame] inclusive (0-indexed)
+    // Frames INSIDE these segments are occluded; frames OUTSIDE are visible
+    private final Map<String, List<int[]>> trackOcclusionSegments = new HashMap<>();  // List of [start, end] occlusion segments
+    // Legacy alias for compatibility - now refers to occlusion segments (inverted logic handled in code)
+    private final Map<String, List<int[]>> trackVisibleSegments = trackOcclusionSegments;  // Alias for backward compatibility
+    
+    // Occlusion mode state (in-place multi-segment editor)
+    private boolean occlusionModeActive = false;           // Whether occlusion mode is currently active
+    private String occlusionModeTrackId = null;            // Track being edited for occlusions
+    private int occlusionModeMinFrame = 0;                 // Track's minimum frame (0-indexed)
+    private int occlusionModeMaxFrame = 0;                 // Track's maximum frame (0-indexed)
+    private List<int[]> occlusionModeSegments = null;      // Current OCCLUSION segments being edited (frames where object is hidden)
+    private int occlusionModePendingStart = -1;            // Start frame of pending occlusion segment (-1 if not pending)
+    private int occlusionModeDraggingSegmentIdx = -1;      // Index of segment being dragged (-1 if none)
+    private boolean occlusionModeDraggingStart = false;    // True if dragging start of segment
+    private boolean occlusionModeDraggingEnd = false;      // True if dragging end of segment
+    private JPanel occlusionModeControlPanel = null;       // Control panel shown during occlusion mode
+    private JLabel occlusionModeInfoLabel = null;          // Label showing occlusion info
+    private JButton occlusionModeAddButton = null;         // Add/End occlusion segment button (changes state)
+    private int frameBeforeOcclusionMode = 1;              // Frame that was shown before entering occlusion mode
+    
+    // Trim mode state (in-place range slider for trimming)
+    private boolean trimModeActive = false;           // Whether trim mode is currently active
+    private String trimModeTrackId = null;            // Track being trimmed
+    private int trimModeMinFrame = 0;                 // Track's minimum frame (0-indexed)
+    private int trimModeMaxFrame = 0;                 // Track's maximum frame (0-indexed)
+    private int trimModeStartValue = 0;               // Current start selection (0-indexed)
+    private int trimModeEndValue = 0;                 // Current end selection (0-indexed)
+    private boolean trimModeDraggingStart = false;    // True if dragging start thumb
+    private boolean trimModeDraggingEnd = false;      // True if dragging end thumb
+    private JPanel trimModeControlPanel = null;       // Control panel shown during trim mode
+    private JLabel trimModeInfoLabel = null;          // Label showing trim info
+    private int frameBeforeTrimMode = 1;              // Frame that was shown before entering trim mode
+    
+    // Trajectory smoothing state
+    // Enables per-track smoothing to reduce jitter in noisy microscopy data
+    private final Map<String, Boolean> trackSmoothing = new HashMap<>();  // Whether smoothing is enabled for each track
+    private final Map<String, Map<Integer, Point>> trackOriginalAnnotations = new HashMap<>();  // Original (unsmoothed) coordinates
+    
+    // Server management
+    private boolean serverWasRunningOnStart = false;
+    private boolean serverAvailable = false;  // Whether server is ready for tracking operations
+    private volatile boolean serverOperationInProgress = false;  // Prevents concurrent server operations
+    private volatile boolean serverCancellationInProgress = false;  // True after user hits Cancel until worker/server finishes
+
+    /**
+     * Gate for long-running tracking-server operations.
+     * If a cancel has been requested, show a "Cancelling..." popup to prevent immediate re-run.
+     */
+    private boolean blockIfServerBusy(String requestedOperationName) {
+        if (!serverOperationInProgress && !serverCancellationInProgress) {
+            return false;
+        }
+
+        if (serverCancellationInProgress) {
+            JOptionPane.showMessageDialog(frame,
+                "Cancelling operation in progress.\n\n" +
+                "Please wait for the cancellation to finish before starting a new operation." +
+                (requestedOperationName != null && !requestedOperationName.isBlank()
+                    ? "\n\nRequested: " + requestedOperationName
+                    : ""),
+                "Cancelling Operation In Progress",
+                JOptionPane.INFORMATION_MESSAGE);
+        } else {
+            JOptionPane.showMessageDialog(frame,
+                "Another operation is still in progress.\n\n" +
+                "Please wait for it to complete before starting a new one.",
+                "Operation In Progress",
+                JOptionPane.WARNING_MESSAGE);
+        }
+        return true;
+    }
+
+    /**
+     * Generates a visually distinct RGB color for trajectory visualization.
+     * Colors are selected from a constrained gamut to ensure visibility against typical backgrounds.
+     * Optimized: Uses ThreadLocalRandom for better performance in concurrent scenarios.
+     * @return A randomly generated Color with fixed alpha transparency
+     */
+    private Color generateRandomColor() {
+        java.util.concurrent.ThreadLocalRandom random = java.util.concurrent.ThreadLocalRandom.current();
+        // Generate bright, visible colors (avoiding too dark colors)
+        int r = random.nextInt(50, 256); // 50-255
+        int g = random.nextInt(50, 256); // 50-255
+        int b = random.nextInt(50, 256); // 50-255
+        return new Color(r, g, b, 200);
+    }
+
+    // Undo/Redo system
+    private final Stack<AnnotationState> undoStack = new Stack<>();
+    private final Stack<AnnotationState> redoStack = new Stack<>();
+
+    private Point dragStartView = null;
+    private Point dragStartMouse = null;  // Mouse position when drag started
+    private double dragStartOffsetX = 0.0;  // Image offset when drag started
+    private double dragStartOffsetY = 0.0;  // Image offset when drag started
+    private Point hoverPoint = null;
+    private int hoverCursorSize = 3;  // Size of hover cursor in pixels (odd numbers only: 3, 5, 7, ..., 51)
+    private boolean cursorCircleMode = false;  // If true, draw circle instead of square
+    private boolean cursorOpaqueMode = false;  // If true, fill the shape instead of just outline
+    private boolean cursorPersistentMode = false;  // If true, apply cursor shape to all track points
+    
+    // Track quick-switch mode state (Shift+click feature)
+    // Shift+click: Quick switch to track at clicked point
+    // Ctrl+click: Toggle selection checkbox for track at clicked point (for batch operations)
+    private boolean trackSwitchModeActive = false;  // True when Shift is held down
+    private boolean multiSelectModeActive = false;  // True when Ctrl is held down (for multi-select preview)
+    private String hoveredTrackId = null;  // Track ID under cursor in switch/multi-select mode (for visual feedback)
+
+    private JLabel pageLabel;
+    private JLabel pixelValueLabel;
+    private JSlider frameSlider;
+    private JPanel frameNavPanel;  // Reference to frame navigation panel for trim mode modifications
+
+    private JPanel annotationPanel;
+    private JScrollPane annotationScrollPane;  // Scroll pane for track list (for programmatic scrolling)
+    private int rowHeight = 30;
+
+    private Timer playTimer;
+
+    private final int FRAME_JUMP_AMOUNT = 10;
+
+    public static void main(String[] args) {
+        SwingUtilities.invokeLater(() -> new VideoAnnotationTool().initUI());
+    }
+
+    private static class AnnotationState {
+        Map<String, Map<Integer, Point>> trackAnnotations;
+        Map<String, Color> trackColors;
+        Map<String, List<Anchor>> trackAnchors;  // Changed from List<Point>
+        Map<String, Boolean> trackOptimized;
+        Map<String, Boolean> trackSelected;
+        Map<String, Long> trackTotalTime;  // Time tracking
+        Map<String, Long> trackStartTime;  // Time tracking
+        Map<String, Boolean> trackCompleted;  // Completion state
+        // Track trimming state
+        Map<String, Map<Integer, Point>> trackUntrimmedAnnotations;  // Original annotations before trim
+        Map<String, List<Anchor>> trackUntrimmedAnchors;  // Original anchors before trim
+        Map<String, int[]> trackTrimRange;  // Trim range per track
+        // Occlusion segments state (for LocoTrack fine-tuning)
+        Map<String, List<int[]>> trackVisibleSegments;  // Visible segments per track
+        // Trajectory smoothing state
+        Map<String, Boolean> trackSmoothing;  // Whether smoothing is enabled for each track
+        Map<String, Map<Integer, Point>> trackOriginalAnnotations;  // Original (unsmoothed) coordinates
+        String selectedTrackId;
+        int trackCounter;
+        int colorIndex;
+        boolean correctionMode;
+
+        AnnotationState(Map<String, Map<Integer, Point>> tracks, 
+                       Map<String, Color> colors,
+                       Map<String, List<Anchor>> anchors,  // Changed parameter type
+                       Map<String, Boolean> optimized,
+                       Map<String, Boolean> selected,
+                       Map<String, Long> totalTime,
+                       Map<String, Long> startTime,
+                       Map<String, Boolean> completed,
+                       Map<String, Map<Integer, Point>> untrimmedAnnotations,
+                       Map<String, List<Anchor>> untrimmedAnchors,
+                       Map<String, int[]> trimRange,
+                       Map<String, List<int[]>> visibleSegments,
+                       Map<String, Boolean> smoothing,
+                       Map<String, Map<Integer, Point>> originalAnnotations,
+                       String selectedId, 
+                       int counter,
+                       int colorIdx, 
+                       boolean corrMode) {
+            this.trackAnnotations = deepCopyTracks(tracks);
+            this.trackColors = new HashMap<>(colors);
+            this.trackAnchors = deepCopyAnchors(anchors);  // Changed method call
+            this.trackOptimized = new HashMap<>(optimized);
+            this.trackSelected = new HashMap<>(selected);
+            this.trackTotalTime = new HashMap<>(totalTime);
+            this.trackStartTime = new HashMap<>(startTime);
+            this.trackCompleted = new HashMap<>(completed);
+            this.trackUntrimmedAnnotations = deepCopyTracks(untrimmedAnnotations);
+            this.trackUntrimmedAnchors = deepCopyAnchors(untrimmedAnchors);
+            this.trackTrimRange = deepCopyTrimRange(trimRange);
+            this.trackVisibleSegments = deepCopyVisibleSegments(visibleSegments);
+            this.trackSmoothing = new HashMap<>(smoothing);
+            this.trackOriginalAnnotations = deepCopyTracks(originalAnnotations);
+            this.selectedTrackId = selectedId;
+            this.trackCounter = counter;
+            this.colorIndex = colorIdx;
+            this.correctionMode = corrMode;
+        }
+
+        private static Map<String, Map<Integer, Point>> deepCopyTracks(Map<String, Map<Integer, Point>> original) {
+            // Pre-size the map for better performance
+            Map<String, Map<Integer, Point>> copy = new LinkedHashMap<>(original.size());
+            for (Map.Entry<String, Map<Integer, Point>> entry : original.entrySet()) {
+                Map<Integer, Point> originalFrameMap = entry.getValue();
+                Map<Integer, Point> frameCopy = new HashMap<>(originalFrameMap.size());
+                for (Map.Entry<Integer, Point> frameEntry : originalFrameMap.entrySet()) {
+                    frameCopy.put(frameEntry.getKey(), new Point(frameEntry.getValue()));
+                }
+                copy.put(entry.getKey(), frameCopy);
+            }
+            return copy;
+        }
+        
+        private static Map<String, List<Anchor>> deepCopyAnchors(Map<String, List<Anchor>> original) {
+            Map<String, List<Anchor>> copy = new LinkedHashMap<>();
+            for (Map.Entry<String, List<Anchor>> entry : original.entrySet()) {
+                List<Anchor> anchorsCopy = new ArrayList<>();
+                for (Anchor a : entry.getValue()) {
+                    anchorsCopy.add(new Anchor(a));
+                }
+                copy.put(entry.getKey(), anchorsCopy);
+            }
+            return copy;
+        }
+        
+        private static Map<String, int[]> deepCopyTrimRange(Map<String, int[]> original) {
+            Map<String, int[]> copy = new HashMap<>();
+            for (Map.Entry<String, int[]> entry : original.entrySet()) {
+                int[] range = entry.getValue();
+                copy.put(entry.getKey(), new int[]{range[0], range[1]});
+            }
+            return copy;
+        }
+        
+        private static Map<String, List<int[]>> deepCopyVisibleSegments(Map<String, List<int[]>> original) {
+            Map<String, List<int[]>> copy = new HashMap<>();
+            for (Map.Entry<String, List<int[]>> entry : original.entrySet()) {
+                List<int[]> segmentsCopy = new ArrayList<>();
+                for (int[] segment : entry.getValue()) {
+                    segmentsCopy.add(new int[]{segment[0], segment[1]});
+                }
+                copy.put(entry.getKey(), segmentsCopy);
+            }
+            return copy;
+        }
+    }
+
+    private void saveState() {
+        undoStack.push(new AnnotationState(trackAnnotations, trackColors, trackAnchors,
+                                           trackOptimized, trackSelected,
+                                           trackTotalTime, trackStartTime, trackCompleted,
+                                           trackUntrimmedAnnotations, trackUntrimmedAnchors, trackTrimRange,
+                                           trackVisibleSegments,
+                                           trackSmoothing, trackOriginalAnnotations,
+                                           selectedTrackId, trackCounter, colorIndex, correctionMode));
+        redoStack.clear();
+    }
+
+    private void undo() {
+        if (undoStack.isEmpty()) return;
+        
+        // Exit trim mode if active (undo could change track state)
+        if (trimModeActive) {
+            cancelTrimMode();
+        }
+        
+        redoStack.push(new AnnotationState(trackAnnotations, trackColors, trackAnchors,
+                                           trackOptimized, trackSelected,
+                                           trackTotalTime, trackStartTime, trackCompleted,
+                                           trackUntrimmedAnnotations, trackUntrimmedAnchors, trackTrimRange,
+                                           trackVisibleSegments,
+                                           trackSmoothing, trackOriginalAnnotations,
+                                           selectedTrackId, trackCounter, colorIndex, correctionMode));
+        
+        AnnotationState state = undoStack.pop();
+        trackAnnotations.clear();
+        trackAnnotations.putAll(state.trackAnnotations);
+        trackColors.clear();
+        trackColors.putAll(state.trackColors);
+        trackAnchors.clear();
+        trackAnchors.putAll(state.trackAnchors);
+        trackOptimized.clear();
+        trackOptimized.putAll(state.trackOptimized);
+        trackSelected.clear();
+        trackSelected.putAll(state.trackSelected);
+        trackTotalTime.clear();
+        trackTotalTime.putAll(state.trackTotalTime);
+        trackStartTime.clear();
+        trackStartTime.putAll(state.trackStartTime);
+        trackCompleted.clear();
+        trackCompleted.putAll(state.trackCompleted);
+        trackUntrimmedAnnotations.clear();
+        trackUntrimmedAnnotations.putAll(state.trackUntrimmedAnnotations);
+        trackUntrimmedAnchors.clear();
+        trackUntrimmedAnchors.putAll(state.trackUntrimmedAnchors);
+        trackTrimRange.clear();
+        trackTrimRange.putAll(state.trackTrimRange);
+        trackVisibleSegments.clear();
+        trackVisibleSegments.putAll(state.trackVisibleSegments);
+        trackSmoothing.clear();
+        trackSmoothing.putAll(state.trackSmoothing);
+        trackOriginalAnnotations.clear();
+        trackOriginalAnnotations.putAll(state.trackOriginalAnnotations);
+        selectedTrackId = state.selectedTrackId;
+        trackCounter = state.trackCounter;
+        colorIndex = state.colorIndex;
+        correctionMode = state.correctionMode;
+        
+        loadSliceImage();
+        refreshAnnotationList();
+        frameSlider.repaint(); // Update slider to show anchor points
+    }
+
+    private void redo() {
+        if (redoStack.isEmpty()) return;
+        
+        // Exit trim mode if active (redo could change track state)
+        if (trimModeActive) {
+            cancelTrimMode();
+        }
+        
+        undoStack.push(new AnnotationState(trackAnnotations, trackColors, trackAnchors,
+                                           trackOptimized, trackSelected,
+                                           trackTotalTime, trackStartTime, trackCompleted,
+                                           trackUntrimmedAnnotations, trackUntrimmedAnchors, trackTrimRange,
+                                           trackVisibleSegments,
+                                           trackSmoothing, trackOriginalAnnotations,
+                                           selectedTrackId, trackCounter, colorIndex, correctionMode));
+        
+        AnnotationState state = redoStack.pop();
+        trackAnnotations.clear();
+        trackAnnotations.putAll(state.trackAnnotations);
+        trackColors.clear();
+        trackColors.putAll(state.trackColors);
+        trackAnchors.clear();
+        trackAnchors.putAll(state.trackAnchors);
+        trackOptimized.clear();
+        trackOptimized.putAll(state.trackOptimized);
+        trackSelected.clear();
+        trackSelected.putAll(state.trackSelected);
+        trackTotalTime.clear();
+        trackTotalTime.putAll(state.trackTotalTime);
+        trackStartTime.clear();
+        trackStartTime.putAll(state.trackStartTime);
+        trackCompleted.clear();
+        trackCompleted.putAll(state.trackCompleted);
+        trackUntrimmedAnnotations.clear();
+        trackUntrimmedAnnotations.putAll(state.trackUntrimmedAnnotations);
+        trackUntrimmedAnchors.clear();
+        trackUntrimmedAnchors.putAll(state.trackUntrimmedAnchors);
+        trackTrimRange.clear();
+        trackTrimRange.putAll(state.trackTrimRange);
+        trackVisibleSegments.clear();
+        trackVisibleSegments.putAll(state.trackVisibleSegments);
+        trackSmoothing.clear();
+        trackSmoothing.putAll(state.trackSmoothing);
+        trackOriginalAnnotations.clear();
+        trackOriginalAnnotations.putAll(state.trackOriginalAnnotations);
+        selectedTrackId = state.selectedTrackId;
+        trackCounter = state.trackCounter;
+        colorIndex = state.colorIndex;
+        correctionMode = state.correctionMode;
+        
+        loadSliceImage();
+        refreshAnnotationList();
+        frameSlider.repaint(); // Update slider to show anchor points
+    }
+
+    private Color getTrackColor(String trackId) {
+        return trackColors.getOrDefault(trackId, new Color(255, 0, 0, 200)); // Default to red if not found
+    }
+    
+    /**
+     * Apply trajectory smoothing using a combination of methods.
+     * Primary method: Butterworth low-pass filter (best for removing high-frequency jitter)
+     * Fallback: Gaussian smoothing for short segments
+     * 
+     * The Butterworth filter is a frequency-domain low-pass filter that effectively
+     * removes high-frequency noise while preserving the overall trajectory shape.
+     * Tested extensively against ground truth data from microscopy tracking.
+     * 
+     * Edge cases handled:
+     * - Tracks with fewer than 3 points: Returns original data unchanged
+     * - Tracks with gaps (missing frames): Only smooths contiguous segments
+     * - Single-frame segments: Preserved unchanged
+     * - Very short segments (<10 points): Uses Gaussian smoothing instead
+     * - Anchor points: Preserved exactly if present
+     * 
+     * @param trackId The track to smooth
+     * @return Map of frame index to smoothed Point coordinates
+     */
+    private Map<Integer, Point> smoothTrajectory(String trackId) {
+        Map<Integer, Point> original = trackAnnotations.get(trackId);
+        if (original == null || original.isEmpty()) {
+            return new HashMap<>();
+        }
+        
+        // For very short tracks, return original data
+        if (original.size() < 3) {
+            return new HashMap<>(original);
+        }
+        
+        Map<Integer, Point> smoothed = new HashMap<>();
+        
+        // Get sorted frame indices
+        List<Integer> frames = new ArrayList<>(original.keySet());
+        Collections.sort(frames);
+        
+        // Find contiguous segments (handle gaps in trajectory)
+        List<List<Integer>> segments = findContiguousSegments(frames);
+        
+        // Get anchor points for this track (to preserve them exactly)
+        List<Anchor> anchors = trackAnchors.get(trackId);
+        Set<Integer> anchorFrames = new HashSet<>();
+        if (anchors != null) {
+            for (Anchor a : anchors) {
+                anchorFrames.add(a.frame);
+            }
+        }
+        
+        for (List<Integer> segment : segments) {
+            if (segment.size() < 3) {
+                // Too short to smooth - keep original
+                for (int frame : segment) {
+                    smoothed.put(frame, new Point(original.get(frame)));
+                }
+            } else {
+                // Apply smoothing to this segment
+                Map<Integer, Point> segmentSmoothed = smoothSegment(original, segment, anchorFrames);
+                smoothed.putAll(segmentSmoothed);
+            }
+        }
+        
+        return smoothed;
+    }
+    
+    /**
+     * Find contiguous segments in a list of frame indices.
+     * A gap is defined as a frame index difference > 1.
+     */
+    private List<List<Integer>> findContiguousSegments(List<Integer> frames) {
+        List<List<Integer>> segments = new ArrayList<>();
+        if (frames.isEmpty()) return segments;
+        
+        List<Integer> currentSegment = new ArrayList<>();
+        currentSegment.add(frames.get(0));
+        
+        for (int i = 1; i < frames.size(); i++) {
+            if (frames.get(i) - frames.get(i - 1) == 1) {
+                // Contiguous
+                currentSegment.add(frames.get(i));
+            } else {
+                // Gap found - start new segment
+                segments.add(currentSegment);
+                currentSegment = new ArrayList<>();
+                currentSegment.add(frames.get(i));
+            }
+        }
+        segments.add(currentSegment);
+        
+        return segments;
+    }
+    
+    /**
+     * Smooth a contiguous segment using the best available method.
+     * Uses Butterworth filter for longer segments, Gaussian for shorter ones.
+     */
+    private Map<Integer, Point> smoothSegment(Map<Integer, Point> original, 
+                                               List<Integer> segment, 
+                                               Set<Integer> anchorFrames) {
+        Map<Integer, Point> smoothed = new HashMap<>();
+        int n = segment.size();
+        
+        // Extract x and y coordinates
+        double[] xCoords = new double[n];
+        double[] yCoords = new double[n];
+        for (int i = 0; i < n; i++) {
+            Point p = original.get(segment.get(i));
+            xCoords[i] = p.x;
+            yCoords[i] = p.y;
+        }
+        
+        double[] smoothedX;
+        double[] smoothedY;
+        
+        if (n >= 12) {
+            // Use Butterworth low-pass filter for longer segments
+            // Cutoff frequency 0.05 works best based on experiments
+            smoothedX = butterworthLowPass(xCoords, 0.05, 2);
+            smoothedY = butterworthLowPass(yCoords, 0.05, 2);
+        } else {
+            // Use Gaussian smoothing for shorter segments
+            double sigma = Math.max(1.0, n / 5.0);
+            smoothedX = gaussianSmooth1D(xCoords, sigma);
+            smoothedY = gaussianSmooth1D(yCoords, sigma);
+        }
+        
+        // Convert back to Points, preserving anchor points exactly
+        for (int i = 0; i < n; i++) {
+            int frame = segment.get(i);
+            
+            if (anchorFrames.contains(frame)) {
+                // Preserve anchor point exactly
+                smoothed.put(frame, new Point(original.get(frame)));
+            } else {
+                // Use smoothed coordinates
+                int x = (int) Math.round(smoothedX[i]);
+                int y = (int) Math.round(smoothedY[i]);
+                smoothed.put(frame, new Point(x, y));
+            }
+        }
+        
+        return smoothed;
+    }
+    
+    /**
+     * Apply Butterworth low-pass filter to a 1D signal.
+     * This is implemented using a second-order recursive filter
+     * applied in both forward and reverse directions (zero-phase filtering).
+     * 
+     * Uses mirror padding to handle edge effects (similar to scipy's filtfilt).
+     * 
+     * @param data Input signal
+     * @param cutoffFreq Normalized cutoff frequency (0 to 0.5, where 0.5 is Nyquist)
+     * @param order Filter order (typically 2)
+     * @return Filtered signal
+     */
+    private double[] butterworthLowPass(double[] data, double cutoffFreq, int order) {
+        int n = data.length;
+        if (n < 6) {
+            // Too short for Butterworth, use simple averaging
+            return gaussianSmooth1D(data, 1.5);
+        }
+        
+        // Compute Butterworth filter coefficients
+        // For a 2nd order Butterworth low-pass filter:
+        // H(s) = 1 / (s^2 + sqrt(2)*s + 1)
+        // Using bilinear transform to convert to digital filter
+        
+        double wc = Math.tan(Math.PI * cutoffFreq);
+        double k1 = Math.sqrt(2) * wc;
+        double k2 = wc * wc;
+        double norm = 1 + k1 + k2;
+        
+        // Numerator coefficients (feedforward)
+        double b0 = k2 / norm;
+        double b1 = 2 * b0;
+        double b2 = b0;
+        
+        // Denominator coefficients (feedback)
+        double a1 = 2 * (k2 - 1) / norm;
+        double a2 = (1 - k1 + k2) / norm;
+        
+        // Pad the signal to reduce edge effects (mirror padding)
+        int padLen = Math.min(3 * Math.max(1, (int)(1.0 / cutoffFreq)), n - 1);
+        double[] padded = new double[n + 2 * padLen];
+        
+        // Mirror padding at start
+        for (int i = 0; i < padLen; i++) {
+            padded[i] = 2 * data[0] - data[padLen - i];
+        }
+        // Copy original data
+        System.arraycopy(data, 0, padded, padLen, n);
+        // Mirror padding at end
+        for (int i = 0; i < padLen; i++) {
+            padded[n + padLen + i] = 2 * data[n-1] - data[n - 2 - i];
+        }
+        
+        int paddedLen = padded.length;
+        
+        // Forward pass with proper initial conditions
+        double[] forward = new double[paddedLen];
+        
+        // Initialize with DC gain assumption
+        double dcGain = (b0 + b1 + b2) / (1 + a1 + a2);
+        forward[0] = padded[0] * dcGain;
+        forward[1] = padded[1] * dcGain;
+        
+        for (int i = 2; i < paddedLen; i++) {
+            forward[i] = b0 * padded[i] + b1 * padded[i-1] + b2 * padded[i-2] 
+                        - a1 * forward[i-1] - a2 * forward[i-2];
+        }
+        
+        // Backward pass (for zero-phase filtering)
+        double[] backward = new double[paddedLen];
+        backward[paddedLen-1] = forward[paddedLen-1] * dcGain;
+        backward[paddedLen-2] = forward[paddedLen-2] * dcGain;
+        
+        for (int i = paddedLen - 3; i >= 0; i--) {
+            backward[i] = b0 * forward[i] + b1 * forward[i+1] + b2 * forward[i+2]
+                         - a1 * backward[i+1] - a2 * backward[i+2];
+        }
+        
+        // Extract the result (remove padding)
+        double[] result = new double[n];
+        System.arraycopy(backward, padLen, result, 0, n);
+        
+        return result;
+    }
+    
+    /**
+     * Apply Gaussian smoothing to a 1D signal.
+     * Uses a Gaussian kernel with specified sigma.
+     */
+    private double[] gaussianSmooth1D(double[] data, double sigma) {
+        int n = data.length;
+        double[] result = new double[n];
+        
+        // Compute kernel size (3*sigma on each side)
+        int kernelHalf = (int) Math.ceil(3 * sigma);
+        
+        for (int i = 0; i < n; i++) {
+            double sum = 0;
+            double weightSum = 0;
+            
+            for (int j = -kernelHalf; j <= kernelHalf; j++) {
+                int idx = i + j;
+                if (idx >= 0 && idx < n) {
+                    double weight = Math.exp(-0.5 * j * j / (sigma * sigma));
+                    sum += weight * data[idx];
+                    weightSum += weight;
+                }
+            }
+            
+            result[i] = sum / weightSum;
+        }
+        
+        return result;
+    }
+    
+    /**
+     * Enable trajectory smoothing for a track.
+     * Stores the original data and applies smoothing.
+     * 
+     * @param trackId The track to enable smoothing for
+     */
+    private void enableTrackSmoothing(String trackId) {
+        Map<Integer, Point> original = trackAnnotations.get(trackId);
+        if (original == null || original.isEmpty()) {
+            return;
+        }
+        
+        // Store original data for later restoration
+        Map<Integer, Point> originalCopy = new HashMap<>();
+        for (Map.Entry<Integer, Point> entry : original.entrySet()) {
+            originalCopy.put(entry.getKey(), new Point(entry.getValue()));
+        }
+        trackOriginalAnnotations.put(trackId, originalCopy);
+        
+        // Apply smoothing
+        Map<Integer, Point> smoothed = smoothTrajectory(trackId);
+        
+        // Replace track data with smoothed version
+        original.clear();
+        original.putAll(smoothed);
+        
+        trackSmoothing.put(trackId, true);
+    }
+    
+    /**
+     * Disable trajectory smoothing for a track.
+     * Restores the original (unsmoothed) data.
+     * 
+     * @param trackId The track to disable smoothing for
+     */
+    private void disableTrackSmoothing(String trackId) {
+        Map<Integer, Point> originalData = trackOriginalAnnotations.get(trackId);
+        if (originalData == null) {
+            // No original data stored - shouldn't happen but handle gracefully
+            trackSmoothing.put(trackId, false);
+            return;
+        }
+        
+        // Restore original data
+        Map<Integer, Point> current = trackAnnotations.get(trackId);
+        if (current != null) {
+            current.clear();
+            current.putAll(originalData);
+        }
+        
+        // Clean up stored original data
+        trackOriginalAnnotations.remove(trackId);
+        trackSmoothing.put(trackId, false);
+    }
+    
+    /**
+     * Re-apply smoothing to a track if it was already enabled.
+     * Called when track data changes (optimization, new anchors, etc.)
+     * to maintain smoothing while incorporating the new data.
+     * 
+     * This provides a better user experience - smoothing stays on
+     * until the user explicitly disables it.
+     * 
+     * @param trackId The track to re-smooth if smoothing is enabled
+     */
+    private void reapplyTrackSmoothingIfEnabled(String trackId) {
+        if (!trackSmoothing.getOrDefault(trackId, false)) {
+            // Smoothing wasn't enabled, nothing to do
+            return;
+        }
+        
+        // Get the current track data (this is the new data after modification)
+        Map<Integer, Point> current = trackAnnotations.get(trackId);
+        if (current == null || current.isEmpty()) {
+            return;
+        }
+        
+        // Store the new data as the "original" (unsmoothed) data
+        Map<Integer, Point> newOriginal = new HashMap<>();
+        for (Map.Entry<Integer, Point> entry : current.entrySet()) {
+            newOriginal.put(entry.getKey(), new Point(entry.getValue()));
+        }
+        trackOriginalAnnotations.put(trackId, newOriginal);
+        
+        // Re-apply smoothing to the new data
+        Map<Integer, Point> smoothed = smoothTrajectory(trackId);
+        
+        // Update the track with smoothed data
+        current.clear();
+        current.putAll(smoothed);
+    }
+    
+    /**
+     * Invalidate smoothing for a track completely.
+     * Only used when importing tracks or in special cases where
+     * we want to completely reset smoothing state.
+     * 
+     * @param trackId The track whose smoothing should be invalidated
+     */
+    private void invalidateTrackSmoothing(String trackId) {
+        trackSmoothing.remove(trackId);
+        trackOriginalAnnotations.remove(trackId);
+    }
+    
+    // Smoothing comparison mode state
+    private boolean smoothingComparisonMode = false;
+    private String smoothingComparisonTrackId = null;
+    private Map<Integer, Point> smoothingComparisonOriginal = null;
+    private Map<Integer, Point> smoothingComparisonSmoothed = null;
+    
+    /**
+     * Toggle smoothing comparison mode - splits the main view horizontally
+     * to show original vs smoothed trajectory side by side.
+     * Uses the main frame slider for navigation.
+     * 
+     * @param trackId The track to compare
+     */
+    private void toggleSmoothingComparisonMode(String trackId) {
+        if (smoothingComparisonMode && trackId.equals(smoothingComparisonTrackId)) {
+            // Exit comparison mode
+            exitSmoothingComparisonMode();
+            return;
+        }
+        
+        Map<Integer, Point> currentTrack = trackAnnotations.get(trackId);
+        if (currentTrack == null || currentTrack.isEmpty()) {
+            setStatus("Track has no data to compare");
+            return;
+        }
+        
+        // Get original (unsmoothed) data and smoothed data
+        Map<Integer, Point> originalData;
+        Map<Integer, Point> smoothedData;
+        
+        if (trackSmoothing.getOrDefault(trackId, false)) {
+            // Smoothing is enabled - original is stored, current is smoothed
+            originalData = trackOriginalAnnotations.get(trackId);
+            smoothedData = currentTrack;
+            if (originalData == null) {
+                originalData = currentTrack;
+            }
+        } else {
+            // Smoothing is disabled - current is original, compute smoothed preview
+            originalData = currentTrack;
+            smoothedData = smoothTrajectory(trackId);
+        }
+        
+        // Store comparison data
+        smoothingComparisonMode = true;
+        smoothingComparisonTrackId = trackId;
+        smoothingComparisonOriginal = new HashMap<>(originalData);
+        smoothingComparisonSmoothed = new HashMap<>(smoothedData);
+        
+        // Center view on the current track point
+        Point currentPoint = currentTrack.get(currentSlice - 1);
+        if (currentPoint != null && currentImage != null) {
+            int imgW = currentImage.getWidth();
+            int imgH = currentImage.getHeight();
+            int panelW = imageLabel.getWidth();
+            int panelH = imageLabel.getHeight();
+            
+            // Calculate scale to fit image in half width (same as paintComparisonView)
+            int halfW = panelW / 2;
+            double scaleX = (double)(halfW - 10) / imgW;
+            double scaleY = (double)(panelH - 60) / imgH;
+            double scale = Math.min(scaleX, scaleY) * zoomFactor;
+            
+            int scaledW = (int)(imgW * scale);
+            int scaledH = (int)(imgH * scale);
+            
+            // Calculate pixel dimensions
+            double pixelW = (double) scaledW / imgW;
+            double pixelH = (double) scaledH / imgH;
+            
+            // Target: center of left half (where we want the track point)
+            int targetCenterX = halfW / 2;
+            int targetCenterY = panelH / 2;
+            
+            // Base position of image in left half (without offset)
+            int baseX = (halfW - scaledW) / 2;
+            int baseY = (panelH - scaledH) / 2 + 20;
+            
+            // Where the track point would be without offset
+            int trackScreenX = baseX + (int)(currentPoint.x * pixelW);
+            int trackScreenY = baseY + (int)(currentPoint.y * pixelH);
+            
+            // Calculate offset to center the track point
+            imageOffsetX = targetCenterX - trackScreenX;
+            imageOffsetY = targetCenterY - trackScreenY;
+        }
+        
+        // Refresh display
+        imageLabel.repaint();
+        setStatus("Comparison mode: Original (left) vs Smoothed (right) - Right-click smoothing button or press ESC to exit");
+    }
+    
+    /**
+     * Exit smoothing comparison mode and return to normal view.
+     * Refocuses the view on the track point.
+     */
+    private void exitSmoothingComparisonMode() {
+        String trackId = smoothingComparisonTrackId;
+        
+        smoothingComparisonMode = false;
+        smoothingComparisonTrackId = null;
+        smoothingComparisonOriginal = null;
+        smoothingComparisonSmoothed = null;
+        
+        // Refocus on the track point
+        if (trackId != null && trackAnnotations.containsKey(trackId)) {
+            Map<Integer, Point> track = trackAnnotations.get(trackId);
+            Point currentPoint = track.get(currentSlice - 1);
+            if (currentPoint != null && currentImage != null) {
+                int imgW = currentImage.getWidth();
+                int imgH = currentImage.getHeight();
+                int panelW = imageLabel.getWidth();
+                int panelH = imageLabel.getHeight();
+                
+                // Calculate where the track point is in screen coordinates
+                int dstW = (int) Math.ceil(imgW * zoomFactor);
+                int dstH = (int) Math.ceil(imgH * zoomFactor);
+                int dstX = (int) Math.floor(imageOffsetX);
+                int dstY = (int) Math.floor(imageOffsetY);
+                
+                double pixelWidth = (double) dstW / imgW;
+                double pixelHeight = (double) dstH / imgH;
+                
+                int trackScreenX = dstX + (int) Math.floor(currentPoint.x * pixelWidth);
+                int trackScreenY = dstY + (int) Math.floor(currentPoint.y * pixelHeight);
+                
+                // Center of viewport
+                int viewportCenterX = panelW / 2;
+                int viewportCenterY = panelH / 2;
+                
+                // Adjust offset to center the track point
+                imageOffsetX = imageOffsetX + (viewportCenterX - trackScreenX);
+                imageOffsetY = imageOffsetY + (viewportCenterY - trackScreenY);
+            }
+        }
+        
+        imageLabel.repaint();
+        setStatus("Exited comparison mode");
+    }
+    
+    /**
+     * Paint the split comparison view showing original vs smoothed trajectory.
+     * Called from paintComponentImpl when comparison mode is active.
+     */
+    private void paintComparisonView(Graphics g) {
+        Graphics2D g2d = (Graphics2D) g;
+        g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        
+        int imgW = currentImage.getWidth();
+        int imgH = currentImage.getHeight();
+        int panelW = imageLabel.getWidth();
+        int panelH = imageLabel.getHeight();
+        
+        // Split panel horizontally (left/right) - left half for original, right half for smoothed
+        int halfW = panelW / 2;
+        int dividerWidth = 4;
+        
+        // Calculate scaled image size to fit in each half (width-wise)
+        double scaleX = (double)(halfW - 10) / imgW;
+        double scaleY = (double)(panelH - 60) / imgH;  // Leave room for labels
+        double scale = Math.min(scaleX, scaleY) * zoomFactor;
+        
+        int scaledW = (int)(imgW * scale);
+        int scaledH = (int)(imgH * scale);
+        
+        // Apply pan offset (shared between both views)
+        int offsetX = (int) imageOffsetX;
+        int offsetY = (int) imageOffsetY;
+        
+        // Left panel position (original) - centered in left half
+        int leftX = (halfW - scaledW) / 2 + offsetX;
+        int leftY = (panelH - scaledH) / 2 + 20 + offsetY;
+        
+        // Right panel position (smoothed) - centered in right half
+        int rightX = halfW + dividerWidth/2 + (halfW - scaledW) / 2 + offsetX;
+        int rightY = (panelH - scaledH) / 2 + 20 + offsetY;  // Same Y as left (side by side)
+        
+        // Rendering hint for image
+        if (scale >= 1.0) {
+            g2d.setRenderingHint(RenderingHints.KEY_INTERPOLATION, 
+                                 RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
+        } else {
+            g2d.setRenderingHint(RenderingHints.KEY_INTERPOLATION, 
+                                 RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+        }
+        
+        // Draw left image (original view) - left half of screen
+        g2d.setClip(0, 0, halfW - dividerWidth/2, panelH);
+        g2d.drawImage(currentImage, leftX, leftY, leftX + scaledW, leftY + scaledH,
+                      0, 0, imgW, imgH, null);
+        
+        // Draw right image (smoothed view) - right half of screen
+        g2d.setClip(halfW + dividerWidth/2, 0, panelW - (halfW + dividerWidth/2), panelH);
+        g2d.drawImage(currentImage, rightX, rightY, rightX + scaledW, rightY + scaledH,
+                      0, 0, imgW, imgH, null);
+        
+        // Reset clip
+        g2d.setClip(null);
+        
+        // Get track color
+        Color trackColor = getTrackColor(smoothingComparisonTrackId);
+        int frameIdx = currentSlice - 1;
+        double pixelW = (double) scaledW / imgW;
+        double pixelH = (double) scaledH / imgH;
+        
+        // Draw original track point (left side)
+        if (smoothingComparisonOriginal != null) {
+            g2d.setClip(0, 0, halfW - dividerWidth/2, panelH);
+            drawComparisonTrackPoint(g2d, smoothingComparisonOriginal, frameIdx, 
+                                     leftX, leftY, pixelW, pixelH, trackColor, new Color(255, 100, 100));
+        }
+        
+        // Draw smoothed track point (right side)
+        if (smoothingComparisonSmoothed != null) {
+            g2d.setClip(halfW + dividerWidth/2, 0, halfW - dividerWidth/2, panelH);
+            drawComparisonTrackPoint(g2d, smoothingComparisonSmoothed, frameIdx,
+                                     rightX, rightY, pixelW, pixelH, trackColor, new Color(100, 255, 255));
+        }
+        
+        // Reset clip for labels and divider
+        g2d.setClip(null);
+        
+        // Draw divider line
+        g2d.setColor(new Color(80, 80, 80));
+        g2d.fillRect(halfW - dividerWidth/2, 0, dividerWidth, panelH);
+        g2d.setColor(ACCENT_BLUE);
+        g2d.fillRect(halfW - 1, 0, 2, panelH);
+        
+        // Draw labels at top
+        g2d.setFont(new Font("Segoe UI", Font.BOLD, 14));
+        FontMetrics fm = g2d.getFontMetrics();
+        
+        // Original label (left)
+        String origLabel = "ORIGINAL";
+        int origLabelW = fm.stringWidth(origLabel);
+        g2d.setColor(new Color(40, 40, 40, 220));
+        g2d.fillRoundRect(halfW/2 - origLabelW/2 - 12, 8, origLabelW + 24, 26, 8, 8);
+        g2d.setColor(new Color(255, 150, 150));
+        g2d.drawString(origLabel, halfW/2 - origLabelW/2, 26);
+        
+        // Smoothed label (right)
+        String smoothLabel = "SMOOTHED";
+        int smoothLabelW = fm.stringWidth(smoothLabel);
+        g2d.setColor(new Color(40, 40, 40, 220));
+        g2d.fillRoundRect(halfW + halfW/2 - smoothLabelW/2 - 12, 8, smoothLabelW + 24, 26, 8, 8);
+        g2d.setColor(new Color(100, 255, 255));
+        g2d.drawString(smoothLabel, halfW + halfW/2 - smoothLabelW/2, 26);
+        
+        // Draw coordinate comparison at bottom
+        Point origPoint = smoothingComparisonOriginal != null ? smoothingComparisonOriginal.get(frameIdx) : null;
+        Point smoothPoint = smoothingComparisonSmoothed != null ? smoothingComparisonSmoothed.get(frameIdx) : null;
+        
+        g2d.setFont(new Font("Monospaced", Font.BOLD, 12));
+        fm = g2d.getFontMetrics();
+        
+        if (origPoint != null) {
+            String origCoord = String.format("(%d, %d)", origPoint.x, origPoint.y);
+            g2d.setColor(new Color(0, 0, 0, 180));
+            g2d.fillRoundRect(10, panelH - 30, fm.stringWidth(origCoord) + 10, 22, 5, 5);
+            g2d.setColor(new Color(255, 150, 150));
+            g2d.drawString(origCoord, 15, panelH - 13);
+        }
+        
+        if (smoothPoint != null) {
+            String smoothCoord = String.format("(%d, %d)", smoothPoint.x, smoothPoint.y);
+            g2d.setColor(new Color(0, 0, 0, 180));
+            g2d.fillRoundRect(halfW + 10, panelH - 30, fm.stringWidth(smoothCoord) + 10, 22, 5, 5);
+            g2d.setColor(new Color(100, 255, 255));
+            g2d.drawString(smoothCoord, halfW + 15, panelH - 13);
+        }
+        
+        // Draw difference indicator if both points exist
+        if (origPoint != null && smoothPoint != null) {
+            double dist = Math.sqrt(Math.pow(origPoint.x - smoothPoint.x, 2) + 
+                                    Math.pow(origPoint.y - smoothPoint.y, 2));
+            String diffStr = String.format("Δ: %.1f px", dist);
+            int diffW = fm.stringWidth(diffStr);
+            g2d.setColor(new Color(0, 0, 0, 200));
+            g2d.fillRoundRect(halfW - diffW/2 - 8, panelH - 30, diffW + 16, 22, 5, 5);
+            g2d.setColor(Color.WHITE);
+            g2d.drawString(diffStr, halfW - diffW/2, panelH - 13);
+        }
+        
+        // Draw exit hint
+        g2d.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+        String hint = "Right-click smoothing button or press ESC to exit comparison";
+        int hintW = g2d.getFontMetrics().stringWidth(hint);
+        g2d.setColor(new Color(0, 0, 0, 150));
+        g2d.fillRoundRect(panelW/2 - hintW/2 - 10, panelH - 55, hintW + 20, 20, 5, 5);
+        g2d.setColor(TEXT_SECONDARY);
+        g2d.drawString(hint, panelW/2 - hintW/2, panelH - 40);
+    }
+    
+    /**
+     * Helper method to draw a track point with trail in comparison view.
+     * Uses the same cursor styling as the main view.
+     */
+    private void drawComparisonTrackPoint(Graphics2D g2d, Map<Integer, Point> trackData, 
+                                           int frameIdx, int baseX, int baseY,
+                                           double pixelW, double pixelH, 
+                                           Color trackColor, Color accentColor) {
+        // Draw trail (last 15 frames)
+        g2d.setStroke(new BasicStroke(Math.max(1.5f, (float)(pixelW * 0.4))));
+        int trailStart = Math.max(0, frameIdx - 15);
+        Point prevPoint = null;
+        for (int i = trailStart; i <= frameIdx; i++) {
+            Point p = trackData.get(i);
+            if (p != null) {
+                int sx = baseX + (int)(p.x * pixelW);
+                int sy = baseY + (int)(p.y * pixelH);
+                
+                if (prevPoint != null) {
+                    float alpha = 0.2f + 0.6f * (i - trailStart) / Math.max(1, frameIdx - trailStart);
+                    g2d.setColor(new Color(trackColor.getRed(), trackColor.getGreen(),
+                                           trackColor.getBlue(), (int)(alpha * 200)));
+                    g2d.drawLine(prevPoint.x, prevPoint.y, sx, sy);
+                }
+                prevPoint = new Point(sx, sy);
+            }
+        }
+        
+        // Draw current point using the same cursor styling as main view
+        Point p = trackData.get(frameIdx);
+        if (p != null) {
+            int screenX = baseX + (int) Math.floor(p.x * pixelW);
+            int screenY = baseY + (int) Math.floor(p.y * pixelH);
+            int screenPixelW = (int) Math.ceil(pixelW);
+            int screenPixelH = (int) Math.ceil(pixelH);
+            
+            // Calculate cursor bounds in image coordinates (same as main view)
+            int halfB = (hoverCursorSize - 1) / 2;
+            int halfA = hoverCursorSize / 2;
+            int px1 = p.x - halfB;
+            int py1 = p.y - halfB;
+            int px2 = p.x + halfA + 1;
+            int py2 = p.y + halfA + 1;
+            
+            int sx1 = baseX + (int) Math.floor(px1 * pixelW);
+            int sy1 = baseY + (int) Math.floor(py1 * pixelH);
+            int sx2 = baseX + (int) Math.floor(px2 * pixelW);
+            int sy2 = baseY + (int) Math.floor(py2 * pixelH);
+            int sw = sx2 - sx1;
+            int sh = sy2 - sy1;
+            
+            g2d.setStroke(new BasicStroke(Math.max(1.0f, (float)(pixelW / 3.0))));
+            g2d.setColor(trackColor);
+            
+            if (cursorCircleMode) {
+                // Draw circle/ellipse
+                if (cursorOpaqueMode) {
+                    g2d.fillOval(sx1, sy1, sw, sh);
+                } else {
+                    // Draw center pixel filled + circle outline
+                    g2d.fillRect(screenX, screenY, screenPixelW, screenPixelH);
+                    g2d.drawOval(sx1, sy1, sw, sh);
+                }
+            } else {
+                // Draw square/rectangle
+                if (cursorOpaqueMode) {
+                    g2d.fillRect(sx1, sy1, sw, sh);
+                } else {
+                    // Draw center pixel filled + square outline
+                    g2d.fillRect(screenX, screenY, screenPixelW, screenPixelH);
+                    g2d.drawRect(sx1, sy1, sw, sh);
+                }
+            }
+        }
+    }
+
+    private void loadConfig() {
+        File configFile = new File(CONFIG_FILE);
+        if (configFile.exists()) {
+            try (FileInputStream fis = new FileInputStream(configFile)) {
+                config.load(fis);
+                setStatus("Configuration loaded from " + CONFIG_FILE);
+            } catch (IOException e) {
+                System.err.println("Failed to load config: " + e.getMessage());
+                loadDefaultConfig();
+            }
+        } else {
+            loadDefaultConfig();
+        }
+    }
+
+    private void loadDefaultConfig() {
+        config.setProperty("bash.script.path", "scripts/run_persistent_tracking.sh");
+        config.setProperty("local.python.script", "src/main/python/tracking_server.py");
+        config.setProperty("local.work.dir", "/tmp/tracking_temp");
+        config.setProperty("local.conda.env", "ripple-env");
+        config.setProperty("local.socket.path", "/tmp/ripple-env.sock");
+        config.setProperty("raft.model.size", "large");
+        config.setProperty("local.timeout", "300");
+        config.setProperty("output.directory", "{VIDEO_DIR}");
+        config.setProperty("auto.compute.optical.flow", "true");
+        config.setProperty("cache.flow.to.disk", "true");  // Cache optical flow files to disk by default (reuse across sessions)
+        // Note: corridor.width removed - Full Blend method is now used by default
+        config.setProperty("tracking.mode", "single-seed");  // "single-seed" or "multi-seed"
+        config.setProperty("correction.local.mode", "false");  // Local correction mode (affects only nearby frames)
+        config.setProperty("correction.local.window", "11");  // Window size for local corrections (±5 frames)
+        saveConfig();
+    }
+
+    private void saveConfig() {
+        try (FileOutputStream fos = new FileOutputStream(CONFIG_FILE)) {
+            config.store(fos, "Native Linux RAFT Configuration (Local Execution)");
+        } catch (IOException e) {
+            System.err.println("Failed to save config: " + e.getMessage());
+        }
+    }
+    
+    /**
+     * Format milliseconds as a human-readable time string.
+     * @param millis Time in milliseconds
+     * @return Formatted string like "1h 23m 45s" or "5m 30s" or "45s"
+     */
+    private String formatTime(long millis) {
+        if (millis < 1000) {
+            return "< 1s";
+        }
+        long seconds = millis / 1000;
+        long minutes = seconds / 60;
+        long hours = minutes / 60;
+        seconds = seconds % 60;
+        minutes = minutes % 60;
+        
+        if (hours > 0) {
+            return String.format("%dh %dm %ds", hours, minutes, seconds);
+        } else if (minutes > 0) {
+            return String.format("%dm %ds", minutes, seconds);
+        } else {
+            return String.format("%ds", seconds);
+        }
+    }
+    
+    /**
+     * Start timing for a track. Called when a track is created or resumed.
+     * @param trackId The track ID
+     */
+    private void startTrackTimer(String trackId) {
+        // Initialize session start time if this is the first track
+        if (sessionStartTime == 0) {
+            sessionStartTime = System.currentTimeMillis();
+        }
+        
+        // Only start if not already running
+        if (trackStartTime.getOrDefault(trackId, 0L) == 0L) {
+            trackStartTime.put(trackId, System.currentTimeMillis());
+            // Initialize total time if not present
+            if (!trackTotalTime.containsKey(trackId)) {
+                trackTotalTime.put(trackId, 0L);
+            }
+        }
+    }
+    
+    /**
+     * Pause timing for a track. Called when marking complete or switching tracks.
+     * Accumulates elapsed time to total.
+     * @param trackId The track ID
+     */
+    private void pauseTrackTimer(String trackId) {
+        Long startTime = trackStartTime.get(trackId);
+        if (startTime != null && startTime > 0) {
+            long elapsed = System.currentTimeMillis() - startTime;
+            long currentTotal = trackTotalTime.getOrDefault(trackId, 0L);
+            trackTotalTime.put(trackId, currentTotal + elapsed);
+            trackStartTime.put(trackId, 0L); // Mark as paused
+        }
+    }
+    
+    /**
+     * Get the current total time for a track (including any active timing).
+     * @param trackId The track ID
+     * @return Total time in milliseconds
+     */
+    private long getTrackTotalTime(String trackId) {
+        long total = trackTotalTime.getOrDefault(trackId, 0L);
+        Long startTime = trackStartTime.get(trackId);
+        if (startTime != null && startTime > 0) {
+            // Add currently running time
+            total += System.currentTimeMillis() - startTime;
+        }
+        return total;
+    }
+    
+    /**
+     * Mark a track as complete. Stops the timer and prompts for trimming.
+     * @param trackId The track ID
+     */
+    private void markTrackComplete(String trackId) {
+        pauseTrackTimer(trackId);
+        
+        // Get the track's frame range
+        Map<Integer, Point> frameMap = trackAnnotations.get(trackId);
+        if (frameMap == null || frameMap.isEmpty()) {
+            trackCompleted.put(trackId, true);
+            refreshAnnotationList();
+            imageLabel.repaint();
+            setStatus(trackId + " marked complete (no points)");
+            return;
+        }
+        
+        // Find min and max frames
+        int minFrame = Integer.MAX_VALUE;
+        int maxFrame = Integer.MIN_VALUE;
+        for (int frame : frameMap.keySet()) {
+            minFrame = Math.min(minFrame, frame);
+            maxFrame = Math.max(maxFrame, frame);
+        }
+        
+        // Ask user if they want to mark occlusion segments
+        final int trackMinFrame = minFrame;
+        final int trackMaxFrame = maxFrame;
+        
+        int choice = JOptionPane.showConfirmDialog(frame,
+            "Would you like to mark occlusion segments for " + trackId + "?\n\n" +
+            "Track range: Frame " + (minFrame + 1) + " to " + (maxFrame + 1) + "\n" +
+            "(" + (maxFrame - minFrame + 1) + " frames total)\n\n" +
+            "Occlusion segments mark frames where the object is temporarily\n" +
+            "not visible (e.g., behind another object or out of frame).\n\n" +
+            "If the object is always visible, click No to mark complete.",
+            "Mark Occlusion Segments?",
+            JOptionPane.YES_NO_OPTION,
+            JOptionPane.QUESTION_MESSAGE);
+        
+        if (choice == JOptionPane.YES_OPTION) {
+            // Enter occlusion mode to define segments
+            enterOcclusionMode(trackId, trackMinFrame, trackMaxFrame);
+        } else {
+            // Mark complete without occlusions (object always visible)
+            trackCompleted.put(trackId, true);
+            refreshAnnotationList();
+            imageLabel.repaint();
+            long totalTime = trackTotalTime.getOrDefault(trackId, 0L);
+            setStatus(trackId + " marked complete - fully visible (" + formatTime(totalTime) + ")");
+        }
+    }
+    
+    /**
+     * Apply trim to a track - stores the original data and removes frames outside the trim range.
+     * @param trackId The track ID to trim
+     * @param trimStart The start frame (0-indexed, inclusive)
+     * @param trimEnd The end frame (0-indexed, inclusive)
+     */
+    private void applyTrackTrim(String trackId, int trimStart, int trimEnd) {
+        saveState(); // Save state for undo
+        
+        Map<Integer, Point> frameMap = trackAnnotations.get(trackId);
+        List<Anchor> anchors = trackAnchors.get(trackId);
+        
+        if (frameMap == null) return;
+        
+        // Store the untrimmed data (only if not already trimmed, i.e., this is the first trim)
+        if (!trackUntrimmedAnnotations.containsKey(trackId)) {
+            // Deep copy the original annotations
+            Map<Integer, Point> untrimmedCopy = new HashMap<>();
+            for (Map.Entry<Integer, Point> entry : frameMap.entrySet()) {
+                untrimmedCopy.put(entry.getKey(), new Point(entry.getValue()));
+            }
+            trackUntrimmedAnnotations.put(trackId, untrimmedCopy);
+            
+            // Deep copy the original anchors
+            if (anchors != null) {
+                List<Anchor> untrimmedAnchorsCopy = new ArrayList<>();
+                for (Anchor a : anchors) {
+                    untrimmedAnchorsCopy.add(new Anchor(a));
+                }
+                trackUntrimmedAnchors.put(trackId, untrimmedAnchorsCopy);
+            }
+        }
+        
+        // Store the trim range
+        trackTrimRange.put(trackId, new int[]{trimStart, trimEnd});
+        
+        // Remove frames outside the trim range
+        List<Integer> framesToRemove = new ArrayList<>();
+        for (int frame : frameMap.keySet()) {
+            if (frame < trimStart || frame > trimEnd) {
+                framesToRemove.add(frame);
+            }
+        }
+        for (int frame : framesToRemove) {
+            frameMap.remove(frame);
+        }
+        
+        // Remove anchors outside the trim range
+        if (anchors != null) {
+            anchors.removeIf(anchor -> anchor.frame < trimStart || anchor.frame > trimEnd);
+        }
+        
+        // Adjust occlusion segments to fit within the new trim range
+        adjustOcclusionSegmentsForTrim(trackId, trimStart, trimEnd);
+        
+        // Mark as complete
+        trackCompleted.put(trackId, true);
+        
+        refreshAnnotationList();
+        imageLabel.repaint();
+        frameSlider.repaint();
+        
+        int keptFrames = trimEnd - trimStart + 1;
+        long totalTime = trackTotalTime.getOrDefault(trackId, 0L);
+        setStatus(trackId + " trimmed to frames " + (trimStart + 1) + "-" + (trimEnd + 1) + " and marked complete (" + formatTime(totalTime) + ")");
+    }
+    
+    /**
+     * Adjust occlusion segments when a track is trimmed.
+     * Removes segments outside the trim range and clips segments that span the boundaries.
+     */
+    private void adjustOcclusionSegmentsForTrim(String trackId, int trimStart, int trimEnd) {
+        List<int[]> segments = trackOcclusionSegments.get(trackId);
+        if (segments == null || segments.isEmpty()) return;
+        
+        List<int[]> adjustedSegments = new ArrayList<>();
+        
+        for (int[] seg : segments) {
+            // Skip segments entirely outside the trim range
+            if (seg[1] < trimStart || seg[0] > trimEnd) {
+                continue;
+            }
+            
+            // Clip segment to fit within trim range
+            int newStart = Math.max(seg[0], trimStart);
+            int newEnd = Math.min(seg[1], trimEnd);
+            
+            if (newStart <= newEnd) {
+                adjustedSegments.add(new int[]{newStart, newEnd});
+            }
+        }
+        
+        if (adjustedSegments.isEmpty()) {
+            // No occlusion segments remaining after trim - remove entirely
+            trackOcclusionSegments.remove(trackId);
+        } else {
+            trackOcclusionSegments.put(trackId, adjustedSegments);
+        }
+    }
+    
+    /**
+     * Resume editing a completed track. Restarts the timer and clears completion status.
+     * Also clears occlusion segments so user can re-mark them when completing again.
+     * @param trackId The track ID
+     */
+    private void resumeTrackEditing(String trackId) {
+        saveState(); // Save state for undo
+        
+        // Restore untrimmed data if this track was trimmed (legacy support)
+        if (trackUntrimmedAnnotations.containsKey(trackId)) {
+            Map<Integer, Point> untrimmed = trackUntrimmedAnnotations.get(trackId);
+            Map<Integer, Point> currentFrameMap = trackAnnotations.get(trackId);
+            
+            if (currentFrameMap != null && untrimmed != null) {
+                // Restore the original untrimmed annotations
+                currentFrameMap.clear();
+                for (Map.Entry<Integer, Point> entry : untrimmed.entrySet()) {
+                    currentFrameMap.put(entry.getKey(), new Point(entry.getValue()));
+                }
+            }
+            
+            // Restore untrimmed anchors
+            if (trackUntrimmedAnchors.containsKey(trackId)) {
+                List<Anchor> untrimmedAnchors = trackUntrimmedAnchors.get(trackId);
+                List<Anchor> currentAnchors = trackAnchors.get(trackId);
+                
+                if (currentAnchors != null && untrimmedAnchors != null) {
+                    currentAnchors.clear();
+                    for (Anchor a : untrimmedAnchors) {
+                        currentAnchors.add(new Anchor(a));
+                    }
+                }
+            }
+            
+            // Clear the untrimmed storage
+            trackUntrimmedAnnotations.remove(trackId);
+            trackUntrimmedAnchors.remove(trackId);
+            trackTrimRange.remove(trackId);
+        }
+        
+        // Clear occlusion segments - user will re-mark them when completing again
+        boolean hadOcclusions = trackOcclusionSegments.containsKey(trackId);
+        trackOcclusionSegments.remove(trackId);
+        
+        trackCompleted.put(trackId, false);
+        startTrackTimer(trackId);
+        refreshAnnotationList();
+        imageLabel.repaint();
+        frameSlider.repaint();
+        
+        if (hadOcclusions) {
+            setStatus(trackId + " resumed for editing (occlusion segments cleared)");
+        } else {
+            setStatus(trackId + " resumed for editing");
+        }
+    }
+    
+    /**
+     * Update trim mode selection based on mouse position on the slider.
+     * @param mouseX The x coordinate of the mouse on the slider
+     * @param isStart True if updating start thumb, false for end thumb
+     */
+    private void updateTrimModeFromMouse(int mouseX, boolean isStart) {
+        if (!trimModeActive || frameSlider == null) return;
+        
+        Insets insets = frameSlider.getInsets();
+        int trackLeft = insets.left + 6;
+        int trackRight = frameSlider.getWidth() - insets.right - 6;
+        int trackWidth = trackRight - trackLeft;
+        
+        // Calculate frame from mouse position
+        double ratio = (double)(mouseX - trackLeft) / Math.max(1, trackWidth);
+        ratio = Math.max(0, Math.min(1, ratio));  // Clamp to [0, 1]
+        
+        int sliderValue = (int) Math.round(frameSlider.getMinimum() + ratio * (frameSlider.getMaximum() - frameSlider.getMinimum()));
+        int frameIndex = sliderValue - 1;  // Convert to 0-indexed
+        
+        // Clamp to track range
+        frameIndex = Math.max(trimModeMinFrame, Math.min(trimModeMaxFrame, frameIndex));
+        
+        if (isStart) {
+            // Start can't exceed end
+            trimModeStartValue = Math.min(frameIndex, trimModeEndValue);
+            // Update the displayed frame to the start frame
+            goToFrame(trimModeStartValue + 1);  // Convert to 1-indexed
+        } else {
+            // End can't be less than start
+            trimModeEndValue = Math.max(frameIndex, trimModeStartValue);
+            // Update the displayed frame to the end frame
+            goToFrame(trimModeEndValue + 1);  // Convert to 1-indexed
+        }
+        
+        updateTrimModeInfoLabel();
+        frameSlider.repaint();
+    }
+    
+    /**
+     * Update the trim mode info label with current selection.
+     */
+    private void updateTrimModeInfoLabel() {
+        if (trimModeInfoLabel == null) return;
+        
+        int keptFrames = trimModeEndValue - trimModeStartValue + 1;
+        int totalFrames = trimModeMaxFrame - trimModeMinFrame + 1;
+        int removedFrames = totalFrames - keptFrames;
+        
+        if (removedFrames == 0) {
+            trimModeInfoLabel.setText("Keeping all " + totalFrames + " frames (no trimming)");
+            trimModeInfoLabel.setForeground(TEXT_SECONDARY);
+        } else {
+            trimModeInfoLabel.setText("Keeping frames " + (trimModeStartValue + 1) + "-" + (trimModeEndValue + 1) + 
+                " (" + keptFrames + " frames, removing " + removedFrames + ")");
+            trimModeInfoLabel.setForeground(ACCENT_YELLOW);
+        }
+    }
+    
+    /**
+     * Navigate to a specific frame.
+     * @param frame The frame number (1-indexed)
+     */
+    private void goToFrame(int frame) {
+        if (imp == null || totalSlices <= 0) return;
+        
+        int targetFrame = Math.max(1, Math.min(totalSlices, frame));
+        if (targetFrame != currentSlice) {
+            currentSlice = targetFrame;
+            frameSlider.setValue(currentSlice);
+            pageLabel.setText(String.format("Frame: %d / %d", currentSlice, totalSlices));
+            loadSliceImageFast();
+        }
+    }
+    
+    /**
+     * Enter trim mode for a track - shows range slider on the main frame slider.
+     * @param trackId The track ID to trim
+     * @param minFrame The minimum frame of the track (0-indexed)
+     * @param maxFrame The maximum frame of the track (0-indexed)
+     */
+    private void enterTrimMode(String trackId, int minFrame, int maxFrame) {
+        // Edge case: track with single frame - nothing to trim
+        if (minFrame == maxFrame) {
+            JOptionPane.showMessageDialog(frame,
+                "This track only has a single frame and cannot be trimmed.\n" +
+                "The track will be marked as complete.",
+                "Cannot Trim",
+                JOptionPane.INFORMATION_MESSAGE);
+            trackCompleted.put(trackId, true);
+            refreshAnnotationList();
+            imageLabel.repaint();
+            setStatus(trackId + " marked complete (single frame, no trim needed)");
+            return;
+        }
+        
+        // Save current state
+        frameBeforeTrimMode = currentSlice;
+        
+        // Initialize trim mode state
+        trimModeActive = true;
+        trimModeTrackId = trackId;
+        trimModeMinFrame = minFrame;
+        trimModeMaxFrame = maxFrame;
+        trimModeStartValue = minFrame;  // Default: keep all
+        trimModeEndValue = maxFrame;
+        trimModeDraggingStart = false;
+        trimModeDraggingEnd = false;
+        
+        // Create trim mode control panel
+        createTrimModeControlPanel();
+        
+        // Navigate to start frame
+        goToFrame(minFrame + 1);
+        
+        // Update UI
+        frameSlider.repaint();
+        imageLabel.repaint();
+        refreshAnnotationList();
+        
+        setStatus("Trim mode: Drag green thumb for start, red for end. Click Apply when done.");
+    }
+    
+    /**
+     * Create the trim mode control panel with buttons and info label.
+     */
+    private void createTrimModeControlPanel() {
+        if (trimModeControlPanel != null) {
+            frameNavPanel.remove(trimModeControlPanel);
+        }
+        
+        trimModeControlPanel = new JPanel(new BorderLayout(10, 0));
+        trimModeControlPanel.setOpaque(true);
+        trimModeControlPanel.setBackground(PANEL_DARK);
+        // Add bottom margin so text doesn't overlap with slider graphics
+        trimModeControlPanel.setBorder(BorderFactory.createEmptyBorder(0, 0, 12, 0));
+        
+        // Info label on the left
+        trimModeInfoLabel = new JLabel();
+        trimModeInfoLabel.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        updateTrimModeInfoLabel();
+        
+        // Track info
+        Color trackColor = getTrackColor(trimModeTrackId);
+        JPanel trackIndicator = new JPanel();
+        trackIndicator.setPreferredSize(new Dimension(16, 16));
+        trackIndicator.setBackground(trackColor);
+        trackIndicator.setBorder(BorderFactory.createLineBorder(trackColor.darker(), 1));
+        trackIndicator.setOpaque(true);
+        
+        JLabel trackLabel = new JLabel("Trimming " + trimModeTrackId + ": ");
+        trackLabel.setFont(new Font("Segoe UI", Font.BOLD, 12));
+        trackLabel.setForeground(TEXT_PRIMARY);
+        
+        JPanel leftPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
+        leftPanel.setOpaque(true);
+        leftPanel.setBackground(PANEL_DARK);
+        leftPanel.add(trackIndicator);
+        leftPanel.add(trackLabel);
+        leftPanel.add(trimModeInfoLabel);
+        
+        // Buttons on the right
+        JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
+        buttonPanel.setOpaque(true);
+        buttonPanel.setBackground(PANEL_DARK);
+        
+        JButton applyButton = new JButton("Apply Trim");
+        applyButton.setBackground(ACCENT_GREEN);
+        applyButton.setForeground(Color.WHITE);
+        applyButton.setFocusPainted(false);
+        applyButton.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        applyButton.setFont(new Font("Segoe UI", Font.BOLD, 11));
+        applyButton.addActionListener(e -> applyTrimModeAndExit());
+        
+        JButton skipButton = new JButton("Skip");
+        skipButton.setBackground(SURFACE_HOVER);
+        skipButton.setForeground(TEXT_PRIMARY);
+        skipButton.setFocusPainted(false);
+        skipButton.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        skipButton.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+        skipButton.setToolTipText("Mark complete without trimming");
+        skipButton.addActionListener(e -> skipTrimModeAndComplete());
+        
+        JButton cancelButton = new JButton("Cancel");
+        cancelButton.setBackground(SURFACE_HOVER);
+        cancelButton.setForeground(TEXT_SECONDARY);
+        cancelButton.setFocusPainted(false);
+        cancelButton.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        cancelButton.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+        cancelButton.setToolTipText("Cancel and continue editing");
+        cancelButton.addActionListener(e -> cancelTrimMode());
+        
+        buttonPanel.add(applyButton);
+        buttonPanel.add(skipButton);
+        buttonPanel.add(cancelButton);
+        
+        trimModeControlPanel.add(leftPanel, BorderLayout.CENTER);
+        trimModeControlPanel.add(buttonPanel, BorderLayout.EAST);
+        
+        // Replace page label with trim control panel
+        frameNavPanel.remove(pageLabel);
+        frameNavPanel.add(trimModeControlPanel, BorderLayout.NORTH);
+        frameNavPanel.revalidate();
+        frameNavPanel.repaint();
+    }
+    
+    /**
+     * Apply the trim and exit trim mode.
+     */
+    private void applyTrimModeAndExit() {
+        if (!trimModeActive) return;
+        
+        String trackId = trimModeTrackId;
+        int trimStart = trimModeStartValue;
+        int trimEnd = trimModeEndValue;
+        int originalMin = trimModeMinFrame;
+        int originalMax = trimModeMaxFrame;
+        
+        // Exit trim mode first
+        exitTrimMode();
+        
+        // Apply the trim (only if something was actually trimmed)
+        if (trimStart > originalMin || trimEnd < originalMax) {
+            applyTrackTrim(trackId, trimStart, trimEnd);
+        } else {
+            // No trimming needed, just mark complete
+            trackCompleted.put(trackId, true);
+            refreshAnnotationList();
+            imageLabel.repaint();
+            long totalTime = trackTotalTime.getOrDefault(trackId, 0L);
+            setStatus(trackId + " marked complete (no trimming applied) (" + formatTime(totalTime) + ")");
+        }
+    }
+    
+    /**
+     * Skip trimming and mark track as complete.
+     */
+    private void skipTrimModeAndComplete() {
+        if (!trimModeActive) return;
+        
+        String trackId = trimModeTrackId;
+        
+        // Exit trim mode
+        exitTrimMode();
+        
+        // Mark complete without trimming
+        trackCompleted.put(trackId, true);
+        refreshAnnotationList();
+        imageLabel.repaint();
+        long totalTime = trackTotalTime.getOrDefault(trackId, 0L);
+        setStatus(trackId + " marked complete (" + formatTime(totalTime) + ")");
+    }
+    
+    /**
+     * Cancel trim mode and resume editing.
+     */
+    private void cancelTrimMode() {
+        if (!trimModeActive) return;
+        
+        String trackId = trimModeTrackId;
+        
+        // Exit trim mode
+        exitTrimMode();
+        
+        // Resume editing (don't mark as complete)
+        startTrackTimer(trackId);
+        setStatus(trackId + " - trim cancelled, continuing edit");
+    }
+    
+    /**
+     * Exit trim mode and restore normal UI.
+     */
+    private void exitTrimMode() {
+        if (!trimModeActive) return;
+        
+        // Reset state
+        trimModeActive = false;
+        trimModeTrackId = null;
+        trimModeDraggingStart = false;
+        trimModeDraggingEnd = false;
+        
+        // Remove trim control panel and restore page label
+        if (trimModeControlPanel != null) {
+            frameNavPanel.remove(trimModeControlPanel);
+            trimModeControlPanel = null;
+            trimModeInfoLabel = null;
+        }
+        frameNavPanel.add(pageLabel, BorderLayout.WEST);
+        frameNavPanel.revalidate();
+        frameNavPanel.repaint();
+        
+        // Restore frame
+        goToFrame(frameBeforeTrimMode);
+        
+        // Update UI
+        frameSlider.repaint();
+        imageLabel.repaint();
+        refreshAnnotationList();
+    }
+    
+    // ====== OCCLUSION MODE FOR LOCOTRACK FINE-TUNING ======
+    // Unlike trim mode which specifies a single contiguous range, occlusion mode
+    // allows marking multiple visible segments (object visible between frames X-Y, then again Z-W, etc.)
+    // Frames outside visible segments are considered occluded (object not visible in frame)
+    
+    /**
+     * Enter occlusion mode for a track - allows marking multiple visible segments.
+     * This is required for LocoTrack fine-tuning which needs occlusion ground truth.
+     * 
+     * @param trackId The track ID to edit occlusions for
+     * @param minFrame The minimum frame of the track (0-indexed)
+     * @param maxFrame The maximum frame of the track (0-indexed)
+     */
+    private void enterOcclusionMode(String trackId, int minFrame, int maxFrame) {
+        // Edge case: track with single frame - nothing to mark
+        if (minFrame == maxFrame) {
+            JOptionPane.showMessageDialog(frame,
+                "This track only has a single frame.\n" +
+                "Single-frame tracks are assumed fully visible.",
+                "Cannot Edit Occlusions",
+                JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        
+        // Save current state
+        frameBeforeOcclusionMode = currentSlice;
+        
+        // Initialize occlusion mode state
+        occlusionModeActive = true;
+        occlusionModeTrackId = trackId;
+        occlusionModeMinFrame = minFrame;
+        occlusionModeMaxFrame = maxFrame;
+        occlusionModePendingStart = -1;  // No pending segment initially
+        occlusionModeDraggingSegmentIdx = -1;
+        occlusionModeDraggingStart = false;
+        occlusionModeDraggingEnd = false;
+        
+        // Load existing OCCLUSION segments (frames where object is hidden)
+        // If no segments exist, default is empty list (object fully visible throughout)
+        if (trackOcclusionSegments.containsKey(trackId)) {
+            // Deep copy existing segments for editing
+            occlusionModeSegments = new ArrayList<>();
+            for (int[] seg : trackOcclusionSegments.get(trackId)) {
+                occlusionModeSegments.add(new int[]{seg[0], seg[1]});
+            }
+        } else {
+            // Default: no occlusions (empty list = object is visible throughout)
+            occlusionModeSegments = new ArrayList<>();
+        }
+        
+        // Create occlusion mode control panel
+        createOcclusionModeControlPanel();
+        
+        // Navigate to start frame
+        goToFrame(minFrame + 1);
+        
+        // Update UI
+        frameSlider.repaint();
+        imageLabel.repaint();
+        refreshAnnotationList();
+        
+        setStatus("Occlusion mode: Mark frames where object becomes occluded (hidden). Green = visible, Red = occluded.");
+    }
+    
+    /**
+     * Create the occlusion mode control panel with buttons and info label.
+     * Layout is similar to trim mode for consistency.
+     */
+    private void createOcclusionModeControlPanel() {
+        if (occlusionModeControlPanel != null) {
+            frameNavPanel.remove(occlusionModeControlPanel);
+        }
+        
+        occlusionModeControlPanel = new JPanel(new BorderLayout(10, 0));
+        occlusionModeControlPanel.setOpaque(true);
+        occlusionModeControlPanel.setBackground(PANEL_DARK);
+        occlusionModeControlPanel.setPreferredSize(new Dimension(0, 45));  // Fixed height to fit text
+        // Add bottom margin so text doesn't overlap with slider graphics
+        occlusionModeControlPanel.setBorder(BorderFactory.createEmptyBorder(0, 0, 12, 0));
+        
+        // Info label
+        occlusionModeInfoLabel = new JLabel();
+        occlusionModeInfoLabel.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        updateOcclusionModeInfoLabel();
+        
+        // Track info
+        Color trackColor = getTrackColor(occlusionModeTrackId);
+        JPanel trackIndicator = new JPanel();
+        trackIndicator.setPreferredSize(new Dimension(16, 16));
+        trackIndicator.setBackground(trackColor);
+        trackIndicator.setBorder(BorderFactory.createLineBorder(trackColor.darker(), 1));
+        trackIndicator.setOpaque(true);
+        
+        JLabel trackLabel = new JLabel("Occlusions for " + occlusionModeTrackId + ": ");
+        trackLabel.setFont(new Font("Segoe UI", Font.BOLD, 12));
+        trackLabel.setForeground(TEXT_PRIMARY);
+        
+        JPanel leftPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
+        leftPanel.setOpaque(true);
+        leftPanel.setBackground(PANEL_DARK);
+        leftPanel.add(trackIndicator);
+        leftPanel.add(trackLabel);
+        leftPanel.add(occlusionModeInfoLabel);
+        
+        // Buttons on the right
+        JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
+        buttonPanel.setOpaque(true);
+        buttonPanel.setBackground(PANEL_DARK);
+        
+        // Start/End Occlusion Segment button - changes state based on pending segment
+        occlusionModeAddButton = new JButton("Start Occlusion");
+        occlusionModeAddButton.setBackground(new Color(180, 80, 80));  // Red-ish for occlusion
+        occlusionModeAddButton.setForeground(Color.WHITE);
+        occlusionModeAddButton.setFocusPainted(false);
+        occlusionModeAddButton.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        occlusionModeAddButton.setFont(new Font("Segoe UI", Font.BOLD, 11));
+        occlusionModeAddButton.setToolTipText("Mark current frame as start of occlusion (object disappears)");
+        occlusionModeAddButton.addActionListener(e -> toggleOcclusionSegment());
+        
+        JButton removeSegmentButton = new JButton("Remove Segment");
+        removeSegmentButton.setBackground(new Color(100, 100, 100));
+        removeSegmentButton.setForeground(Color.WHITE);
+        removeSegmentButton.setFocusPainted(false);
+        removeSegmentButton.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        removeSegmentButton.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+        removeSegmentButton.setToolTipText("Remove the occlusion segment at current frame");
+        removeSegmentButton.addActionListener(e -> removeOcclusionSegmentAtCurrentFrame());
+        
+        JButton applyButton = new JButton("Apply");
+        applyButton.setBackground(ACCENT_GREEN);
+        applyButton.setForeground(Color.WHITE);
+        applyButton.setFocusPainted(false);
+        applyButton.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        applyButton.setFont(new Font("Segoe UI", Font.BOLD, 11));
+        applyButton.addActionListener(e -> applyOcclusionModeAndExit());
+        
+        JButton cancelButton = new JButton("Cancel");
+        cancelButton.setBackground(SURFACE_HOVER);
+        cancelButton.setForeground(TEXT_SECONDARY);
+        cancelButton.setFocusPainted(false);
+        cancelButton.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        cancelButton.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+        cancelButton.addActionListener(e -> cancelOcclusionMode());
+        
+        buttonPanel.add(occlusionModeAddButton);
+        buttonPanel.add(removeSegmentButton);
+        buttonPanel.add(applyButton);
+        buttonPanel.add(cancelButton);
+        
+        occlusionModeControlPanel.add(leftPanel, BorderLayout.CENTER);
+        occlusionModeControlPanel.add(buttonPanel, BorderLayout.EAST);
+        
+        // Replace page label with occlusion control panel
+        frameNavPanel.remove(pageLabel);
+        frameNavPanel.add(occlusionModeControlPanel, BorderLayout.NORTH);
+        frameNavPanel.revalidate();
+        frameNavPanel.repaint();
+    }
+    
+    /**
+     * Toggle occlusion segment: Start a new occlusion or end the pending one.
+     */
+    private void toggleOcclusionSegment() {
+        if (!occlusionModeActive || occlusionModeSegments == null) return;
+        
+        int currentFrame = currentSlice - 1;  // Convert to 0-indexed
+        
+        if (occlusionModePendingStart < 0) {
+            // No pending segment - start a new occlusion
+            // Check if current frame is already in an occlusion segment
+            for (int[] seg : occlusionModeSegments) {
+                if (currentFrame >= seg[0] && currentFrame <= seg[1]) {
+                    JOptionPane.showMessageDialog(frame,
+                        "Current frame is already inside an occlusion segment.\n\n" +
+                        "To modify an existing segment, remove it first and create a new one.",
+                        "Frame Already Occluded",
+                        JOptionPane.WARNING_MESSAGE);
+                    return;
+                }
+            }
+            
+            // Start the pending occlusion at current frame
+            occlusionModePendingStart = currentFrame;
+            
+            // Update button appearance
+            occlusionModeAddButton.setText("End Occlusion");
+            occlusionModeAddButton.setBackground(ACCENT_GREEN);
+            occlusionModeAddButton.setToolTipText("Mark current frame as end of occlusion (object reappears)");
+            
+            updateOcclusionModeInfoLabel();
+            frameSlider.repaint();
+            setStatus("Occlusion started at frame " + (currentFrame + 1) + ". Navigate to where object reappears and click 'End Occlusion'.");
+        } else {
+            // We have a pending start - end the occlusion segment
+            int startFrame = occlusionModePendingStart;
+            int endFrame = currentFrame;
+            
+            // Validate: end must be >= start
+            if (endFrame < startFrame) {
+                // Swap if user went backwards
+                int temp = startFrame;
+                startFrame = endFrame;
+                endFrame = temp;
+            }
+            
+            // Check for overlaps with existing segments
+            for (int[] seg : occlusionModeSegments) {
+                // Check if new segment overlaps with existing
+                if (!(endFrame < seg[0] || startFrame > seg[1])) {
+                    JOptionPane.showMessageDialog(frame,
+                        "Occlusion segments cannot overlap.\n\n" +
+                        "The segment you're trying to create (frames " + (startFrame + 1) + "-" + (endFrame + 1) + ")\n" +
+                        "overlaps with an existing segment (frames " + (seg[0] + 1) + "-" + (seg[1] + 1) + ").\n\n" +
+                        "Please remove the existing segment first, or choose different frames.",
+                        "Segments Overlap",
+                        JOptionPane.WARNING_MESSAGE);
+                    return;
+                }
+            }
+            
+            // Add the new occlusion segment
+            occlusionModeSegments.add(new int[]{startFrame, endFrame});
+            
+            // Sort segments by start frame
+            occlusionModeSegments.sort((a, b) -> Integer.compare(a[0], b[0]));
+            
+            // Reset pending state
+            occlusionModePendingStart = -1;
+            
+            // Update button appearance
+            occlusionModeAddButton.setText("Start Occlusion");
+            occlusionModeAddButton.setBackground(new Color(180, 80, 80));
+            occlusionModeAddButton.setToolTipText("Mark current frame as start of occlusion (object disappears)");
+            
+            updateOcclusionModeInfoLabel();
+            frameSlider.repaint();
+            setStatus("Occlusion segment added: frames " + (startFrame + 1) + "-" + (endFrame + 1) + 
+                      " (" + (endFrame - startFrame + 1) + " frames marked as occluded)");
+        }
+    }
+    
+    /**
+     * Update the occlusion mode info label with current segment information.
+     */
+    private void updateOcclusionModeInfoLabel() {
+        if (occlusionModeInfoLabel == null || occlusionModeSegments == null) return;
+        
+        int totalFrames = occlusionModeMaxFrame - occlusionModeMinFrame + 1;
+        int occludedFrames = 0;
+        for (int[] seg : occlusionModeSegments) {
+            occludedFrames += (seg[1] - seg[0] + 1);
+        }
+        int visibleFrames = totalFrames - occludedFrames;
+        
+        StringBuilder text = new StringBuilder();
+        
+        // Show pending segment info if applicable
+        if (occlusionModePendingStart >= 0) {
+            text.append("\u23F1 Pending from frame ").append(occlusionModePendingStart + 1).append(" | ");
+        }
+        
+        if (occlusionModeSegments.isEmpty()) {
+            text.append("No occlusions (fully visible)");
+            occlusionModeInfoLabel.setText(text.toString());
+            occlusionModeInfoLabel.setForeground(ACCENT_GREEN);
+        } else {
+            text.append(occlusionModeSegments.size()).append(" occlusion segment(s): ")
+                .append(occludedFrames).append(" hidden, ").append(visibleFrames).append(" visible");
+            occlusionModeInfoLabel.setText(text.toString());
+            occlusionModeInfoLabel.setForeground(ACCENT_YELLOW);
+        }
+    }
+    
+    /**
+     * Remove the occlusion segment that contains the current frame.
+     */
+    private void removeOcclusionSegmentAtCurrentFrame() {
+        if (!occlusionModeActive || occlusionModeSegments == null) return;
+        
+        int currentFrame = currentSlice - 1;  // Convert to 0-indexed
+        
+        // Find the segment containing current frame
+        int foundIdx = -1;
+        for (int i = 0; i < occlusionModeSegments.size(); i++) {
+            int[] seg = occlusionModeSegments.get(i);
+            if (currentFrame >= seg[0] && currentFrame <= seg[1]) {
+                foundIdx = i;
+                break;
+            }
+        }
+        
+        if (foundIdx < 0) {
+            JOptionPane.showMessageDialog(frame,
+                "Current frame is not inside an occlusion segment.\n\n" +
+                "Navigate to a frame within an occlusion segment (shown in red) to remove it.",
+                "No Segment at Current Frame",
+                JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        
+        // Remove the segment
+        int[] removed = occlusionModeSegments.remove(foundIdx);
+        
+        updateOcclusionModeInfoLabel();
+        frameSlider.repaint();
+        setStatus("Removed occlusion segment: frames " + (removed[0] + 1) + "-" + (removed[1] + 1));
+    }
+    
+    /**
+     * Apply the occlusion segments and exit occlusion mode.
+     * Also marks the track as complete.
+     */
+    private void applyOcclusionModeAndExit() {
+        if (!occlusionModeActive) return;
+        
+        // Warn if there's a pending segment
+        if (occlusionModePendingStart >= 0) {
+            int choice = JOptionPane.showConfirmDialog(frame,
+                "You have a pending occlusion segment starting at frame " + (occlusionModePendingStart + 1) + ".\n\n" +
+                "This segment has not been completed and will be discarded.\n" +
+                "Do you want to apply changes anyway?",
+                "Pending Segment",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.WARNING_MESSAGE);
+            if (choice != JOptionPane.YES_OPTION) {
+                return;
+            }
+        }
+        
+        String trackId = occlusionModeTrackId;
+        
+        // Save state for undo
+        saveState();
+        
+        // Store the segments (now these are OCCLUSION segments, not visible segments)
+        if (occlusionModeSegments.isEmpty()) {
+            // No occlusions - remove from map entirely
+            trackOcclusionSegments.remove(trackId);
+        } else {
+            List<int[]> segments = new ArrayList<>();
+            for (int[] seg : occlusionModeSegments) {
+                segments.add(new int[]{seg[0], seg[1]});
+            }
+            trackOcclusionSegments.put(trackId, segments);
+        }
+        
+        // Mark track as complete
+        trackCompleted.put(trackId, true);
+        
+        // Exit occlusion mode
+        exitOcclusionMode();
+        
+        // Update status
+        int occludedFrames = calculateOccludedFrames(trackId);
+        long totalTime = trackTotalTime.getOrDefault(trackId, 0L);
+        if (occludedFrames > 0) {
+            setStatus(trackId + " marked complete with " + occludedFrames + " occluded frames (" + formatTime(totalTime) + ")");
+        } else {
+            setStatus(trackId + " marked complete - fully visible (" + formatTime(totalTime) + ")");
+        }
+    }
+    
+    /**
+     * Calculate the number of occluded frames for a track.
+     */
+    private int calculateOccludedFrames(String trackId) {
+        List<int[]> segments = trackOcclusionSegments.get(trackId);
+        if (segments == null || segments.isEmpty()) return 0;
+        
+        int occludedFrames = 0;
+        for (int[] seg : segments) {
+            occludedFrames += (seg[1] - seg[0] + 1);
+        }
+        
+        return occludedFrames;
+    }
+    
+    /**
+     * Cancel occlusion mode without saving changes.
+     */
+    private void cancelOcclusionMode() {
+        if (!occlusionModeActive) return;
+        
+        // Exit occlusion mode without saving
+        exitOcclusionMode();
+        
+        setStatus("Occlusion editing cancelled");
+    }
+    
+    /**
+     * Exit occlusion mode and restore normal UI.
+     */
+    private void exitOcclusionMode() {
+        if (!occlusionModeActive) return;
+        
+        // Reset state
+        occlusionModeActive = false;
+        occlusionModeTrackId = null;
+        occlusionModeSegments = null;
+        occlusionModePendingStart = -1;
+        occlusionModeDraggingSegmentIdx = -1;
+        occlusionModeDraggingStart = false;
+        occlusionModeDraggingEnd = false;
+        
+        // Remove occlusion control panel and restore page label
+        if (occlusionModeControlPanel != null) {
+            frameNavPanel.remove(occlusionModeControlPanel);
+            occlusionModeControlPanel = null;
+            occlusionModeInfoLabel = null;
+            occlusionModeAddButton = null;
+        }
+        frameNavPanel.add(pageLabel, BorderLayout.WEST);
+        frameNavPanel.revalidate();
+        frameNavPanel.repaint();
+        
+        // Restore frame
+        goToFrame(frameBeforeOcclusionMode);
+        
+        // Update UI
+        frameSlider.repaint();
+        imageLabel.repaint();
+        refreshAnnotationList();
+    }
+    
+    /**
+     * Check if a frame is marked as occluded for a track.
+     * A frame is occluded if it's INSIDE any of the occlusion segments.
+     * 
+     * @param trackId The track ID
+     * @param frame The frame number (0-indexed)
+     * @return true if the frame is occluded, false if visible
+     */
+    private boolean isFrameOccluded(String trackId, int frame) {
+        List<int[]> segments = trackOcclusionSegments.get(trackId);
+        if (segments == null || segments.isEmpty()) {
+            // No occlusion data = assume all visible
+            return false;
+        }
+        
+        // Frame is occluded if it's inside any occlusion segment
+        for (int[] seg : segments) {
+            if (frame >= seg[0] && frame <= seg[1]) {
+                return true;  // Frame is within an occlusion segment
+            }
+        }
+        return false;  // Frame is outside all occlusion segments (visible)
+    }
+
+    /**
+     * Start LocoTrack fine-tuning on the current annotations.
+     * Requires all tracks to be marked as complete and GPU mode.
+     */
+    private void startLocoTrackFineTuning() {
+        // Show mode selection dialog
+        String[] options = {"\u26A1 Turbo (~30 sec)", "\uD83D\uDD27 Standard (slower)", "Cancel"};
+        int choice = JOptionPane.showOptionDialog(frame,
+            "<html><b>Select Fine-tuning Mode:</b><br><br>" +
+            "\u26A1 <b>Turbo</b> - Fast LoRA-based adaptation (~30 seconds)<br>" +
+            "&nbsp;&nbsp;&nbsp;Uses lightweight adapters for quick iterations<br><br>" +
+            "\uD83D\uDD27 <b>Standard</b> - Full fine-tuning (5-60+ minutes)<br>" +
+            "&nbsp;&nbsp;&nbsp;Trains all model weights for maximum accuracy<br></html>",
+            "Fine-tune LocoTrack",
+            JOptionPane.YES_NO_CANCEL_OPTION,
+            JOptionPane.QUESTION_MESSAGE,
+            null,
+            options,
+            options[0]);
+        
+        if (choice == 2 || choice == JOptionPane.CLOSED_OPTION) {
+            return;  // Cancelled
+        }
+        
+        boolean useTurbo = (choice == 0);
+        startLocoTrackFineTuningImpl(useTurbo);
+    }
+    
+    /**
+     * Implementation of LocoTrack fine-tuning.
+     * @param useTurbo If true, use fast LoRA-based turbo fine-tuning
+     */
+    private void startLocoTrackFineTuningImpl(boolean useTurbo) {
+        if (!isGpuAvailable) {
+            JOptionPane.showMessageDialog(frame,
+                "Fine-tuning requires GPU mode.\n\n" +
+                "Please restart RIPPLE in GPU mode to use this feature.",
+                "GPU Required",
+                JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        
+        if (currentVideoPath == null || imp == null) {
+            JOptionPane.showMessageDialog(frame,
+                "No video loaded.",
+                "Error",
+                JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        
+        if (trackAnnotations.isEmpty()) {
+            JOptionPane.showMessageDialog(frame,
+                "No tracks to fine-tune on.\n\n" +
+                "Please create and complete some track annotations first.",
+                "No Tracks",
+                JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        
+        // Check that we have enough tracks (minimum 4 for train/test split)
+        int minTracks = Integer.parseInt(config.getProperty("finetune.min.tracks", 
+            String.valueOf(Constants.MIN_TRACKS_FOR_FINETUNING)));
+        if (trackAnnotations.size() < minTracks) {
+            JOptionPane.showMessageDialog(frame,
+                "Need at least " + minTracks + " tracks for fine-tuning.\n\n" +
+                "Current tracks: " + trackAnnotations.size() + "\n\n" +
+                "Please annotate more tracks before fine-tuning.",
+                "Not Enough Tracks",
+                JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        
+        // Check that ALL tracks are marked as complete
+        List<String> incompleteTracks = new ArrayList<>();
+        for (String trackId : trackAnnotations.keySet()) {
+            if (!trackCompleted.getOrDefault(trackId, false)) {
+                incompleteTracks.add(trackId);
+            }
+        }
+        
+        if (!incompleteTracks.isEmpty()) {
+            String trackList = incompleteTracks.size() <= 5 ?
+                String.join(", ", incompleteTracks) :
+                String.join(", ", incompleteTracks.subList(0, 5)) + 
+                    " ... and " + (incompleteTracks.size() - 5) + " more";
+            
+            JOptionPane.showMessageDialog(frame,
+                "All tracks must be marked as complete for fine-tuning.\n\n" +
+                "Incomplete tracks (" + incompleteTracks.size() + "): " + trackList + "\n\n" +
+                "Please mark all tracks as complete (✓ button) before fine-tuning.",
+                "Incomplete Tracks",
+                JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        
+        if (blockIfServerBusy("Fine-tune LocoTrack")) {
+            return;
+        }
+        
+        // Show weight file selection dialog
+        String weightsDir = config.getProperty("locotrack.weights.dir", Constants.DEFAULT_WEIGHTS_DIR);
+        File baseWeightsDir = new File(weightsDir);
+        if (!baseWeightsDir.exists()) {
+            baseWeightsDir.mkdirs();
+        }
+        
+        // Determine base weights path (use existing or default)
+        String modelType = config.getProperty("locotrack.model.type", "base");
+        File baseWeightsFile = new File(weightsDir, "locotrack_" + modelType + ".ckpt");
+        
+        if (!baseWeightsFile.exists()) {
+            // Check in locotrack_pytorch/weights directory as fallback
+            baseWeightsFile = new File("locotrack_pytorch/weights/locotrack_" + modelType + ".ckpt");
+        }
+        
+        if (!baseWeightsFile.exists()) {
+            JOptionPane.showMessageDialog(frame,
+                "Base LocoTrack weights not found.\n\n" +
+                "Expected: " + baseWeightsFile.getAbsolutePath() + "\n\n" +
+                "Please ensure LocoTrack model weights are installed.",
+                "Weights Not Found",
+                JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        
+        final File finalBaseWeights = baseWeightsFile;
+        
+        // Ask user where to save fine-tuned weights
+        // Turbo mode uses .pth (adapter), standard mode uses .ckpt (full weights)
+        final String fileExtension = useTurbo ? ".pth" : ".ckpt";
+        final String fileDescription = useTurbo ? "LoRA Adapter (*.pth)" : "PyTorch Checkpoint (*.ckpt)";
+        
+        JFileChooser fileChooser = new JFileChooser(weightsDir);
+        fileChooser.setDialogTitle(useTurbo ? "Save LoRA Adapter" : "Save Fine-Tuned Weights");
+        fileChooser.setFileFilter(new javax.swing.filechooser.FileFilter() {
+            @Override
+            public boolean accept(File f) {
+                return f.isDirectory() || f.getName().endsWith(fileExtension);
+            }
+            @Override
+            public String getDescription() {
+                return fileDescription;
+            }
+        });
+        
+        // Suggest a default name based on video
+        String videoName = new File(currentVideoPath).getName().replaceFirst("\\.[^.]+$", "");
+        String suggestedName = useTurbo 
+            ? "locotrack_" + modelType + "_adapter_" + videoName + ".pth"
+            : "locotrack_" + modelType + "_finetuned_" + videoName + ".ckpt";
+        fileChooser.setSelectedFile(new File(weightsDir, suggestedName));
+        
+        int result = fileChooser.showSaveDialog(frame);
+        if (result != JFileChooser.APPROVE_OPTION) {
+            setStatus("Fine-tuning cancelled");
+            return;
+        }
+        
+        File outputWeightsFile = fileChooser.getSelectedFile();
+        if (!outputWeightsFile.getName().endsWith(fileExtension)) {
+            outputWeightsFile = new File(outputWeightsFile.getAbsolutePath() + fileExtension);
+        }
+        
+        // Check if file already exists
+        if (outputWeightsFile.exists()) {
+            int overwrite = JOptionPane.showConfirmDialog(frame,
+                "File already exists:\n" + outputWeightsFile.getName() + "\n\n" +
+                "Overwrite?",
+                "Confirm Overwrite",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.WARNING_MESSAGE);
+            if (overwrite != JOptionPane.YES_OPTION) {
+                return;
+            }
+        }
+        
+        final File finalOutputWeights = outputWeightsFile;
+        
+        // Get training parameters
+        int epochs = Integer.parseInt(config.getProperty("finetune.epochs", 
+            String.valueOf(Constants.DEFAULT_FINETUNE_EPOCHS)));
+        int batchSize = Integer.parseInt(config.getProperty("finetune.batch.size", 
+            String.valueOf(Constants.DEFAULT_FINETUNE_BATCH_SIZE)));
+        double learningRate = Double.parseDouble(config.getProperty("finetune.learning.rate", 
+            String.valueOf(Constants.DEFAULT_FINETUNE_LR)));
+        double trainSplit = Double.parseDouble(config.getProperty("finetune.train.split", 
+            String.valueOf(Constants.DEFAULT_TRAIN_TEST_SPLIT)));
+        String resolution = config.getProperty("finetune.resolution", "native");
+        
+        // Build annotations JSON with visible segments
+        JSONObject annotationsJson = new JSONObject();
+        annotationsJson.put("video_path", currentVideoPath);
+        annotationsJson.put("video_width", imp.getWidth());
+        annotationsJson.put("video_height", imp.getHeight());
+        annotationsJson.put("total_frames", imp.getNSlices());
+        
+        JSONArray tracksArray = new JSONArray();
+        for (Map.Entry<String, Map<Integer, Point>> entry : trackAnnotations.entrySet()) {
+            String trackId = entry.getKey();
+            Map<Integer, Point> positions = entry.getValue();
+            
+            JSONObject trackObj = new JSONObject();
+            trackObj.put("track_id", trackId);
+            trackObj.put("completed", trackCompleted.getOrDefault(trackId, false));
+            
+            // Add positions
+            JSONArray positionsArray = new JSONArray();
+            for (Map.Entry<Integer, Point> posEntry : positions.entrySet()) {
+                JSONObject posObj = new JSONObject();
+                posObj.put("frame", posEntry.getKey());
+                posObj.put("x", posEntry.getValue().x);
+                posObj.put("y", posEntry.getValue().y);
+                positionsArray.put(posObj);
+            }
+            trackObj.put("positions", positionsArray);
+            
+            // Add occlusion segments (frames where object is NOT visible)
+            List<int[]> segments = trackOcclusionSegments.get(trackId);
+            if (segments != null && !segments.isEmpty()) {
+                JSONArray segmentsArray = new JSONArray();
+                for (int[] seg : segments) {
+                    JSONObject segObj = new JSONObject();
+                    segObj.put("start", seg[0]);
+                    segObj.put("end", seg[1]);
+                    segmentsArray.put(segObj);
+                }
+                trackObj.put("occlusion_segments", segmentsArray);
+            }
+            
+            tracksArray.put(trackObj);
+        }
+        annotationsJson.put("tracks", tracksArray);
+        
+        final String annotationsJsonStr = annotationsJson.toString();
+        final int finalEpochs = useTurbo ? Constants.DEFAULT_TURBO_ITERATIONS : epochs;
+        final int finalBatchSize = useTurbo ? Constants.DEFAULT_TURBO_BATCH_SIZE : batchSize;
+        final double finalLearningRate = useTurbo ? Constants.DEFAULT_TURBO_LR : learningRate;
+        final double finalTrainSplit = trainSplit;
+        final String finalModelType = modelType;
+        final String finalResolution = resolution;
+        final boolean finalUseTurbo = useTurbo;
+        
+        setStatus(useTurbo ? "Starting Turbo fine-tuning..." : "Starting LocoTrack fine-tuning...");
+        
+        // Cancellation flag
+        final AtomicBoolean cancelled = new AtomicBoolean(false);
+        
+        // Create modal progress dialog
+        String dialogTitle = useTurbo ? "Turbo Fine-Tuning LocoTrack" : "Fine-Tuning LocoTrack";
+        final JDialog progressDialog = new JDialog(frame, dialogTitle, true);
+        progressDialog.setUndecorated(true);
+        progressDialog.setDefaultCloseOperation(JDialog.DO_NOTHING_ON_CLOSE);
+        progressDialog.setLayout(new BorderLayout(10, 10));
+        
+        // Style the dialog with dark theme
+        JPanel contentPanel = new JPanel(new BorderLayout(10, 10));
+        contentPanel.setBackground(DARK_PANEL);
+        contentPanel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(useTurbo ? ACCENT_GREEN : ACCENT_YELLOW, 2),
+            BorderFactory.createEmptyBorder(15, 20, 15, 20)
+        ));
+        
+        String titleText = useTurbo ? "\\u26A1 Turbo Fine-Tuning (~30 sec)..." : "Fine-Tuning LocoTrack Model...";
+        JLabel titleLabel = new JLabel(titleText);
+        titleLabel.setForeground(useTurbo ? ACCENT_GREEN : ACCENT_YELLOW);
+        titleLabel.setFont(new Font("SansSerif", Font.BOLD, 14));
+        titleLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        contentPanel.add(titleLabel, BorderLayout.NORTH);
+        
+        // Center panel with progress info
+        JPanel centerPanel = new JPanel();
+        centerPanel.setLayout(new BoxLayout(centerPanel, BoxLayout.Y_AXIS));
+        centerPanel.setOpaque(false);
+        
+        String modeInfo = useTurbo ? 
+            "<html><center>Turbo LoRA Adaptation<br>" + trackAnnotations.size() + 
+            " tracks | " + finalEpochs + " iterations</center></html>" :
+            "<html><center>Training on " + trackAnnotations.size() + 
+            " tracks<br>Epochs: " + finalEpochs + " | Batch: " + finalBatchSize + "</center></html>";
+        JLabel infoLabel = new JLabel(modeInfo);
+        infoLabel.setForeground(TEXT_PRIMARY_COLOR);
+        infoLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
+        infoLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        centerPanel.add(infoLabel);
+        centerPanel.add(Box.createVerticalStrut(10));
+        
+        // Progress bar for epoch progress (indeterminate while training)
+        JProgressBar epochProgressBar = new JProgressBar();
+        epochProgressBar.setIndeterminate(true);
+        epochProgressBar.setStringPainted(true);
+        epochProgressBar.setString(useTurbo ? "Turbo training..." : "Training in progress...");
+        epochProgressBar.setForeground(useTurbo ? ACCENT_GREEN : ACCENT_YELLOW);
+        epochProgressBar.setBackground(DARK_PANEL);
+        epochProgressBar.setAlignmentX(Component.CENTER_ALIGNMENT);
+        epochProgressBar.setMaximumSize(new Dimension(300, 25));
+        centerPanel.add(epochProgressBar);
+        centerPanel.add(Box.createVerticalStrut(5));
+        
+        // Status label for detailed progress (animated messages)
+        JLabel statusDetailLabel = new JLabel("Loading model weights...");
+        statusDetailLabel.setForeground(TEXT_SECONDARY_COLOR);
+        statusDetailLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
+        statusDetailLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        centerPanel.add(statusDetailLabel);
+        centerPanel.add(Box.createVerticalStrut(5));
+        
+        // Loss display (will be updated when training completes)
+        JLabel lossLabel = new JLabel("Training on GPU...");
+        lossLabel.setForeground(TEXT_PRIMARY_COLOR);
+        lossLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
+        lossLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        lossLabel.setFont(new Font("Monospaced", Font.PLAIN, 11));
+        centerPanel.add(lossLabel);
+        
+        contentPanel.add(centerPanel, BorderLayout.CENTER);
+        
+        JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.CENTER));
+        buttonPanel.setOpaque(false);
+        JButton cancelButton = new JButton("Cancel");
+        cancelButton.addActionListener(e -> {
+            cancelled.set(true);
+            sendCancelToServer();
+            progressDialog.dispose();
+            setStatus("Fine-tuning cancelled");
+        });
+        buttonPanel.add(cancelButton);
+        
+        JLabel elapsedLabel = new JLabel("Elapsed: 0s");
+        elapsedLabel.setForeground(TEXT_PRIMARY_COLOR);
+        elapsedLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        
+        JPanel southPanel = new JPanel(new BorderLayout());
+        southPanel.setOpaque(false);
+        southPanel.add(buttonPanel, BorderLayout.CENTER);
+        southPanel.add(elapsedLabel, BorderLayout.SOUTH);
+        contentPanel.add(southPanel, BorderLayout.SOUTH);
+        
+        progressDialog.add(contentPanel, BorderLayout.CENTER);
+        progressDialog.pack();
+        progressDialog.setSize(380, 240);
+        progressDialog.setLocationRelativeTo(frame);
+        
+        // Elapsed time timer with rotating status messages
+        final long startTime = System.currentTimeMillis();
+        final String[] statusMessages = {
+            "Loading model weights...",
+            "Preparing training data...",
+            "Running forward pass...",
+            "Computing gradients...",
+            "Optimizing parameters...",
+            "Validating predictions...",
+            "Checking for improvement..."
+        };
+        final int[] messageIndex = {0};
+        
+        Timer elapsedTimer = new Timer(1000, e -> {
+            long elapsed = (System.currentTimeMillis() - startTime) / 1000;
+            long mins = elapsed / 60;
+            long secs = elapsed % 60;
+            if (mins > 0) {
+                elapsedLabel.setText(String.format("Elapsed: %dm %02ds", mins, secs));
+            } else {
+                elapsedLabel.setText("Elapsed: " + secs + "s");
+            }
+            
+            // Rotate status message every 3 seconds (after initial 5 seconds)
+            if (elapsed > 5 && elapsed % 3 == 0) {
+                messageIndex[0] = (messageIndex[0] + 1) % statusMessages.length;
+                statusDetailLabel.setText(statusMessages[messageIndex[0]]);
+            }
+        });
+        elapsedTimer.start();
+        
+        // Run fine-tuning in background with progress animation
+        SwingWorker<JSONObject, Void> worker = new SwingWorker<JSONObject, Void>() {
+            @Override
+            protected JSONObject doInBackground() throws Exception {
+                JSONObject req = new JSONObject();
+                req.put("command", Constants.CMD_FINETUNE_LOCOTRACK);
+                req.put("video_path", workingVideoPath);
+                req.put("annotations_json", annotationsJsonStr);
+                req.put("base_weights", finalBaseWeights.getAbsolutePath());
+                req.put("output_weights", finalOutputWeights.getAbsolutePath());
+                req.put("epochs", finalEpochs);
+                req.put("batch_size", finalBatchSize);
+                req.put("learning_rate", finalLearningRate);
+                req.put("train_split", finalTrainSplit);
+                req.put("model_type", finalModelType);
+                req.put("resolution", finalResolution);
+                req.put("use_turbo", finalUseTurbo);  // Turbo mode flag
+                
+                // Send request and get response - training runs on server
+                return sendTrackingServerRequest(req);
+            }
+            
+            @Override
+            protected void done() {
+                elapsedTimer.stop();
+                progressDialog.dispose();
+                
+                if (cancelled.get() || isCancelled()) {
+                    setStatus("Fine-tuning cancelled");
+                    return;
+                }
+                
+                try {
+                    JSONObject resp = get();
+                    ensureOkResponse(resp);
+                    
+                    // Extract results
+                    JSONObject testAccuracy = resp.optJSONObject("test_accuracy");
+                    double trainLoss = resp.optDouble("train_loss", 0.0);
+                    int epochsTrained = resp.optInt("epochs_trained", finalEpochs);
+                    double elapsed = resp.optDouble("elapsed_seconds", 0.0);
+                    
+                    // Get actual output path (may differ for turbo mode)
+                    String actualOutputPath = resp.optString("output_weights", finalOutputWeights.getAbsolutePath());
+                    String mode = resp.optString("mode", finalUseTurbo ? "turbo" : "standard");
+                    boolean isTurboMode = "turbo".equals(mode);
+                    
+                    // Format accuracy results
+                    StringBuilder accuracyStr = new StringBuilder();
+                    if (testAccuracy != null) {
+                        // Turbo mode uses position_error and improvement
+                        if (testAccuracy.has("position_error")) {
+                            accuracyStr.append(String.format("Position Error: %.2f px\n", 
+                                testAccuracy.getDouble("position_error")));
+                        }
+                        if (testAccuracy.has("improvement")) {
+                            double improvement = testAccuracy.getDouble("improvement");
+                            if (improvement > 0) {
+                                accuracyStr.append(String.format("Improvement: +%.1f%%\n", improvement));
+                            }
+                        }
+                        // Standard mode uses occlusion_accuracy and threshold metrics
+                        if (testAccuracy.has("occlusion_accuracy")) {
+                            accuracyStr.append(String.format("Occlusion Accuracy: %.1f%%\n", 
+                                testAccuracy.getDouble("occlusion_accuracy") * 100));
+                        }
+                        if (testAccuracy.has("average_pts_within_thresh")) {
+                            accuracyStr.append(String.format("Avg Points Within Threshold: %.1f%%\n", 
+                                testAccuracy.getDouble("average_pts_within_thresh") * 100));
+                        }
+                        // Individual thresholds (optional detail)
+                        if (testAccuracy.has("pts_within_4")) {
+                            accuracyStr.append(String.format("Points within 4px: %.1f%%\n", 
+                                testAccuracy.getDouble("pts_within_4") * 100));
+                        }
+                    }
+                    
+                    File actualOutputFile = new File(actualOutputPath);
+                    setStatus("Fine-tuning complete! " + (isTurboMode ? "Adapter" : "Weights") + " saved to " + actualOutputFile.getName());
+                    
+                    String usageInstructions = isTurboMode
+                        ? "To use this adapter for tracking, update\n" +
+                          "'locotrack.adapter' in config.properties."
+                        : "To use these weights for tracking, update\n" +
+                          "'locotrack.weights' in config.properties.";
+                    
+                    JOptionPane.showMessageDialog(frame,
+                        (isTurboMode ? "\u26A1 Turbo Fine-Tuning Complete!\n\n" : "LocoTrack Fine-Tuning Complete!\n\n") +
+                        "Trained for " + epochsTrained + (isTurboMode ? " iterations" : " epochs") + " in " + String.format("%.1f", elapsed) + "s\n" +
+                        (isTurboMode ? "" : "Final training loss: " + String.format("%.4f", trainLoss) + "\n") + "\n" +
+                        (accuracyStr.length() > 0 ? "Test Results:\n" + accuracyStr.toString() + "\n" : "") +
+                        (isTurboMode ? "Adapter" : "Weights") + " saved to:\n" + actualOutputPath + "\n\n" +
+                        usageInstructions,
+                        isTurboMode ? "Turbo Fine-Tuning Complete" : "Fine-Tuning Complete",
+                        JOptionPane.INFORMATION_MESSAGE);
+                    
+                } catch (Exception ex) {
+                    setStatus("Fine-tuning failed: " + ex.getMessage());
+                    JOptionPane.showMessageDialog(frame,
+                        "Fine-tuning failed:\n\n" + ex.getMessage(),
+                        "Fine-Tuning Error",
+                        JOptionPane.ERROR_MESSAGE);
+                    ex.printStackTrace();
+                }
+            }
+        };
+        
+        worker.execute();
+        progressDialog.setVisible(true);
+    }
+
+    private void setStatus(String message) {
+        if (statusLabel != null) {
+            // Add status icon based on message type
+            String icon = "● ";
+            Color color = ACCENT_GREEN;
+            
+            String lowerMsg = message.toLowerCase();
+            if (lowerMsg.contains("error") || lowerMsg.contains("failed")) {
+                icon = "● ";
+                color = ACCENT_RED;
+            } else if (lowerMsg.contains("computing") || lowerMsg.contains("loading") || 
+                       lowerMsg.contains("optimizing") || lowerMsg.contains("propagating")) {
+                icon = "◦ ";
+                color = ACCENT_YELLOW;
+            }
+            
+            statusLabel.setText("  " + icon + message);
+            statusLabel.setForeground(color);
+        }
+        System.out.println("[STATUS] " + message);
+    }
+    
+    /**
+     * Enter preview mode - locks UI on current frame and shows a simplified toolbar.
+     * Disables all frame navigation (slider, scroll wheel, keyboard shortcuts).
+     * @param type "dog" or "trackpy"
+     * @param spots List of detected spots
+     * @param radius The radius/size used for detection (for circle drawing)
+     * @param configDialog Reference to config dialog to restore later
+     */
+    private void enterPreviewMode(String type, List<double[]> spots, double radius, JDialog configDialog) {
+        previewModeActive = true;
+        previewType = type;
+        previewSpots = spots;
+        previewSpotCount = spots.size();
+        previewRadius = radius;
+        previewFrame = currentSlice;  // Remember which frame preview was generated for
+        savedConfigDialog = configDialog;
+        hideTracksInPreview = true;  // Hide existing tracks during preview
+        
+        // Stay on current frame (no longer force to frame 1)
+        // Frame navigation will be disabled below
+        
+        // Disable frame navigation controls
+        if (frameSlider != null) frameSlider.setEnabled(false);
+        if (gotoFrameField != null) gotoFrameField.setEnabled(false);
+        if (gotoFrameButton != null) gotoFrameButton.setEnabled(false);
+        if (playButton != null) playButton.setEnabled(false);
+        if (fpsField != null) fpsField.setEnabled(false);
+        
+        // Disable toolbar buttons (except Adjust Brightness)
+        if (openButton != null) openButton.setEnabled(false);
+        if (importButton != null) importButton.setEnabled(false);
+        if (exportButton != null) exportButton.setEnabled(false);
+        if (helpButton != null) helpButton.setEnabled(false);
+        if (flowVizToggle != null) flowVizToggle.setEnabled(false);
+        if (satCheckbox != null) satCheckbox.setEnabled(false);
+        if (satAdjustButton != null) satAdjustButton.setEnabled(false);
+        if (showMaskCheckbox != null) showMaskCheckbox.setEnabled(false);
+        if (showRegionsCheckbox != null) showRegionsCheckbox.setEnabled(false);
+        
+        // Always recreate preview mode toolbar to avoid stale references
+        if (previewModeToolbar != null) {
+            frame.getContentPane().remove(previewModeToolbar);
+        }
+        previewModeToolbar = new JPanel(new FlowLayout(FlowLayout.CENTER, 20, 10));
+        previewModeToolbar.setBackground(new Color(40, 80, 40));
+        previewModeToolbar.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createMatteBorder(0, 0, 2, 0, ACCENT_GREEN),
+            BorderFactory.createEmptyBorder(8, 20, 8, 20)
+        ));
+        
+        String typeLabel = "dog".equals(type) ? "DoG" : "Trackpy";
+        JLabel previewLabel = new JLabel(String.format("● %s PREVIEW MODE - %d spots detected on Frame %d  |  Frame navigation disabled", 
+                                                       typeLabel, previewSpotCount, previewFrame));
+        previewLabel.setFont(new Font("Segoe UI", Font.BOLD, 14));
+        previewLabel.setForeground(new Color(150, 255, 150));
+        previewModeToolbar.add(previewLabel);
+        
+        JButton editConfigButton = new JButton("◀ Return to Configuration");
+        editConfigButton.setFont(new Font("Segoe UI", Font.BOLD, 13));
+        editConfigButton.setBackground(ACCENT_BLUE);
+        editConfigButton.setForeground(Color.WHITE);
+        editConfigButton.setFocusPainted(false);
+        editConfigButton.setBorder(BorderFactory.createEmptyBorder(10, 20, 10, 20));
+        editConfigButton.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        editConfigButton.addActionListener(e -> exitPreviewMode(true));
+        previewModeToolbar.add(editConfigButton);
+        
+        // Add preview toolbar at top of frame
+        frame.getContentPane().add(previewModeToolbar, BorderLayout.NORTH);
+        frame.revalidate();
+        
+        // Repaint to show overlay (without tracks)
+        imageLabel.repaint();
+        setStatus("Preview mode active - showing " + previewSpotCount + " detected spots (scroll/navigation disabled)");
+    }
+    
+    /**
+     * Exit preview mode - restores normal UI.
+     * @param returnToConfig If true, reopen the config dialog
+     */
+    private void exitPreviewMode(boolean returnToConfig) {
+        previewModeActive = false;
+        previewSpots = null;
+        previewSpotCount = 0;
+        hideTracksInPreview = false;  // Show tracks again
+        
+        // Re-enable frame navigation controls
+        if (frameSlider != null) frameSlider.setEnabled(true);
+        if (gotoFrameField != null) gotoFrameField.setEnabled(true);
+        if (gotoFrameButton != null) gotoFrameButton.setEnabled(true);
+        if (playButton != null) playButton.setEnabled(true);
+        if (fpsField != null) fpsField.setEnabled(true);
+        
+        // Re-enable toolbar buttons
+        if (openButton != null) openButton.setEnabled(true);
+        if (importButton != null) importButton.setEnabled(true);
+        if (exportButton != null) exportButton.setEnabled(true);
+        if (helpButton != null) helpButton.setEnabled(true);
+        // flowVizToggle state depends on whether flow is computed
+        if (flowVizToggle != null) flowVizToggle.setEnabled(opticalFlowComputed);
+        // SAT controls depend on satEnabled state
+        if (satCheckbox != null) satCheckbox.setEnabled(true);
+        if (satAdjustButton != null) satAdjustButton.setEnabled(satEnabled);
+        if (showMaskCheckbox != null) showMaskCheckbox.setEnabled(satEnabled);
+        if (showRegionsCheckbox != null) showRegionsCheckbox.setEnabled(satEnabled);
+        
+        // Remove preview toolbar
+        if (previewModeToolbar != null) {
+            frame.getContentPane().remove(previewModeToolbar);
+            previewModeToolbar = null;  // Clear reference so it gets recreated next time
+            frame.revalidate();
+            frame.repaint();
+        }
+        
+        // Repaint to clear overlay and show tracks again
+        imageLabel.repaint();
+        setStatus("Ready");
+        
+        // Optionally reopen config dialog (keep reference for future previews)
+        if (returnToConfig && savedConfigDialog != null) {
+            savedConfigDialog.setVisible(true);
+            // DON'T clear savedConfigDialog here - keep it for subsequent preview/return cycles
+        } else {
+            savedConfigDialog = null;  // Only clear if not returning to config
+        }
+    }
+    
+    /**
+     * Enter trajectory preview mode for trackpy - allows free frame navigation with trajectory overlay.
+     * Unlike regular preview mode, this allows slider/wheel navigation while showing trajectories.
+     * @param trajectories List of trajectory data (each has id, positions per frame, etc.)
+     * @param detectionsPerFrame Map of frame -> list of detections {x, y, mass}
+     * @param trajCount Number of trajectories
+     * @param radius The radius used for detection (for circle drawing)
+     * @param startFrame Start frame of preview data
+     * @param endFrame End frame of preview data
+     * @param configDialog Reference to config dialog to restore later
+     */
+    @SuppressWarnings("unchecked")
+    private void enterTrajectoryPreviewMode(List<Map<String, Object>> trajectories, 
+                                             Map<Integer, List<double[]>> detectionsPerFrame,
+                                             int trajCount, double radius, int startFrame, int endFrame,
+                                             JDialog configDialog) {
+        trajectoryPreviewActive = true;
+        previewType = "trackpy_trajectories";
+        previewTrajectories = trajectories;
+        previewDetectionsPerFrame = detectionsPerFrame;
+        previewTrajCount = trajCount;
+        previewRadius = radius;
+        previewStartFrame = startFrame;
+        previewEndFrame = endFrame;
+        savedConfigDialog = configDialog;
+        hideTracksInPreview = true;  // Hide existing tracks during preview
+        
+        // Keep frame navigation enabled for trajectory preview!
+        // Only disable certain toolbar buttons
+        if (openButton != null) openButton.setEnabled(false);
+        if (importButton != null) importButton.setEnabled(false);
+        if (exportButton != null) exportButton.setEnabled(false);
+        if (helpButton != null) helpButton.setEnabled(false);
+        if (flowVizToggle != null) flowVizToggle.setEnabled(false);
+        if (satCheckbox != null) satCheckbox.setEnabled(false);
+        if (satAdjustButton != null) satAdjustButton.setEnabled(false);
+        if (showMaskCheckbox != null) showMaskCheckbox.setEnabled(false);
+        if (showRegionsCheckbox != null) showRegionsCheckbox.setEnabled(false);
+        
+        // Always recreate preview mode toolbar
+        if (previewModeToolbar != null) {
+            frame.getContentPane().remove(previewModeToolbar);
+        }
+        previewModeToolbar = new JPanel(new FlowLayout(FlowLayout.CENTER, 20, 10));
+        previewModeToolbar.setBackground(new Color(40, 60, 90));  // Blueish for trajectory mode
+        previewModeToolbar.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createMatteBorder(0, 0, 2, 0, new Color(100, 150, 220)),
+            BorderFactory.createEmptyBorder(8, 20, 8, 20)
+        ));
+        
+        JLabel previewLabel = new JLabel(String.format("● TRACKPY PREVIEW - %d trajectories tracked  |  Navigate freely with slider or scroll", 
+                                                       previewTrajCount));
+        previewLabel.setFont(new Font("Segoe UI", Font.BOLD, 14));
+        previewLabel.setForeground(new Color(180, 210, 255));
+        previewModeToolbar.add(previewLabel);
+        
+        JButton editConfigButton = new JButton("◀ Return to Configuration");
+        editConfigButton.setFont(new Font("Segoe UI", Font.BOLD, 13));
+        editConfigButton.setBackground(ACCENT_BLUE);
+        editConfigButton.setForeground(Color.WHITE);
+        editConfigButton.setFocusPainted(false);
+        editConfigButton.setBorder(BorderFactory.createEmptyBorder(10, 20, 10, 20));
+        editConfigButton.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        editConfigButton.addActionListener(e -> exitTrajectoryPreviewMode(true));
+        previewModeToolbar.add(editConfigButton);
+        
+        // Add preview toolbar at top of frame
+        frame.getContentPane().add(previewModeToolbar, BorderLayout.NORTH);
+        frame.revalidate();
+        
+        // Repaint to show trajectory overlay
+        imageLabel.repaint();
+        setStatus("Trajectory preview active - showing " + previewTrajCount + " trajectories (navigation enabled)");
+    }
+    
+    /**
+     * Exit trajectory preview mode - restores normal UI.
+     * @param returnToConfig If true, reopen the config dialog
+     */
+    private void exitTrajectoryPreviewMode(boolean returnToConfig) {
+        trajectoryPreviewActive = false;
+        previewTrajectories = null;
+        previewDetectionsPerFrame = null;
+        previewTrajCount = 0;
+        hideTracksInPreview = false;  // Show tracks again
+        
+        // Re-enable toolbar buttons
+        if (openButton != null) openButton.setEnabled(true);
+        if (importButton != null) importButton.setEnabled(true);
+        if (exportButton != null) exportButton.setEnabled(true);
+        if (helpButton != null) helpButton.setEnabled(true);
+        if (flowVizToggle != null) flowVizToggle.setEnabled(opticalFlowComputed);
+        if (satCheckbox != null) satCheckbox.setEnabled(true);
+        if (satAdjustButton != null) satAdjustButton.setEnabled(satEnabled);
+        if (showMaskCheckbox != null) showMaskCheckbox.setEnabled(satEnabled);
+        if (showRegionsCheckbox != null) showRegionsCheckbox.setEnabled(satEnabled);
+        
+        // Remove preview toolbar
+        if (previewModeToolbar != null) {
+            frame.getContentPane().remove(previewModeToolbar);
+            previewModeToolbar = null;
+            frame.revalidate();
+            frame.repaint();
+        }
+        
+        // Repaint to clear overlay
+        imageLabel.repaint();
+        setStatus("Ready");
+        
+        if (returnToConfig && savedConfigDialog != null) {
+            savedConfigDialog.setVisible(true);
+        } else {
+            savedConfigDialog = null;
+        }
+    }
+    
+    private boolean isMultiSeedMode() {
+        return "multi-seed".equalsIgnoreCase(config.getProperty("tracking.mode", "single-seed"));
+    }
+    
+    private void handleTrackingModeChange(String oldMode, String newMode) {
+        if (oldMode.equals(newMode)) {
+            return; // No change
+        }
+        
+        if ("single-seed".equalsIgnoreCase(newMode)) {
+            // Switching from multi-seed to single-seed
+            // Count unoptimized tracks
+            long unoptimizedCount = trackAnnotations.keySet().stream()
+                .filter(trackId -> !trackOptimized.getOrDefault(trackId, false))
+                .count();
+            
+            if (unoptimizedCount > 0 && !trackAnnotations.isEmpty()) {
+                String[] options = {"Keep All Tracks", "Remove Unoptimized", "Cancel"};
+                int choice = JOptionPane.showOptionDialog(
+                    frame,
+                    String.format(
+                        "You are switching from multi-seed to single-seed mode.\n" +
+                        "You have %d unoptimized track(s).\n\n" +
+                        "What would you like to do?\n\n" +
+                        "Keep All Tracks: Keep all tracks (you can optimize them individually)\n" +
+                        "Remove Unoptimized: Remove unoptimized tracks\n" +
+                        "Cancel: Stay in multi-seed mode",
+                        unoptimizedCount
+                    ),
+                    "Mode Switch Warning",
+                    JOptionPane.YES_NO_CANCEL_OPTION,
+                    JOptionPane.WARNING_MESSAGE,
+                    null,
+                    options,
+                    options[0]
+                );
+                
+                if (choice == 1) { // Remove Unoptimized
+                    saveState();
+                    List<String> toRemove = trackAnnotations.keySet().stream()
+                        .filter(trackId -> !trackOptimized.getOrDefault(trackId, false))
+                        .collect(java.util.stream.Collectors.toList());
+                    
+                    for (String trackId : toRemove) {
+                        trackAnnotations.remove(trackId);
+                        trackColors.remove(trackId);
+                        trackAnchors.remove(trackId);
+                        trackOptimized.remove(trackId);
+                        trackSelected.remove(trackId);
+                        // Clean up trim data
+                        trackUntrimmedAnnotations.remove(trackId);
+                        trackUntrimmedAnchors.remove(trackId);
+                        trackTrimRange.remove(trackId);
+                        // Clean up smoothing data
+                        trackSmoothing.remove(trackId);
+                        trackOriginalAnnotations.remove(trackId);
+                        // Clean up occlusion data
+                        trackOcclusionSegments.remove(trackId);
+                    }
+                    
+                    if (toRemove.contains(selectedTrackId)) {
+                        selectedTrackId = null;
+                    }
+                    
+                    refreshAnnotationList();
+                    imageLabel.repaint();
+                } else if (choice == 2 || choice == JOptionPane.CLOSED_OPTION) { // Cancel
+                    // Revert the config change
+                    config.setProperty("tracking.mode", oldMode);
+                    return;
+                }
+            }
+            // Note: trackOptimized is preserved to carry over when switching back to multi-seed
+        } else if ("multi-seed".equalsIgnoreCase(newMode)) {
+            // Switching from single-seed to multi-seed
+            // Mark all existing tracks as optimized (they come from single-seed mode)
+            for (String trackId : trackAnnotations.keySet()) {
+                if (!trackOptimized.containsKey(trackId)) {
+                    trackOptimized.put(trackId, true);
+                }
+            }
+        }
+        
+        // Update UI visibility based on mode
+        updateUIForTrackingMode();
+    }
+    
+    private void updateUIForTrackingMode() {
+        // Find and update the optimization button panel visibility
+        Component[] components = frame.getContentPane().getComponents();
+        for (Component comp : components) {
+            searchAndUpdateOptimizationButton(comp);
+        }
+        
+        refreshAnnotationList();
+    }
+    
+    private void searchAndUpdateOptimizationButton(Component comp) {
+        if (comp instanceof JPanel) {
+            JPanel panel = (JPanel) comp;
+            // Check if this panel contains the optimization button
+            for (Component child : panel.getComponents()) {
+                if (child instanceof JButton) {
+                    JButton btn = (JButton) child;
+                    if (btn.getText() != null && btn.getText().contains("Run Track Optimization")) {
+                        // Found the optimization panel - update its visibility
+                        panel.setVisible(isMultiSeedMode());
+                        return;
+                    }
+                }
+            }
+            // Recursively search child components
+            for (Component child : panel.getComponents()) {
+                searchAndUpdateOptimizationButton(child);
+            }
+        } else if (comp instanceof JSplitPane) {
+            // Handle split panes - search both sides
+            JSplitPane splitPane = (JSplitPane) comp;
+            searchAndUpdateOptimizationButton(splitPane.getLeftComponent());
+            searchAndUpdateOptimizationButton(splitPane.getRightComponent());
+        } else if (comp instanceof Container) {
+            // Handle other containers
+            Container container = (Container) comp;
+            for (Component child : container.getComponents()) {
+                searchAndUpdateOptimizationButton(child);
+            }
+        }
+    }
+    
+    // Apply theme to UIManager defaults
+    private void applyUIManagerTheme() {
+        UIDefaults defaults = UIManager.getDefaults();
+        
+        // ====== CORE COLORS ======
+        defaults.put("control", SECONDARY_DARK);
+        defaults.put("controlDkShadow", BORDER_DARK);
+        defaults.put("controlHighlight", SURFACE_HOVER);
+        defaults.put("controlLtHighlight", SURFACE_HOVER);
+        defaults.put("controlShadow", BORDER_DARK);
+        defaults.put("controlText", TEXT_PRIMARY);
+        defaults.put("desktop", PRIMARY_DARK);
+        defaults.put("menu", PANEL_DARK);
+        defaults.put("menuText", TEXT_PRIMARY);
+        defaults.put("scrollbar", SECONDARY_DARK);
+        defaults.put("text", PANEL_DARK);
+        defaults.put("textHighlight", ACCENT_BLUE);
+        defaults.put("textHighlightText", Color.WHITE);
+        defaults.put("textInactiveText", TEXT_DISABLED);
+        defaults.put("textText", TEXT_PRIMARY);
+        defaults.put("window", SECONDARY_DARK);
+        defaults.put("windowBorder", BORDER_DARK);
+        defaults.put("windowText", TEXT_PRIMARY);
+        defaults.put("info", PANEL_DARK);
+        defaults.put("infoText", TEXT_PRIMARY);
+        
+        // ====== PANEL ======
+        defaults.put("Panel.background", SECONDARY_DARK);
+        defaults.put("Panel.foreground", TEXT_PRIMARY);
+        
+        // ====== VIEWPORT ======
+        defaults.put("Viewport.background", PRIMARY_DARK);
+        defaults.put("Viewport.foreground", TEXT_PRIMARY);
+        
+        // ====== LABEL ======
+        defaults.put("Label.background", SECONDARY_DARK);
+        defaults.put("Label.foreground", TEXT_PRIMARY);
+        defaults.put("Label.disabledForeground", TEXT_DISABLED);
+        
+        // ====== BUTTON ======
+        defaults.put("Button.background", PANEL_DARK);
+        defaults.put("Button.foreground", TEXT_PRIMARY);
+        defaults.put("Button.select", SURFACE_HOVER);
+        defaults.put("Button.focus", ACCENT_BLUE);
+        defaults.put("Button.darkShadow", BORDER_DARK);
+        defaults.put("Button.shadow", BORDER_DARK);
+        defaults.put("Button.highlight", SURFACE_HOVER);
+        defaults.put("Button.light", SURFACE_HOVER);
+        defaults.put("Button.disabledText", TEXT_DISABLED);
+        
+        // ====== TOGGLE BUTTON ======
+        defaults.put("ToggleButton.background", PANEL_DARK);
+        defaults.put("ToggleButton.foreground", TEXT_PRIMARY);
+        defaults.put("ToggleButton.select", ACCENT_BLUE);
+        defaults.put("ToggleButton.focus", ACCENT_BLUE);
+        
+        // ====== TEXT FIELD ======
+        defaults.put("TextField.background", PANEL_DARK);
+        defaults.put("TextField.foreground", TEXT_PRIMARY);
+        defaults.put("TextField.caretForeground", TEXT_PRIMARY);
+        defaults.put("TextField.selectionBackground", ACCENT_BLUE);
+        defaults.put("TextField.selectionForeground", Color.WHITE);
+        defaults.put("TextField.inactiveBackground", PANEL_DARK);
+        defaults.put("TextField.inactiveForeground", TEXT_SECONDARY);
+        defaults.put("TextField.shadow", BORDER_DARK);
+        defaults.put("TextField.darkShadow", BORDER_DARK);
+        defaults.put("TextField.light", SURFACE_HOVER);
+        defaults.put("TextField.highlight", SURFACE_HOVER);
+        
+        // ====== TEXT AREA ======
+        defaults.put("TextArea.background", PANEL_DARK);
+        defaults.put("TextArea.foreground", TEXT_PRIMARY);
+        defaults.put("TextArea.caretForeground", TEXT_PRIMARY);
+        defaults.put("TextArea.selectionBackground", ACCENT_BLUE);
+        defaults.put("TextArea.selectionForeground", Color.WHITE);
+        
+        // ====== COMBO BOX ======
+        defaults.put("ComboBox.background", PANEL_DARK);
+        defaults.put("ComboBox.foreground", TEXT_PRIMARY);
+        defaults.put("ComboBox.selectionBackground", ACCENT_BLUE);
+        defaults.put("ComboBox.selectionForeground", Color.WHITE);
+        defaults.put("ComboBox.disabledBackground", SECONDARY_DARK);
+        defaults.put("ComboBox.disabledForeground", TEXT_DISABLED);
+        defaults.put("ComboBox.buttonBackground", PANEL_DARK);
+        
+        // ====== LIST ======
+        defaults.put("List.background", PANEL_DARK);
+        defaults.put("List.foreground", TEXT_PRIMARY);
+        defaults.put("List.selectionBackground", ACCENT_BLUE);
+        defaults.put("List.selectionForeground", Color.WHITE);
+        
+        // ====== SCROLL PANE / BAR ======
+        defaults.put("ScrollPane.background", PRIMARY_DARK);
+        defaults.put("ScrollPane.foreground", TEXT_PRIMARY);
+        defaults.put("ScrollBar.background", SECONDARY_DARK);
+        defaults.put("ScrollBar.foreground", TEXT_SECONDARY);
+        defaults.put("ScrollBar.thumb", BORDER_DARK);
+        defaults.put("ScrollBar.track", SECONDARY_DARK);
+        
+        // ====== MENU ======
+        defaults.put("MenuBar.background", PRIMARY_DARK);
+        defaults.put("MenuBar.foreground", TEXT_PRIMARY);
+        defaults.put("Menu.background", PANEL_DARK);
+        defaults.put("Menu.foreground", TEXT_PRIMARY);
+        defaults.put("Menu.selectionBackground", ACCENT_BLUE);
+        defaults.put("Menu.selectionForeground", Color.WHITE);
+        defaults.put("MenuItem.background", PANEL_DARK);
+        defaults.put("MenuItem.foreground", TEXT_PRIMARY);
+        defaults.put("MenuItem.selectionBackground", ACCENT_BLUE);
+        defaults.put("MenuItem.selectionForeground", Color.WHITE);
+        defaults.put("PopupMenu.background", PANEL_DARK);
+        defaults.put("PopupMenu.foreground", TEXT_PRIMARY);
+        defaults.put("PopupMenu.border", BorderFactory.createLineBorder(BORDER_DARK, 1));
+        
+        // ====== CHECK BOX / RADIO ======
+        defaults.put("CheckBox.background", SECONDARY_DARK);
+        defaults.put("CheckBox.foreground", TEXT_PRIMARY);
+        defaults.put("RadioButton.background", SECONDARY_DARK);
+        defaults.put("RadioButton.foreground", TEXT_PRIMARY);
+        
+        // ====== SLIDER ======
+        defaults.put("Slider.background", SECONDARY_DARK);
+        defaults.put("Slider.foreground", TEXT_PRIMARY);
+        
+        // ====== PROGRESS BAR ======
+        defaults.put("ProgressBar.background", PANEL_DARK);
+        defaults.put("ProgressBar.foreground", ACCENT_BLUE);
+        
+        // ====== TABBED PANE ======
+        defaults.put("TabbedPane.background", SECONDARY_DARK);
+        defaults.put("TabbedPane.foreground", TEXT_PRIMARY);
+        defaults.put("TabbedPane.selected", PANEL_DARK);
+        
+        // ====== TABLE ======
+        defaults.put("Table.background", PANEL_DARK);
+        defaults.put("Table.foreground", TEXT_PRIMARY);
+        defaults.put("Table.selectionBackground", ACCENT_BLUE);
+        defaults.put("Table.selectionForeground", Color.WHITE);
+        defaults.put("Table.gridColor", BORDER_DARK);
+        defaults.put("TableHeader.background", SECONDARY_DARK);
+        defaults.put("TableHeader.foreground", TEXT_PRIMARY);
+        
+        // ====== TREE ======
+        defaults.put("Tree.background", PANEL_DARK);
+        defaults.put("Tree.foreground", TEXT_PRIMARY);
+        defaults.put("Tree.selectionBackground", ACCENT_BLUE);
+        defaults.put("Tree.selectionForeground", Color.WHITE);
+        defaults.put("Tree.textBackground", PANEL_DARK);
+        defaults.put("Tree.textForeground", TEXT_PRIMARY);
+        
+        // ====== FILE CHOOSER ======
+        defaults.put("FileChooser.background", SECONDARY_DARK);
+        defaults.put("FileChooser.foreground", TEXT_PRIMARY);
+        defaults.put("FileChooser.listViewBackground", PANEL_DARK);
+        
+        // ====== OPTION PANE ======
+        defaults.put("OptionPane.background", PANEL_DARK);
+        defaults.put("OptionPane.foreground", TEXT_PRIMARY);
+        defaults.put("OptionPane.messageForeground", TEXT_PRIMARY);
+        
+        // ====== TOOL TIP ======
+        defaults.put("ToolTip.background", PANEL_DARK);
+        defaults.put("ToolTip.foreground", TEXT_PRIMARY);
+        defaults.put("ToolTip.border", BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(BORDER_DARK, 1),
+            BorderFactory.createEmptyBorder(4, 6, 4, 6)
+        ));
+        
+        // ====== SPLIT PANE ======
+        defaults.put("SplitPane.background", SECONDARY_DARK);
+        defaults.put("SplitPane.dividerFocusColor", ACCENT_BLUE);
+        
+        // ====== SEPARATOR ======
+        defaults.put("Separator.foreground", BORDER_DARK);
+        defaults.put("Separator.background", SECONDARY_DARK);
+        
+        // ====== INTERNAL FRAME ======
+        defaults.put("InternalFrame.background", SECONDARY_DARK);
+        defaults.put("InternalFrame.foreground", TEXT_PRIMARY);
+        
+        // ====== TITLED BORDER ======
+        defaults.put("TitledBorder.titleColor", TEXT_PRIMARY);
+        defaults.put("TitledBorder.border", BorderFactory.createLineBorder(BORDER_DARK));
+    }
+
+    private void initUI() {
+        loadConfig();
+        
+        // Set theme Look and Feel
+        try {
+            // Use Metal L&F as base - it's more controllable than system L&F
+            UIManager.setLookAndFeel("javax.swing.plaf.metal.MetalLookAndFeel");
+            
+            // Apply theme colors to UIManager
+            applyUIManagerTheme();
+            
+            // Set default fonts
+            Font defaultFont = new Font("Segoe UI", Font.PLAIN, 12);
+            Font boldFont = new Font("Segoe UI", Font.BOLD, 12);
+            UIDefaults defaults = UIManager.getDefaults();
+            defaults.put("defaultFont", defaultFont);
+            defaults.put("Button.font", defaultFont);
+            defaults.put("ToggleButton.font", defaultFont);
+            defaults.put("RadioButton.font", defaultFont);
+            defaults.put("CheckBox.font", defaultFont);
+            defaults.put("ColorChooser.font", defaultFont);
+            defaults.put("ComboBox.font", defaultFont);
+            defaults.put("Label.font", defaultFont);
+            defaults.put("List.font", defaultFont);
+            defaults.put("MenuBar.font", defaultFont);
+            defaults.put("MenuItem.font", defaultFont);
+            defaults.put("RadioButtonMenuItem.font", defaultFont);
+            defaults.put("CheckBoxMenuItem.font", defaultFont);
+            defaults.put("Menu.font", defaultFont);
+            defaults.put("PopupMenu.font", defaultFont);
+            defaults.put("OptionPane.font", defaultFont);
+            defaults.put("Panel.font", defaultFont);
+            defaults.put("ProgressBar.font", defaultFont);
+            defaults.put("ScrollPane.font", defaultFont);
+            defaults.put("Viewport.font", defaultFont);
+            defaults.put("TabbedPane.font", defaultFont);
+            defaults.put("Table.font", defaultFont);
+            defaults.put("TableHeader.font", boldFont);
+            defaults.put("TextField.font", defaultFont);
+            defaults.put("PasswordField.font", defaultFont);
+            defaults.put("TextArea.font", defaultFont);
+            defaults.put("TextPane.font", defaultFont);
+            defaults.put("EditorPane.font", defaultFont);
+            defaults.put("TitledBorder.font", boldFont);
+            defaults.put("ToolBar.font", defaultFont);
+            defaults.put("ToolTip.font", defaultFont);
+            defaults.put("Tree.font", defaultFont);
+            defaults.put("Spinner.font", defaultFont);
+            defaults.put("Slider.font", defaultFont);
+            defaults.put("FileChooser.font", defaultFont);
+            defaults.put("InternalFrame.titleFont", boldFont);
+            
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        
+        frame = new JFrame("RIPPLE \u2014 Video Annotation Tool");
+        frame.setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);  // Handle closing manually with confirmation
+        frame.setLayout(new BorderLayout());
+        frame.getContentPane().setBackground(PRIMARY_DARK);
+        
+        // Set custom application icon (taskbar)
+        BufferedImage appIcon = createAppIcon();
+        frame.setIconImage(appIcon);
+
+        // Menu bar with professional styling and branding
+        JMenuBar menuBar = new JMenuBar() {
+            @Override
+            protected void paintComponent(Graphics g) {
+                super.paintComponent(g);
+                Graphics2D g2d = (Graphics2D) g;
+                g2d.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+                // Dark mode gradient
+                Color gradientStart = PRIMARY_DARK;
+                Color gradientEnd = new Color(22, 25, 30);
+                GradientPaint gradient = new GradientPaint(0, 0, gradientStart, 0, getHeight(), gradientEnd);
+                g2d.setPaint(gradient);
+                g2d.fillRect(0, 0, getWidth(), getHeight());
+            }
+        };
+        menuBar.setBorder(BorderFactory.createMatteBorder(0, 0, 1, 0, BORDER_DARK));
+        menuBar.setOpaque(false);
+        
+        // Add RIPPLE branding to menu bar
+        JLabel brandLabel = new JLabel("  RIPPLE  ");
+        brandLabel.setFont(new Font("Segoe UI Black", Font.BOLD, 15));
+        brandLabel.setForeground(ACCENT_BLUE);
+        menuBar.add(brandLabel);
+        menuBar.add(Box.createHorizontalStrut(10));
+        
+        JMenu optionsMenu = new JMenu("  View  ");
+        optionsMenu.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        optionsMenu.setForeground(TEXT_PRIMARY);
+        optionsMenu.setOpaque(false);
+        
+        // Toggle configuration panel
+        JMenuItem toggleConfigPanelItem = new JMenuItem("  ☰ Toggle Config Panel  ");
+        toggleConfigPanelItem.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        toggleConfigPanelItem.setBackground(PANEL_DARK);
+        toggleConfigPanelItem.setForeground(TEXT_PRIMARY);
+        toggleConfigPanelItem.setBorder(BorderFactory.createEmptyBorder(8, 12, 8, 12));
+        toggleConfigPanelItem.addActionListener(e -> toggleConfigPanel());
+        optionsMenu.add(toggleConfigPanelItem);
+        
+        optionsMenu.addSeparator();
+        
+        // Legacy access to old config dialog (for detailed editing)
+        JMenuItem advancedConfigItem = new JMenuItem("  ⚙ Advanced Configuration...  ");
+        advancedConfigItem.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        advancedConfigItem.setBackground(PANEL_DARK);
+        advancedConfigItem.setForeground(TEXT_PRIMARY);
+        advancedConfigItem.setBorder(BorderFactory.createEmptyBorder(8, 12, 8, 12));
+        advancedConfigItem.addActionListener(e -> editConfiguration());
+        optionsMenu.add(advancedConfigItem);
+        
+        menuBar.add(optionsMenu);
+        
+        // Tools menu for advanced operations
+        JMenu toolsMenu = new JMenu("  Tools  ");
+        toolsMenu.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        toolsMenu.setForeground(TEXT_PRIMARY);
+        toolsMenu.setOpaque(false);
+        
+        // Physics-informed optimization
+        JMenuItem physicsOptItem = new JMenuItem("  🔬 Physics Optimization...  ");
+        physicsOptItem.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        physicsOptItem.setBackground(PANEL_DARK);
+        physicsOptItem.setForeground(TEXT_PRIMARY);
+        physicsOptItem.setBorder(BorderFactory.createEmptyBorder(8, 12, 8, 12));
+        physicsOptItem.setToolTipText("Use completed tracks to correct drift in incomplete tracks");
+        physicsOptItem.addActionListener(e -> runPhysicsInformedOptimization());
+        toolsMenu.add(physicsOptItem);
+        
+        menuBar.add(toolsMenu);
+        
+        frame.setJMenuBar(menuBar);
+
+        // Center panel with professional dark canvas styling
+        JPanel centerPanel = new JPanel(new BorderLayout());
+        centerPanel.setBackground(PRIMARY_DARK);
+        centerPanel.setBorder(BorderFactory.createEmptyBorder(0, 0, 0, 0));
+        centerPanel.setMinimumSize(new Dimension(400, 200)); // Prevent center from collapsing too small
+
+        // Image canvas - optimized like ImageJ's Canvas
+        imageLabel = new JLabel() {
+            @Override
+            public void update(Graphics g) {
+                // Skip background clear - go straight to paint (like ImageJ)
+                paint(g);
+            }
+            
+            @Override
+            protected void paintComponent(Graphics g) {
+                try {
+                    paintComponentImpl(g);
+                } catch (OutOfMemoryError e) {
+                    // Handle OOM gracefully like ImageJ
+                    System.gc();
+                    g.setColor(getBackground());
+                    g.fillRect(0, 0, getWidth(), getHeight());
+                    g.setColor(Color.RED);
+                    g.drawString("Out of memory - try zooming out", 10, 20);
+                }
+            }
+            
+            private void paintComponentImpl(Graphics g) {
+                // Fill background first
+                g.setColor(getBackground());
+                g.fillRect(0, 0, getWidth(), getHeight());
+                
+                if (currentImage == null) return;
+                
+                // Handle smoothing comparison mode - split view
+                if (smoothingComparisonMode && smoothingComparisonTrackId != null) {
+                    paintComparisonView(g);
+                    return;
+                }
+                
+                int imgW = currentImage.getWidth();
+                int imgH = currentImage.getHeight();
+                int panelW = getWidth();
+                int panelH = getHeight();
+                
+                // Calculate the full destination rectangle for the entire image
+                // This is where the image would be if fully visible
+                int dstX = (int) Math.floor(imageOffsetX);
+                int dstY = (int) Math.floor(imageOffsetY);
+                int dstW = (int) Math.ceil(imgW * zoomFactor);
+                int dstH = (int) Math.ceil(imgH * zoomFactor);
+                
+                // Use nearest neighbor for zoomed-in to keep pixels sharp
+                Graphics2D g2d = (Graphics2D) g;
+                if (zoomFactor >= 1.0) {
+                    g2d.setRenderingHint(RenderingHints.KEY_INTERPOLATION, 
+                                         RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
+                } else {
+                    g2d.setRenderingHint(RenderingHints.KEY_INTERPOLATION, 
+                                         RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+                }
+                
+                // Draw the image scaled to the destination rectangle
+                // drawImage will clip automatically to the panel bounds
+                g2d.drawImage(currentImage, dstX, dstY, dstX + dstW, dstY + dstH, 
+                              0, 0, imgW, imgH, null);
+                
+                // Draw segmentation mask overlay if SAT is enabled and Mask checkbox is ON
+                if (satEnabled && segmentationMask != null && showMask) {
+                    g2d.drawImage(segmentationMask, dstX, dstY, dstX + dstW, dstY + dstH,
+                                  0, 0, imgW, imgH, null);
+                }
+                
+                // ====== OVERLAY COORDINATE CALCULATION ======
+                // To match drawImage exactly, we use the same destination rectangle.
+                // For an image pixel at (imgX, imgY), its screen position is:
+                //   screenX = dstX + imgX * dstW / imgW
+                //   screenY = dstY + imgY * dstH / imgH
+                // The pixel occupies a rectangle of size (dstW/imgW) x (dstH/imgH)
+                
+                double pixelWidth = (double) dstW / imgW;
+                double pixelHeight = (double) dstH / imgH;
+                
+                // Draw region boundaries and IDs if SAT enabled and Regions checkbox is ON
+                if (satEnabled && showRegionBoundaries) {
+                    int frameIndex = currentSlice - 1;
+                    if (frameRegions.containsKey(frameIndex)) {
+                        Map<Integer, SegmentedRegion> regions = frameRegions.get(frameIndex);
+                        g2d.setStroke(new BasicStroke(Math.max(1, (int)(2 * zoomFactor))));
+                        
+                        int fontSize = 11;
+                        g2d.setFont(new Font("SansSerif", Font.BOLD, fontSize));
+                        FontMetrics fm = g2d.getFontMetrics();
+                        
+                        for (SegmentedRegion region : regions.values()) {
+                            g2d.setColor(new Color(0, 200, 0, 180));
+                            int bx = dstX + (int) Math.floor(region.minX * pixelWidth);
+                            int by = dstY + (int) Math.floor(region.minY * pixelHeight);
+                            int bx2 = dstX + (int) Math.floor((region.maxX + 1) * pixelWidth);
+                            int by2 = dstY + (int) Math.floor((region.maxY + 1) * pixelHeight);
+                            g2d.drawRect(bx, by, bx2 - bx, by2 - by);
+                            
+                            int cx = dstX + (int) Math.floor((region.centroidX + 0.5) * pixelWidth);
+                            int cy = dstY + (int) Math.floor((region.centroidY + 0.5) * pixelHeight);
+                            
+                            String idText = String.valueOf(region.id);
+                            int textWidth = fm.stringWidth(idText);
+                            int circleDiameter = Math.max(20, textWidth + 8);
+                            int circleRadius = circleDiameter / 2;
+                            
+                            g2d.setColor(new Color(0, 100, 0, 200));
+                            g2d.fillOval(cx - circleRadius, cy - circleRadius, circleDiameter, circleDiameter);
+                            g2d.setColor(new Color(0, 255, 0, 255));
+                            g2d.setStroke(new BasicStroke(2));
+                            g2d.drawOval(cx - circleRadius, cy - circleRadius, circleDiameter, circleDiameter);
+                            g2d.setColor(Color.WHITE);
+                            g2d.drawString(idText, cx - textWidth/2, cy + (fm.getAscent() - fm.getDescent())/2);
+                        }
+                    }
+                }
+                
+                // Show hover preview of region bounding box (always when SAT is enabled)
+                if (satEnabled && hoverPoint != null) {
+                    int frameIndex = currentSlice - 1;
+                    if (framePixelToRegion.containsKey(frameIndex)) {
+                        int[][] pixelMap = framePixelToRegion.get(frameIndex);
+                        int imgX = hoverPoint.x;
+                        int imgY = hoverPoint.y;
+                        
+                        if (imgY >= 0 && imgY < pixelMap.length && 
+                            imgX >= 0 && imgX < pixelMap[0].length) {
+                            
+                            int hoveredRegionId = pixelMap[imgY][imgX];
+                            
+                            if (hoveredRegionId > 0 && frameRegions.containsKey(frameIndex)) {
+                                Map<Integer, SegmentedRegion> regions = frameRegions.get(frameIndex);
+                                SegmentedRegion hoveredRegion = regions.get(hoveredRegionId);
+                                
+                                if (hoveredRegion != null) {
+                                    Color boxColor = (selectedTrackId != null) ? 
+                                        getTrackColor(selectedTrackId) : new Color(255, 255, 0);
+                                    
+                                    g2d.setColor(new Color(boxColor.getRed(), boxColor.getGreen(), 
+                                                         boxColor.getBlue(), 80));
+                                    g2d.setStroke(new BasicStroke(Math.max(2, (int)(3 * zoomFactor))));
+                                    
+                                    int bx = dstX + (int) Math.floor(hoveredRegion.minX * pixelWidth);
+                                    int by = dstY + (int) Math.floor(hoveredRegion.minY * pixelHeight);
+                                    int bx2 = dstX + (int) Math.floor((hoveredRegion.maxX + 1) * pixelWidth);
+                                    int by2 = dstY + (int) Math.floor((hoveredRegion.maxY + 1) * pixelHeight);
+                                    g2d.drawRect(bx, by, bx2 - bx, by2 - by);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Draw hover preview (on all frames) - pixel-aligned cursor (square or circle)
+                if (hoverPoint != null && selectedTrackId != null) {
+                    Color trackColor = getTrackColor(selectedTrackId);
+                    g2d.setColor(new Color(trackColor.getRed(), trackColor.getGreen(), 
+                                        trackColor.getBlue(), 150));
+                    
+                    // Calculate cursor bounds in image coordinates
+                    int halfB = (hoverCursorSize - 1) / 2;
+                    int halfA = hoverCursorSize / 2;
+                    int px1 = hoverPoint.x - halfB;
+                    int py1 = hoverPoint.y - halfB;
+                    int px2 = hoverPoint.x + halfA + 1;  // +1 because we want to include the last pixel
+                    int py2 = hoverPoint.y + halfA + 1;
+                    
+                    // Convert to screen coordinates
+                    int sx1 = dstX + (int) Math.floor(px1 * pixelWidth);
+                    int sy1 = dstY + (int) Math.floor(py1 * pixelHeight);
+                    int sx2 = dstX + (int) Math.floor(px2 * pixelWidth);
+                    int sy2 = dstY + (int) Math.floor(py2 * pixelHeight);
+                    int sw = sx2 - sx1;
+                    int sh = sy2 - sy1;
+                    
+                    g2d.setStroke(new BasicStroke(Math.max(1.0f, (float)(pixelWidth / 3.0))));
+                    
+                    // Calculate center pixel screen coordinates
+                    int screenX = dstX + (int) Math.floor(hoverPoint.x * pixelWidth);
+                    int screenY = dstY + (int) Math.floor(hoverPoint.y * pixelHeight);
+                    int screenW = (int) Math.ceil(pixelWidth);
+                    int screenH = (int) Math.ceil(pixelHeight);
+                    
+                    if (cursorCircleMode) {
+                        // Draw circle/ellipse
+                        if (cursorOpaqueMode) {
+                            g2d.fillOval(sx1, sy1, sw, sh);
+                        } else {
+                            // Draw center pixel filled + circle outline
+                            g2d.fillRect(screenX, screenY, screenW, screenH);
+                            g2d.drawOval(sx1, sy1, sw, sh);
+                        }
+                    } else {
+                        // Draw square/rectangle
+                        if (cursorOpaqueMode) {
+                            g2d.fillRect(sx1, sy1, sw, sh);
+                        } else {
+                            // Draw center pixel filled + square outline
+                            g2d.fillRect(screenX, screenY, screenW, screenH);
+                            g2d.drawRect(sx1, sy1, sw, sh);
+                        }
+                    }
+                }
+
+                // Draw annotations (hide during preview mode)
+                if (!hideTracksInPreview) {
+                    int screenPixelW = (int) Math.ceil(pixelWidth);
+                    int screenPixelH = (int) Math.ceil(pixelHeight);
+                    
+                    for (Map.Entry<String, Map<Integer, Point>> trackEntry : trackAnnotations.entrySet()) {
+                        String trackId = trackEntry.getKey();
+                        Point p = trackEntry.getValue().get(currentSlice - 1);
+                        if (p != null) {
+                            Color color = getTrackColor(trackId);
+                            g2d.setColor(color);
+                            
+                            int screenX = dstX + (int) Math.floor(p.x * pixelWidth);
+                            int screenY = dstY + (int) Math.floor(p.y * pixelHeight);
+                            
+                            // Determine if this track should use cursor shape styling
+                            boolean useShape = cursorPersistentMode || trackId.equals(selectedTrackId);
+                            
+                            // Check if this track is being trimmed
+                            boolean isBeingTrimmed = trimModeActive && trackId.equals(trimModeTrackId);
+                            
+                            // Check if this track is being hovered in switch mode (Shift held)
+                            boolean isHoveredForSwitch = trackSwitchModeActive && trackId.equals(hoveredTrackId);
+                            
+                            // Check if this is the currently selected track in switch mode (to show which track user is on)
+                            boolean isCurrentTrackInSwitchMode = trackSwitchModeActive && trackId.equals(selectedTrackId);
+                            
+                            // Check if this track is being hovered in multi-select mode (Ctrl held)
+                            boolean isHoveredForMultiSelect = multiSelectModeActive && trackId.equals(hoveredTrackId);
+                            
+                            // Check if this track is multi-selected for batch operations (Ctrl+click)
+                            // Only show persistent ring when Ctrl is held (to avoid obstructing view)
+                            boolean isMultiSelected = multiSelectModeActive && trackSelected.getOrDefault(trackId, false);
+                            
+                            if (useShape) {
+                                // Calculate cursor bounds in image coordinates
+                                int halfB = (hoverCursorSize - 1) / 2;
+                                int halfA = hoverCursorSize / 2;
+                                int px1 = p.x - halfB;
+                                int py1 = p.y - halfB;
+                                int px2 = p.x + halfA + 1;
+                                int py2 = p.y + halfA + 1;
+                                
+                                int sx1 = dstX + (int) Math.floor(px1 * pixelWidth);
+                                int sy1 = dstY + (int) Math.floor(py1 * pixelHeight);
+                                int sx2 = dstX + (int) Math.floor(px2 * pixelWidth);
+                                int sy2 = dstY + (int) Math.floor(py2 * pixelHeight);
+                                int sw = sx2 - sx1;
+                                int sh = sy2 - sy1;
+                                
+                                g2d.setStroke(new BasicStroke(Math.max(1.0f, (float)(pixelWidth / 3.0))));
+                                
+                                if (cursorCircleMode) {
+                                    // Draw circle/ellipse
+                                    if (cursorOpaqueMode) {
+                                        g2d.fillOval(sx1, sy1, sw, sh);
+                                    } else {
+                                        // Draw center pixel + circle outline
+                                        g2d.fillRect(screenX, screenY, screenPixelW, screenPixelH);
+                                        g2d.drawOval(sx1, sy1, sw, sh);
+                                    }
+                                } else {
+                                    // Draw square/rectangle
+                                    if (cursorOpaqueMode) {
+                                        g2d.fillRect(sx1, sy1, sw, sh);
+                                    } else {
+                                        // Draw center pixel + square outline
+                                        g2d.fillRect(screenX, screenY, screenPixelW, screenPixelH);
+                                        g2d.drawRect(sx1, sy1, sw, sh);
+                                    }
+                                }
+                                
+                                // Draw X marker for occluded frames
+                                if (isFrameOccluded(trackId, currentSlice - 1)) {
+                                    g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                                    // Draw X slightly inset from the shape bounds
+                                    int xInset = Math.max(2, (int)(sw * 0.15));
+                                    int xLeft = sx1 + xInset;
+                                    int xRight = sx1 + sw - xInset;
+                                    int xTop = sy1 + xInset;
+                                    int xBottom = sy1 + sh - xInset;
+                                    // Draw dark outline first for contrast
+                                    g2d.setColor(new Color(0, 0, 0, 180));
+                                    g2d.setStroke(new BasicStroke(Math.max(4.0f, (float)(pixelWidth / 1.5)), 
+                                                                   BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                                    g2d.drawLine(xLeft, xTop, xRight, xBottom);
+                                    g2d.drawLine(xLeft, xBottom, xRight, xTop);
+                                    // Draw X in track color on top
+                                    g2d.setColor(color);
+                                    g2d.setStroke(new BasicStroke(Math.max(2.0f, (float)(pixelWidth / 2.0)), 
+                                                                   BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                                    g2d.drawLine(xLeft, xTop, xRight, xBottom);
+                                    g2d.drawLine(xLeft, xBottom, xRight, xTop);
+                                }
+                            } else {
+                                // Non-selected track without persistent mode: just draw single pixel point
+                                g2d.fillRect(screenX, screenY, screenPixelW, screenPixelH);
+                                
+                                // Draw small X marker for occluded frames (scaled to cursor size)
+                                if (isFrameOccluded(trackId, currentSlice - 1)) {
+                                    g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                                    // Calculate X size based on cursor size setting (for consistency)
+                                    int halfB = (hoverCursorSize - 1) / 2;
+                                    int halfA = hoverCursorSize / 2;
+                                    int px1 = p.x - halfB;
+                                    int py1 = p.y - halfB;
+                                    int px2 = p.x + halfA + 1;
+                                    int py2 = p.y + halfA + 1;
+                                    
+                                    int sx1 = dstX + (int) Math.floor(px1 * pixelWidth);
+                                    int sy1 = dstY + (int) Math.floor(py1 * pixelHeight);
+                                    int sx2 = dstX + (int) Math.floor(px2 * pixelWidth);
+                                    int sy2 = dstY + (int) Math.floor(py2 * pixelHeight);
+                                    int sw = sx2 - sx1;
+                                    int sh = sy2 - sy1;
+                                    
+                                    int xInset = Math.max(2, (int)(sw * 0.15));
+                                    int xLeft = sx1 + xInset;
+                                    int xRight = sx1 + sw - xInset;
+                                    int xTop = sy1 + xInset;
+                                    int xBottom = sy1 + sh - xInset;
+                                    // Draw dark outline first
+                                    g2d.setColor(new Color(0, 0, 0, 180));
+                                    g2d.setStroke(new BasicStroke(Math.max(3.0f, (float)(pixelWidth / 2.0)), 
+                                                                   BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                                    g2d.drawLine(xLeft, xTop, xRight, xBottom);
+                                    g2d.drawLine(xLeft, xBottom, xRight, xTop);
+                                    // Draw X in track color
+                                    g2d.setColor(color);
+                                    g2d.setStroke(new BasicStroke(Math.max(1.5f, (float)(pixelWidth / 3.0)), 
+                                                                   BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                                    g2d.drawLine(xLeft, xTop, xRight, xBottom);
+                                    g2d.drawLine(xLeft, xBottom, xRight, xTop);
+                                }
+                            }
+                            
+                            // Draw switch mode highlight ring (Shift held):
+                            // 1. Hovered track - white ring for track user is about to switch to
+                            // 2. Current track - shows which track user is currently on
+                            if (isHoveredForSwitch || isCurrentTrackInSwitchMode) {
+                                g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                                
+                                // Calculate highlight ring size (larger than cursor)
+                                int highlightRadius = Math.max(8, hoverCursorSize + 4);
+                                int halfB = (highlightRadius - 1) / 2;
+                                int halfA = highlightRadius / 2;
+                                int px1 = p.x - halfB;
+                                int py1 = p.y - halfB;
+                                int px2 = p.x + halfA + 1;
+                                int py2 = p.y + halfA + 1;
+                                
+                                int hx1 = dstX + (int) Math.floor(px1 * pixelWidth);
+                                int hy1 = dstY + (int) Math.floor(py1 * pixelHeight);
+                                int hx2 = dstX + (int) Math.floor(px2 * pixelWidth);
+                                int hy2 = dstY + (int) Math.floor(py2 * pixelHeight);
+                                int hw = hx2 - hx1;
+                                int hh = hy2 - hy1;
+                                
+                                // Draw pulsing white highlight ring with track color glow
+                                g2d.setStroke(new BasicStroke(Math.max(3.0f, (float)(pixelWidth / 2.0))));
+                                g2d.setColor(new Color(255, 255, 255, 200));
+                                g2d.drawOval(hx1 - 2, hy1 - 2, hw + 4, hh + 4);
+                                
+                                // Draw track color inner ring
+                                g2d.setStroke(new BasicStroke(Math.max(2.0f, (float)(pixelWidth / 3.0))));
+                                g2d.setColor(new Color(color.getRed(), color.getGreen(), color.getBlue(), 255));
+                                g2d.drawOval(hx1, hy1, hw, hh);
+                                
+                                // Draw track name label near the point
+                                g2d.setFont(new Font("SansSerif", Font.BOLD, 11));
+                                FontMetrics fm = g2d.getFontMetrics();
+                                String label = trackId;
+                                int labelWidth = fm.stringWidth(label);
+                                int labelX = screenX + screenPixelW + 5;
+                                int labelY = screenY + screenPixelH / 2 + fm.getAscent() / 2;
+                                
+                                // Background for label
+                                g2d.setColor(new Color(0, 0, 0, 180));
+                                g2d.fillRoundRect(labelX - 3, labelY - fm.getAscent(), labelWidth + 6, fm.getHeight(), 4, 4);
+                                
+                                // Label text
+                                g2d.setColor(Color.WHITE);
+                                g2d.drawString(label, labelX, labelY);
+                            }
+                            
+                            // Draw highlight ring for multi-select mode:
+                            // 1. Hovering over a track in multi-select mode (Ctrl held) - preview ring
+                            // 2. Already multi-selected tracks (when Ctrl is held) - persistent ring
+                            // Only draw if not already showing switch mode highlight (avoid duplicate rings)
+                            if ((isHoveredForMultiSelect || isMultiSelected) && !isHoveredForSwitch && !isCurrentTrackInSwitchMode) {
+                                g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                                
+                                // Calculate highlight ring size (larger than cursor)
+                                int highlightRadius = Math.max(8, hoverCursorSize + 4);
+                                int halfB = (highlightRadius - 1) / 2;
+                                int halfA = highlightRadius / 2;
+                                int px1 = p.x - halfB;
+                                int py1 = p.y - halfB;
+                                int px2 = p.x + halfA + 1;
+                                int py2 = p.y + halfA + 1;
+                                
+                                int hx1 = dstX + (int) Math.floor(px1 * pixelWidth);
+                                int hy1 = dstY + (int) Math.floor(py1 * pixelHeight);
+                                int hx2 = dstX + (int) Math.floor(px2 * pixelWidth);
+                                int hy2 = dstY + (int) Math.floor(py2 * pixelHeight);
+                                int hw = hx2 - hx1;
+                                int hh = hy2 - hy1;
+                                
+                                // Draw cyan/teal highlight ring to distinguish from shift-hover (white ring)
+                                // Using a distinct color helps users differentiate multi-select from track-switch
+                                g2d.setStroke(new BasicStroke(Math.max(2.5f, (float)(pixelWidth / 2.5))));
+                                g2d.setColor(new Color(0, 220, 220, 200));  // Cyan for multi-select
+                                g2d.drawOval(hx1 - 2, hy1 - 2, hw + 4, hh + 4);
+                                
+                                // Draw track color inner ring
+                                g2d.setStroke(new BasicStroke(Math.max(1.5f, (float)(pixelWidth / 4.0))));
+                                g2d.setColor(new Color(color.getRed(), color.getGreen(), color.getBlue(), 230));
+                                g2d.drawOval(hx1, hy1, hw, hh);
+                                
+                                // Draw track name label near the point
+                                g2d.setFont(new Font("SansSerif", Font.BOLD, 11));
+                                FontMetrics fm = g2d.getFontMetrics();
+                                String label = trackId;
+                                int labelWidth = fm.stringWidth(label);
+                                int labelX = screenX + screenPixelW + 5;
+                                int labelY = screenY + screenPixelH / 2 + fm.getAscent() / 2;
+                                
+                                // Background for label (cyan tint to match selection ring)
+                                g2d.setColor(new Color(0, 60, 60, 200));
+                                g2d.fillRoundRect(labelX - 3, labelY - fm.getAscent(), labelWidth + 6, fm.getHeight(), 4, 4);
+                                
+                                // Label text (cyan tint)
+                                g2d.setColor(new Color(180, 255, 255));
+                                g2d.drawString(label, labelX, labelY);
+                            }
+                            
+                            // Draw highlight ring for track being trimmed
+                            if (isBeingTrimmed) {
+                                g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                                
+                                // Calculate highlight ring size (larger than cursor)
+                                int highlightRadius = Math.max(10, hoverCursorSize + 6);
+                                int halfB = (highlightRadius - 1) / 2;
+                                int halfA = highlightRadius / 2;
+                                int px1 = p.x - halfB;
+                                int py1 = p.y - halfB;
+                                int px2 = p.x + halfA + 1;
+                                int py2 = p.y + halfA + 1;
+                                
+                                int hx1 = dstX + (int) Math.floor(px1 * pixelWidth);
+                                int hy1 = dstY + (int) Math.floor(py1 * pixelHeight);
+                                int hx2 = dstX + (int) Math.floor(px2 * pixelWidth);
+                                int hy2 = dstY + (int) Math.floor(py2 * pixelHeight);
+                                int hw = hx2 - hx1;
+                                int hh = hy2 - hy1;
+                                
+                                // Draw animated trim indicator - alternating green/red for start/end
+                                g2d.setStroke(new BasicStroke(Math.max(3.0f, (float)(pixelWidth / 2.0)), 
+                                    BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND, 0f, new float[]{8f, 4f}, 0f));
+                                g2d.setColor(new Color(ACCENT_GREEN.getRed(), ACCENT_GREEN.getGreen(), ACCENT_GREEN.getBlue(), 220));
+                                g2d.drawOval(hx1 - 3, hy1 - 3, hw + 6, hh + 6);
+                                
+                                // Draw inner track color ring
+                                g2d.setStroke(new BasicStroke(Math.max(2.0f, (float)(pixelWidth / 3.0))));
+                                g2d.setColor(new Color(color.getRed(), color.getGreen(), color.getBlue(), 255));
+                                g2d.drawOval(hx1, hy1, hw, hh);
+                                
+                                // Draw "TRIMMING" label
+                                g2d.setFont(new Font("SansSerif", Font.BOLD, 11));
+                                FontMetrics fm = g2d.getFontMetrics();
+                                String label = "✂ " + trackId;
+                                int labelWidth = fm.stringWidth(label);
+                                int labelX = screenX + screenPixelW + 5;
+                                int labelY = screenY + screenPixelH / 2 + fm.getAscent() / 2;
+                                
+                                // Background for label (green tint)
+                                g2d.setColor(new Color(30, 80, 30, 200));
+                                g2d.fillRoundRect(labelX - 3, labelY - fm.getAscent(), labelWidth + 6, fm.getHeight(), 4, 4);
+                                
+                                // Label text
+                                g2d.setColor(new Color(150, 255, 150));
+                                g2d.drawString(label, labelX, labelY);
+                            }
+                        }
+                    }
+                }
+                
+                // Draw detection preview overlay (DoG or Trackpy)
+                if (previewModeActive && previewSpots != null && currentSlice == previewFrame) {
+                    g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                    g2d.setStroke(new BasicStroke(1.0f));
+                    
+                    int spotIndex = 0;
+                    for (double[] spot : previewSpots) {
+                        double spotX = spot[0];
+                        double spotY = spot[1];
+                        
+                        float hue = ((spotIndex * 37) % 180) / 180.0f;
+                        Color spotColor = Color.getHSBColor(hue, 1.0f, 1.0f);
+                        g2d.setColor(spotColor);
+                        
+                        // Center of the pixel
+                        int screenX = dstX + (int) Math.floor((spotX + 0.5) * pixelWidth);
+                        int screenY = dstY + (int) Math.floor((spotY + 0.5) * pixelHeight);
+                        
+                        int circleRadius = Math.max(2, (int) Math.round(previewRadius * zoomFactor));
+                        g2d.drawOval(screenX - circleRadius, screenY - circleRadius, 
+                                    circleRadius * 2, circleRadius * 2);
+                        
+                        spotIndex++;
+                    }
+                    
+                    g2d.setFont(new Font("SansSerif", Font.BOLD, 12));
+                    String typeLabel = "dog".equals(previewType) ? "DoG" : "Trackpy";
+                    String infoText = String.format("%s Preview: %d spots (radius=%.1f px)", 
+                                                    typeLabel, previewSpotCount, previewRadius);
+                    g2d.setColor(new Color(0, 0, 0, 180));
+                    g2d.fillRoundRect(8, 8, g2d.getFontMetrics().stringWidth(infoText) + 16, 24, 8, 8);
+                    g2d.setColor(new Color(100, 255, 100));
+                    g2d.drawString(infoText, 16, 24);
+                }
+                
+                // Draw trajectory preview overlay (Trackpy with free navigation)
+                if (trajectoryPreviewActive && previewTrajectories != null) {
+                    g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                    int currentFrame = currentSlice - 1;
+                    
+                    int trajIndex = 0;
+                    for (Map<String, Object> traj : previewTrajectories) {
+                        @SuppressWarnings("unchecked")
+                        Map<Integer, double[]> positions = (Map<Integer, double[]>) traj.get("positions");
+                        if (positions == null || positions.isEmpty()) continue;
+                        
+                        float hue = ((trajIndex * 37) % 180) / 180.0f;
+                        Color trajColor = Color.getHSBColor(hue, 0.8f, 0.9f);
+                        
+                        List<Integer> sortedFrames = new ArrayList<>(positions.keySet());
+                        java.util.Collections.sort(sortedFrames);
+                        
+                        g2d.setColor(new Color(trajColor.getRed(), trajColor.getGreen(), trajColor.getBlue(), 150));
+                        g2d.setStroke(new BasicStroke(Math.max(1.0f, 1.5f * (float)zoomFactor)));
+                        
+                        double[] prevPos = null;
+                        for (int frameIdx : sortedFrames) {
+                            if (frameIdx > currentFrame) break;
+                            double[] pos = positions.get(frameIdx);
+                            if (prevPos != null) {
+                                int x1 = dstX + (int) Math.floor((prevPos[0] + 0.5) * pixelWidth);
+                                int y1 = dstY + (int) Math.floor((prevPos[1] + 0.5) * pixelHeight);
+                                int x2 = dstX + (int) Math.floor((pos[0] + 0.5) * pixelWidth);
+                                int y2 = dstY + (int) Math.floor((pos[1] + 0.5) * pixelHeight);
+                                g2d.drawLine(x1, y1, x2, y2);
+                            }
+                            prevPos = pos;
+                        }
+                        
+                        if (positions.containsKey(currentFrame)) {
+                            double[] pos = positions.get(currentFrame);
+                            int screenX = dstX + (int) Math.floor((pos[0] + 0.5) * pixelWidth);
+                            int screenY = dstY + (int) Math.floor((pos[1] + 0.5) * pixelHeight);
+                            int circleRadius = Math.max(3, (int) Math.round(previewRadius * zoomFactor * 0.7));
+                            
+                            g2d.setColor(trajColor);
+                            g2d.fillOval(screenX - circleRadius, screenY - circleRadius, 
+                                        circleRadius * 2, circleRadius * 2);
+                            g2d.setColor(Color.WHITE);
+                            g2d.setStroke(new BasicStroke(1.0f));
+                            g2d.drawOval(screenX - circleRadius, screenY - circleRadius, 
+                                        circleRadius * 2, circleRadius * 2);
+                        }
+                        
+                        trajIndex++;
+                    }
+                    
+                    if (previewDetectionsPerFrame != null && previewDetectionsPerFrame.containsKey(currentFrame)) {
+                        List<double[]> detections = previewDetectionsPerFrame.get(currentFrame);
+                        g2d.setStroke(new BasicStroke(1.0f));
+                        for (double[] det : detections) {
+                            int screenX = dstX + (int) Math.floor((det[0] + 0.5) * pixelWidth);
+                            int screenY = dstY + (int) Math.floor((det[1] + 0.5) * pixelHeight);
+                            int circleRadius = Math.max(2, (int) Math.round(previewRadius * zoomFactor * 0.5));
+                            
+                            g2d.setColor(new Color(255, 255, 255, 80));
+                            g2d.drawOval(screenX - circleRadius, screenY - circleRadius, 
+                                        circleRadius * 2, circleRadius * 2);
+                        }
+                    }
+                    
+                    g2d.setFont(new Font("SansSerif", Font.BOLD, 12));
+                    int detCount = (previewDetectionsPerFrame != null && previewDetectionsPerFrame.containsKey(currentFrame)) 
+                        ? previewDetectionsPerFrame.get(currentFrame).size() : 0;
+                    String infoText = String.format("Trackpy Trajectories: %d tracks | Frame %d: %d detections", 
+                                                    previewTrajCount, currentSlice, detCount);
+                    g2d.setColor(new Color(0, 0, 0, 180));
+                    g2d.fillRoundRect(8, 8, g2d.getFontMetrics().stringWidth(infoText) + 16, 24, 8, 8);
+                    g2d.setColor(new Color(150, 200, 255));
+                    g2d.drawString(infoText, 16, 24);
+                }
+            }
+        };
+        imageLabel.setHorizontalAlignment(JLabel.LEFT);
+        imageLabel.setOpaque(true);
+        imageLabel.setBackground(PRIMARY_DARK);
+        imageLabel.setDoubleBuffered(true);  // Ensure double buffering for smooth rendering
+
+        JScrollPane scrollPane = new JScrollPane(imageLabel);
+        scrollPane.setBorder(BorderFactory.createEmptyBorder());
+        scrollPane.getViewport().setBackground(PRIMARY_DARK);
+        scrollPane.setBackground(PRIMARY_DARK);
+        centerPanel.add(scrollPane, BorderLayout.CENTER);
+        
+        // Frame navigation panel with professional styling
+        frameNavPanel = new JPanel(new BorderLayout(12, 0)) {
+            @Override
+            protected void paintComponent(Graphics g) {
+                super.paintComponent(g);
+                Graphics2D g2d = (Graphics2D) g;
+                g2d.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+                // Solid background color based on theme
+                g2d.setColor(PANEL_DARK);
+                g2d.fillRect(0, 0, getWidth(), getHeight());
+            }
+        };
+        frameNavPanel.setOpaque(false);
+        frameNavPanel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createMatteBorder(1, 0, 0, 0, BORDER_DARK),
+            BorderFactory.createEmptyBorder(10, 20, 10, 20)
+        ));
+        
+        pageLabel = new JLabel("Frame: 0 / 0", SwingConstants.CENTER);
+        pageLabel.setFont(new Font("Segoe UI", Font.BOLD, 14));
+        pageLabel.setForeground(ACCENT_BLUE);
+        pageLabel.setOpaque(false);
+        
+        frameSlider = new JSlider(1, 1, 1) {
+            @Override
+            protected void paintComponent(Graphics g) {
+                super.paintComponent(g);
+                Graphics2D g2 = (Graphics2D) g.create();
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                
+                // Clip to prevent drawing outside slider bounds
+                g2.setClip(0, 0, getWidth(), getHeight());
+                
+                // Calculate the track area bounds
+                Insets insets = getInsets();
+                int trackLeft = insets.left + 6;  // Account for thumb width
+                int trackRight = getWidth() - insets.right - 6;
+                int trackWidth = trackRight - trackLeft;
+                int trackY = getHeight() / 2;
+                
+                // Paint trim mode range indicators if active
+                if (trimModeActive && totalSlices > 1) {
+                    int rangeMin = trimModeMinFrame + 1;  // Convert to 1-indexed
+                    int rangeMax = trimModeMaxFrame + 1;
+                    int startVal = trimModeStartValue + 1;
+                    int endVal = trimModeEndValue + 1;
+                    
+                    // Calculate positions
+                    double rangeMinRatio = (double)(rangeMin - getMinimum()) / Math.max(1, getMaximum() - getMinimum());
+                    double rangeMaxRatio = (double)(rangeMax - getMinimum()) / Math.max(1, getMaximum() - getMinimum());
+                    double startRatio = (double)(startVal - getMinimum()) / Math.max(1, getMaximum() - getMinimum());
+                    double endRatio = (double)(endVal - getMinimum()) / Math.max(1, getMaximum() - getMinimum());
+                    
+                    int rangeMinX = trackLeft + (int)(rangeMinRatio * trackWidth);
+                    int rangeMaxX = trackLeft + (int)(rangeMaxRatio * trackWidth);
+                    int startX = trackLeft + (int)(startRatio * trackWidth);
+                    int endX = trackLeft + (int)(endRatio * trackWidth);
+                    
+                    // Draw track range background (frames the track spans)
+                    g2.setColor(new Color(80, 80, 80, 150));
+                    g2.fillRoundRect(rangeMinX, trackY - 4, rangeMaxX - rangeMinX, 8, 4, 4);
+                    
+                    // Draw selected range (what will be kept)
+                    Color trackColor = getTrackColor(trimModeTrackId);
+                    g2.setColor(new Color(trackColor.getRed(), trackColor.getGreen(), trackColor.getBlue(), 180));
+                    g2.fillRoundRect(startX, trackY - 6, endX - startX, 12, 6, 6);
+                    
+                    // Draw trimmed areas (what will be removed) with hatching pattern
+                    g2.setColor(new Color(ACCENT_RED.getRed(), ACCENT_RED.getGreen(), ACCENT_RED.getBlue(), 100));
+                    if (startX > rangeMinX) {
+                        g2.fillRoundRect(rangeMinX, trackY - 4, startX - rangeMinX, 8, 4, 4);
+                    }
+                    if (endX < rangeMaxX) {
+                        g2.fillRoundRect(endX, trackY - 4, rangeMaxX - endX, 8, 4, 4);
+                    }
+                    
+                    // Draw start thumb
+                    g2.setColor(ACCENT_GREEN);
+                    g2.fillOval(startX - 8, trackY - 10, 16, 20);
+                    g2.setColor(Color.WHITE);
+                    g2.setStroke(new BasicStroke(2));
+                    g2.drawLine(startX - 2, trackY - 4, startX - 2, trackY + 4);
+                    g2.drawLine(startX + 2, trackY - 4, startX + 2, trackY + 4);
+                    
+                    // Draw end thumb
+                    g2.setColor(ACCENT_RED);
+                    g2.fillOval(endX - 8, trackY - 10, 16, 20);
+                    g2.setColor(Color.WHITE);
+                    g2.drawLine(endX - 2, trackY - 4, endX - 2, trackY + 4);
+                    g2.drawLine(endX + 2, trackY - 4, endX + 2, trackY + 4);
+                    
+                    // Draw frame numbers at thumbs
+                    g2.setColor(TEXT_PRIMARY);
+                    g2.setFont(new Font("Segoe UI", Font.BOLD, 10));
+                    FontMetrics fm = g2.getFontMetrics();
+                    String startStr = String.valueOf(startVal);
+                    String endStr = String.valueOf(endVal);
+                    g2.drawString(startStr, startX - fm.stringWidth(startStr) / 2, trackY - 14);
+                    g2.drawString(endStr, endX - fm.stringWidth(endStr) / 2, trackY + 22);
+                }
+                // Paint occlusion mode segment indicators if active
+                else if (occlusionModeActive && occlusionModeSegments != null && totalSlices > 1) {
+                    int rangeMin = occlusionModeMinFrame + 1;  // Convert to 1-indexed
+                    int rangeMax = occlusionModeMaxFrame + 1;
+                    
+                    double rangeMinRatio = (double)(rangeMin - getMinimum()) / Math.max(1, getMaximum() - getMinimum());
+                    double rangeMaxRatio = (double)(rangeMax - getMinimum()) / Math.max(1, getMaximum() - getMinimum());
+                    int rangeMinX = trackLeft + (int)(rangeMinRatio * trackWidth);
+                    int rangeMaxX = trackLeft + (int)(rangeMaxRatio * trackWidth);
+                    
+                    // Draw track range background (default: GREEN for visible)
+                    g2.setColor(new Color(ACCENT_GREEN.getRed(), ACCENT_GREEN.getGreen(), ACCENT_GREEN.getBlue(), 120));
+                    g2.fillRoundRect(rangeMinX, trackY - 6, rangeMaxX - rangeMinX, 12, 6, 6);
+                    
+                    // Draw occlusion segments (RED overlays - frames where object is hidden)
+                    g2.setColor(new Color(ACCENT_RED.getRed(), ACCENT_RED.getGreen(), ACCENT_RED.getBlue(), 200));
+                    
+                    for (int[] seg : occlusionModeSegments) {
+                        int segStart = seg[0] + 1;  // Convert to 1-indexed
+                        int segEnd = seg[1] + 1;
+                        
+                        double segStartRatio = (double)(segStart - getMinimum()) / Math.max(1, getMaximum() - getMinimum());
+                        double segEndRatio = (double)(segEnd - getMinimum()) / Math.max(1, getMaximum() - getMinimum());
+                        int segStartX = trackLeft + (int)(segStartRatio * trackWidth);
+                        int segEndX = trackLeft + (int)(segEndRatio * trackWidth);
+                        
+                        // Draw occlusion segment (red)
+                        g2.fillRoundRect(segStartX, trackY - 7, Math.max(4, segEndX - segStartX), 14, 6, 6);
+                        
+                        // Draw segment boundary markers
+                        g2.setColor(Color.WHITE);
+                        g2.setStroke(new BasicStroke(2, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                        g2.drawLine(segStartX, trackY - 9, segStartX, trackY + 9);
+                        g2.drawLine(segEndX, trackY - 9, segEndX, trackY + 9);
+                        g2.setColor(new Color(ACCENT_RED.getRed(), ACCENT_RED.getGreen(), ACCENT_RED.getBlue(), 200));
+                    }
+                    
+                    // Draw pending occlusion segment indicator (dashed line from start to current)
+                    if (occlusionModePendingStart >= 0) {
+                        int pendingStart = occlusionModePendingStart + 1;  // Convert to 1-indexed
+                        int currentFrame = getValue();
+                        
+                        double pendingStartRatio = (double)(pendingStart - getMinimum()) / Math.max(1, getMaximum() - getMinimum());
+                        double currentRatio = (double)(currentFrame - getMinimum()) / Math.max(1, getMaximum() - getMinimum());
+                        
+                        int pendingStartX = trackLeft + (int)(pendingStartRatio * trackWidth);
+                        int currentX = trackLeft + (int)(currentRatio * trackWidth);
+                        
+                        // Draw pending region with dashed border
+                        int leftX = Math.min(pendingStartX, currentX);
+                        int rightX = Math.max(pendingStartX, currentX);
+                        
+                        g2.setColor(new Color(ACCENT_RED.getRed(), ACCENT_RED.getGreen(), ACCENT_RED.getBlue(), 100));
+                        g2.fillRoundRect(leftX, trackY - 6, rightX - leftX, 12, 4, 4);
+                        
+                        // Dashed border
+                        g2.setColor(ACCENT_RED);
+                        g2.setStroke(new BasicStroke(2, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND, 
+                                                      1.0f, new float[]{4.0f, 4.0f}, 0.0f));
+                        g2.drawRoundRect(leftX, trackY - 6, rightX - leftX, 12, 4, 4);
+                        
+                        // Draw start marker
+                        g2.setStroke(new BasicStroke(3));
+                        g2.drawLine(pendingStartX, trackY - 10, pendingStartX, trackY + 10);
+                    }
+                    
+                    // Draw current frame indicator
+                    int currentFrame = getValue();
+                    double currentRatio = (double)(currentFrame - getMinimum()) / Math.max(1, getMaximum() - getMinimum());
+                    int currentX = trackLeft + (int)(currentRatio * trackWidth);
+                    
+                    // Check if current frame is visible or occluded
+                    boolean isOccluded = false;
+                    for (int[] seg : occlusionModeSegments) {
+                        if (currentFrame - 1 >= seg[0] && currentFrame - 1 <= seg[1]) {
+                            isOccluded = true;
+                            break;
+                        }
+                    }
+                    
+                    // Draw current frame indicator (green if visible, red if occluded)
+                    g2.setColor(isOccluded ? ACCENT_RED : ACCENT_GREEN);
+                    g2.setStroke(new BasicStroke(1));
+                    g2.fillOval(currentX - 7, trackY - 9, 14, 18);
+                    g2.setColor(Color.WHITE);
+                    g2.setStroke(new BasicStroke(2));
+                    g2.drawOval(currentX - 7, trackY - 9, 14, 18);
+                    
+                    // Draw frame number below
+                    g2.setFont(new Font("Segoe UI", Font.BOLD, 10));
+                    FontMetrics fm = g2.getFontMetrics();
+                    String frameStr = String.valueOf(currentFrame);
+                    g2.setColor(TEXT_PRIMARY);
+                    g2.drawString(frameStr, currentX - fm.stringWidth(frameStr) / 2, trackY + 24);
+                }
+                // Paint anchor point indicators only for the selected track (when not in trim/occlusion mode)
+                else if (totalSlices > 1 && selectedTrackId != null && trackAnchors.containsKey(selectedTrackId)) {
+                    // Draw anchor indicators only for the selected track
+                    List<Anchor> anchors = trackAnchors.get(selectedTrackId);
+                    Color trackColor = getTrackColor(selectedTrackId);
+                    
+                    for (Anchor anchor : anchors) {
+                        // Convert 0-indexed frame to 1-indexed slider position
+                        int sliderFrame = anchor.frame + 1;
+                        if (sliderFrame >= getMinimum() && sliderFrame <= getMaximum()) {
+                            // Calculate x position
+                            double ratio = (double)(sliderFrame - getMinimum()) / (getMaximum() - getMinimum());
+                            int x = trackLeft + (int)(ratio * trackWidth);
+                            
+                            // Draw vertical line
+                            g2.setColor(new Color(trackColor.getRed(), trackColor.getGreen(), trackColor.getBlue(), 180));
+                            g2.setStroke(new BasicStroke(3, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                            g2.drawLine(x, trackY - 8, x, trackY + 8);
+                            
+                            // Draw small circle at top
+                            g2.fillOval(x - 3, trackY - 11, 6, 6);
+                        }
+                    }
+                }
+                
+                g2.dispose();
+            }
+        };
+        
+        // Add mouse listeners for trim mode thumb dragging
+        frameSlider.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mousePressed(MouseEvent e) {
+                if (!trimModeActive) return;
+                
+                // Calculate which thumb was clicked
+                Insets insets = frameSlider.getInsets();
+                int trackLeft = insets.left + 6;
+                int trackRight = frameSlider.getWidth() - insets.right - 6;
+                int trackWidth = trackRight - trackLeft;
+                
+                int startVal = trimModeStartValue + 1;
+                int endVal = trimModeEndValue + 1;
+                double startRatio = (double)(startVal - frameSlider.getMinimum()) / Math.max(1, frameSlider.getMaximum() - frameSlider.getMinimum());
+                double endRatio = (double)(endVal - frameSlider.getMinimum()) / Math.max(1, frameSlider.getMaximum() - frameSlider.getMinimum());
+                int startX = trackLeft + (int)(startRatio * trackWidth);
+                int endX = trackLeft + (int)(endRatio * trackWidth);
+                
+                int mouseX = e.getX();
+                int distToStart = Math.abs(mouseX - startX);
+                int distToEnd = Math.abs(mouseX - endX);
+                
+                // Click on start thumb
+                if (distToStart < 15 && distToStart <= distToEnd) {
+                    trimModeDraggingStart = true;
+                    trimModeDraggingEnd = false;
+                }
+                // Click on end thumb
+                else if (distToEnd < 15) {
+                    trimModeDraggingStart = false;
+                    trimModeDraggingEnd = true;
+                }
+                // Click somewhere else - move the closer thumb
+                else {
+                    if (distToStart < distToEnd) {
+                        trimModeDraggingStart = true;
+                        updateTrimModeFromMouse(e.getX(), true);
+                    } else {
+                        trimModeDraggingEnd = true;
+                        updateTrimModeFromMouse(e.getX(), false);
+                    }
+                }
+            }
+            
+            @Override
+            public void mouseReleased(MouseEvent e) {
+                trimModeDraggingStart = false;
+                trimModeDraggingEnd = false;
+            }
+        });
+        
+        frameSlider.addMouseMotionListener(new MouseMotionAdapter() {
+            @Override
+            public void mouseDragged(MouseEvent e) {
+                if (!trimModeActive) return;
+                
+                if (trimModeDraggingStart) {
+                    updateTrimModeFromMouse(e.getX(), true);
+                } else if (trimModeDraggingEnd) {
+                    updateTrimModeFromMouse(e.getX(), false);
+                }
+            }
+        });
+        
+        frameSlider.setEnabled(false);
+        frameSlider.setMajorTickSpacing(10);
+        frameSlider.setMinorTickSpacing(1);
+        frameSlider.setPaintTicks(false);
+        frameSlider.setPaintLabels(false);
+        frameSlider.setBackground(SECONDARY_DARK);
+        frameSlider.setForeground(ACCENT_BLUE);
+        frameSlider.setOpaque(false);
+        // Set preferred height to accommodate custom graphics (track markers, frame numbers)
+        frameSlider.setPreferredSize(new Dimension(100, 50));
+        
+        frameNavPanel.add(pageLabel, BorderLayout.WEST);
+        frameNavPanel.add(frameSlider, BorderLayout.CENTER);
+        
+        centerPanel.add(frameNavPanel, BorderLayout.SOUTH);
+        
+        // Create SAT controls (needed by configuration panel)
+        satCheckbox = createStyledCheckbox("SAT");
+        satCheckbox.setToolTipText("Segmentation-Assisted-Tracking: Overlay threshold mask");
+        
+        satAdjustButton = createStyledButton("Adjust");
+        satAdjustButton.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+        satAdjustButton.setToolTipText("Adjust segmentation threshold");
+        satAdjustButton.setEnabled(false); // Enable when SAT is checked
+        
+        showMaskCheckbox = createStyledCheckbox("Mask");
+        showMaskCheckbox.setToolTipText("Show/Hide segmentation mask overlay");
+        showMaskCheckbox.setSelected(false); // Default to NOT showing mask
+        showMaskCheckbox.setEnabled(false); // Enable when SAT is enabled
+        
+        showRegionsCheckbox = createStyledCheckbox("Regions");
+        showRegionsCheckbox.setToolTipText("Show/Hide region boundaries and IDs");
+        showRegionsCheckbox.setSelected(false); // Default to NOT showing regions
+        showRegionsCheckbox.setEnabled(false); // Enable when SAT is enabled
+        
+        // Create left configuration panel
+        JPanel leftConfigPanel = createConfigurationPanel();
+        
+        // Create right annotation panel
+        JPanel rightAnnotationPanel = createAnnotationPanel();
+        
+        JViewport viewport = scrollPane.getViewport();
+        
+        // Frame slider listener - minimal updates during drag (like ImageJ)
+        frameSlider.addChangeListener(e -> {
+            // In trim mode, slider changes are handled by our custom mouse handlers
+            if (trimModeActive) return;
+            
+            int newSlice = frameSlider.getValue();
+            if (newSlice != currentSlice && imp != null) {
+                currentSlice = newSlice;
+                pageLabel.setText(String.format("Frame: %d / %d", currentSlice, totalSlices));
+                
+                if (frameSlider.getValueIsAdjusting()) {
+                    // While dragging: minimal update - just change slice and repaint
+                    loadSliceImageFast();
+                } else {
+                    // On release: do full update including annotation list
+                    loadSliceImage();
+                    refreshAnnotationList();
+                }
+            }
+        });
+        
+        // Use JSplitPane to make panels resizable
+        // Create nested split panes: left panel | (center | right panel)
+        rightSplitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, centerPanel, rightAnnotationPanel);
+        rightSplitPane.setDividerLocation(0.75); // Center panel gets 75% of space initially
+        rightSplitPane.setResizeWeight(1.0); // Center panel grows/shrinks
+        rightSplitPane.setContinuousLayout(true);
+        rightSplitPane.setBorder(null);
+        rightSplitPane.setOneTouchExpandable(true); // Add one-touch expand buttons on divider
+        rightSplitPane.setDividerSize(8); // Slightly larger divider for easier dragging
+        
+        leftSplitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, leftConfigPanel, rightSplitPane);
+        leftSplitPane.setDividerLocation(configPanelWidth);
+        leftSplitPane.setResizeWeight(0.0); // Left panel stays fixed size
+        leftSplitPane.setContinuousLayout(true);
+        leftSplitPane.setBorder(null);
+        leftSplitPane.setOneTouchExpandable(true); // Add one-touch expand buttons on divider
+        leftSplitPane.setDividerSize(8); // Slightly larger divider for easier dragging
+        
+        // Enforce maximum size for left config panel (can only shrink, not expand beyond default)
+        leftSplitPane.addPropertyChangeListener(JSplitPane.DIVIDER_LOCATION_PROPERTY, evt -> {
+            int location = (Integer) evt.getNewValue();
+            if (location > configPanelWidth) {
+                SwingUtilities.invokeLater(() -> leftSplitPane.setDividerLocation(configPanelWidth));
+            }
+        });
+        
+        // Enforce maximum size for right annotation panel (can only shrink, not expand beyond default)
+        rightSplitPane.addPropertyChangeListener(JSplitPane.DIVIDER_LOCATION_PROPERTY, evt -> {
+            int location = (Integer) evt.getNewValue();
+            int minLocation = rightSplitPane.getWidth() - annotationPanelWidth - rightSplitPane.getDividerSize();
+            if (rightSplitPane.getWidth() > 0 && location < minLocation) {
+                SwingUtilities.invokeLater(() -> rightSplitPane.setDividerLocation(minLocation));
+            }
+        });
+        
+        frame.add(leftSplitPane, BorderLayout.CENTER);
+
+        // Mouse Events - KEEPING ALL ORIGINAL MOUSE HANDLERS
+        imageLabel.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (SwingUtilities.isLeftMouseButton(e)) handleImageClick(e);
+            }
+            @Override
+            public void mousePressed(MouseEvent e) {
+                if (SwingUtilities.isRightMouseButton(e)) {
+                    dragStartMouse = e.getPoint();
+                    dragStartOffsetX = imageOffsetX;
+                    dragStartOffsetY = imageOffsetY;
+                    imageLabel.setCursor(Cursor.getPredefinedCursor(Cursor.MOVE_CURSOR));
+                }
+            }
+            @Override
+            public void mouseReleased(MouseEvent e) {
+                if (SwingUtilities.isRightMouseButton(e)) {
+                    dragStartMouse = null;
+                    // Restore appropriate cursor based on switch mode
+                    if (trackSwitchModeActive) {
+                        imageLabel.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+                    } else {
+                        imageLabel.setCursor(Cursor.getDefaultCursor());
+                    }
+                }
+            }
+            @Override
+            public void mouseEntered(MouseEvent e) {
+                // Set cursor based on Shift key state when entering the image area
+                if (e.isShiftDown()) {
+                    trackSwitchModeActive = true;
+                    imageLabel.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+                }
+            }
+            @Override
+            public void mouseExited(MouseEvent e) {
+                hoverPoint = null;
+                hoveredTrackId = null;  // Clear track selection highlight
+                pixelValueLabel.setText("Pixel: N/A");
+                imageLabel.repaint();
+            }
+        });
+
+        imageLabel.addMouseMotionListener(new MouseMotionAdapter() {
+            @Override
+            public void mouseDragged(MouseEvent e) {
+                if (SwingUtilities.isRightMouseButton(e) && dragStartMouse != null) {
+                    // Simple offset update like ImageJ's scroll() method
+                    imageOffsetX = dragStartOffsetX + (e.getX() - dragStartMouse.x);
+                    imageOffsetY = dragStartOffsetY + (e.getY() - dragStartMouse.y);
+                    // Keep hover preview stable under panning by recomputing hovered pixel
+                    updateHoverPointFromScreen(e.getX(), e.getY());
+                    imageLabel.repaint();
+                }
+            }
+            
+            @Override
+            public void mouseMoved(MouseEvent e) {
+                Point oldHoverPoint = hoverPoint;
+                updateHoverPointFromScreen(e.getX(), e.getY());
+                
+                // Track switch mode: detect which track is under the cursor
+                if (trackSwitchModeActive && hoverPoint != null) {
+                    String oldHoveredTrack = hoveredTrackId;
+                    hoveredTrackId = findTrackAtPoint(hoverPoint.x, hoverPoint.y);
+                    
+                    // Update status with hovered track info
+                    if (hoveredTrackId != null) {
+                        String completedNote = trackCompleted.getOrDefault(hoveredTrackId, false) ? " (completed)" : "";
+                        setStatus("Click to switch: " + hoveredTrackId + completedNote);
+                    } else {
+                        setStatus("Track Switch Mode: Shift+click on a track point to switch to it");
+                    }
+                    
+                    // Repaint if hovered track changed
+                    if ((oldHoveredTrack == null) != (hoveredTrackId == null) ||
+                        (oldHoveredTrack != null && !oldHoveredTrack.equals(hoveredTrackId))) {
+                        imageLabel.repaint();
+                        return;  // Already repainted
+                    }
+                }
+                
+                // Multi-select mode: detect which track is under the cursor for preview
+                if (multiSelectModeActive && hoverPoint != null) {
+                    String oldHoveredTrack = hoveredTrackId;
+                    hoveredTrackId = findTrackAtPoint(hoverPoint.x, hoverPoint.y);
+                    
+                    // Update status with hovered track info and selection state
+                    if (hoveredTrackId != null) {
+                        boolean isSelected = trackSelected.getOrDefault(hoveredTrackId, false);
+                        String action = isSelected ? "Deselect" : "Select";
+                        String completedNote = trackCompleted.getOrDefault(hoveredTrackId, false) ? " (completed)" : "";
+                        int selectedCount = (int) trackSelected.values().stream().filter(v -> v).count();
+                        setStatus("Click to " + action.toLowerCase() + ": " + hoveredTrackId + completedNote + " (" + selectedCount + " selected)");
+                    } else {
+                        int selectedCount = (int) trackSelected.values().stream().filter(v -> v).count();
+                        setStatus("Multi-Select Mode: Ctrl+click to toggle track selection (" + selectedCount + " selected)");
+                    }
+                    
+                    // Repaint if hovered track changed
+                    if ((oldHoveredTrack == null) != (hoveredTrackId == null) ||
+                        (oldHoveredTrack != null && !oldHoveredTrack.equals(hoveredTrackId))) {
+                        imageLabel.repaint();
+                        return;  // Already repainted
+                    }
+                }
+                
+                // Normal hover feedback (SAT mode or track selected)
+                // This avoids constant repaints during simple mouse movement
+                if (satEnabled || selectedTrackId != null || trackSwitchModeActive || multiSelectModeActive) {
+                    boolean needsRepaint = (oldHoverPoint == null) != (hoverPoint == null);
+                    if (!needsRepaint && oldHoverPoint != null && hoverPoint != null) {
+                        needsRepaint = oldHoverPoint.x != hoverPoint.x || oldHoverPoint.y != hoverPoint.y;
+                    }
+                    if (needsRepaint) {
+                        imageLabel.repaint();
+                    }
+                }
+            }
+        });
+        
+        // Mouse Wheel - KEEPING ALL ORIGINAL
+        imageLabel.addMouseWheelListener(e -> {
+            if (currentImage == null) return;
+            
+            // Handle comparison mode zoom
+            if (smoothingComparisonMode) {
+                if (e.isControlDown()) {
+                    Point mousePos = e.getPoint();
+                    if (e.getWheelRotation() < 0) {
+                        zoomCenteredAtComparison(mousePos, 1.25);
+                    } else {
+                        zoomCenteredAtComparison(mousePos, 0.8);
+                    }
+                    updateZoomLabel();
+                } else if (e.isAltDown()) {
+                    if (e.getWheelRotation() < 0) {
+                        changeSlice(FRAME_JUMP_AMOUNT, pageLabel);
+                    } else {
+                        changeSlice(-FRAME_JUMP_AMOUNT, pageLabel);
+                    }
+                    imageLabel.requestFocusInWindow();
+                } else {
+                    if (e.getWheelRotation() < 0) {
+                        changeSlice(1, pageLabel);
+                    } else {
+                        changeSlice(-1, pageLabel);
+                    }
+                }
+                return;
+            }
+            
+            // Block frame navigation in preview mode or trim mode (only allow zoom)
+            if (previewModeActive || trimModeActive) {
+                if (e.isControlDown()) {
+                    // Zoom is still allowed in preview/trim mode
+                    Point mousePos = e.getPoint();
+                    if (e.getWheelRotation() < 0) {
+                        zoomCenteredAt(mousePos, 1.25);
+                    } else {
+                        zoomCenteredAt(mousePos, 0.8);
+                    }
+                    updateZoomLabel();
+                }
+                // All other scroll actions blocked in preview/trim mode
+                return;
+            }
+
+            if (e.isControlDown()) {
+                // Zoom centered at mouse position
+                Point mousePos = e.getPoint();
+                if (e.getWheelRotation() < 0) {
+                    zoomCenteredAt(mousePos, 1.25);
+                } else {
+                    zoomCenteredAt(mousePos, 0.8);
+                }
+                updateZoomLabel();
+            } else if (e.isAltDown()) {
+                if (e.getWheelRotation() < 0) {
+                    changeSlice(FRAME_JUMP_AMOUNT, pageLabel);
+                } else {
+                    changeSlice(-FRAME_JUMP_AMOUNT, pageLabel);
+                }
+                imageLabel.requestFocusInWindow();
+            } else {
+                if (e.getWheelRotation() < 0) {
+                    changeSlice(1, pageLabel);
+                } else {
+                    changeSlice(-1, pageLabel);
+                }
+            }
+        });
+
+        // Keyboard Shortcuts and Track Switch Mode (Shift key handling)
+        KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(e -> {
+            // Handle Shift key press/release for track switch mode visual feedback
+            if (e.getKeyCode() == KeyEvent.VK_SHIFT) {
+                if (e.getID() == KeyEvent.KEY_PRESSED && !trackSwitchModeActive) {
+                    trackSwitchModeActive = true;
+                    // Update cursor to indicate switch mode
+                    if (imageLabel != null && dragStartMouse == null) {  // Don't change cursor during pan
+                        imageLabel.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+                    }
+                    // Update status bar
+                    setStatus("Track Switch Mode: Shift+click on a track point to switch to it");
+                    // Update hovered track if mouse is over a point
+                    if (hoverPoint != null) {
+                        hoveredTrackId = findTrackAtPoint(hoverPoint.x, hoverPoint.y);
+                        imageLabel.repaint();
+                    }
+                } else if (e.getID() == KeyEvent.KEY_RELEASED) {
+                    trackSwitchModeActive = false;
+                    // Only clear hoveredTrackId if multi-select mode is also not active
+                    if (!multiSelectModeActive) {
+                        hoveredTrackId = null;
+                    }
+                    // Restore default cursor (unless Ctrl is still held)
+                    if (imageLabel != null && dragStartMouse == null && !multiSelectModeActive) {
+                        imageLabel.setCursor(Cursor.getDefaultCursor());
+                    }
+                    // Clear status
+                    if (statusLabel != null && !multiSelectModeActive) {
+                        setStatus("Ready");
+                    }
+                    imageLabel.repaint();
+                }
+                // Don't consume the event - allow other handlers to see Shift
+            }
+            
+            // Handle Ctrl key press/release for multi-select mode visual feedback
+            if (e.getKeyCode() == KeyEvent.VK_CONTROL) {
+                if (e.getID() == KeyEvent.KEY_PRESSED && !multiSelectModeActive) {
+                    multiSelectModeActive = true;
+                    // Update cursor to indicate multi-select mode
+                    if (imageLabel != null && dragStartMouse == null) {  // Don't change cursor during pan
+                        imageLabel.setCursor(Cursor.getPredefinedCursor(Cursor.CROSSHAIR_CURSOR));
+                    }
+                    // Update status bar with selection count
+                    int selectedCount = (int) trackSelected.values().stream().filter(v -> v).count();
+                    setStatus("Multi-Select Mode: Ctrl+click to toggle track selection (" + selectedCount + " selected)");
+                    // Update hovered track if mouse is over a point
+                    if (hoverPoint != null) {
+                        hoveredTrackId = findTrackAtPoint(hoverPoint.x, hoverPoint.y);
+                        imageLabel.repaint();
+                    }
+                } else if (e.getID() == KeyEvent.KEY_RELEASED) {
+                    multiSelectModeActive = false;
+                    // Only clear hoveredTrackId if switch mode is also not active
+                    if (!trackSwitchModeActive) {
+                        hoveredTrackId = null;
+                    }
+                    // Restore default cursor (unless Shift is still held)
+                    if (imageLabel != null && dragStartMouse == null && !trackSwitchModeActive) {
+                        imageLabel.setCursor(Cursor.getDefaultCursor());
+                    }
+                    // Clear status
+                    if (statusLabel != null && !trackSwitchModeActive) {
+                        setStatus("Ready");
+                    }
+                    imageLabel.repaint();
+                }
+                // Don't consume the event - allow other handlers to see Ctrl
+            }
+            
+            // Only process KEY_PRESSED for shortcuts
+            if (e.getID() != KeyEvent.KEY_PRESSED) return false;
+            
+            // Handle ESC key to cancel trim mode
+            if (e.getKeyCode() == KeyEvent.VK_ESCAPE && trimModeActive) {
+                cancelTrimMode();
+                return true;
+            }
+            
+            // Handle ESC key to exit smoothing comparison mode
+            if (e.getKeyCode() == KeyEvent.VK_ESCAPE && smoothingComparisonMode) {
+                exitSmoothingComparisonMode();
+                return true;
+            }
+            
+            if (e.isControlDown() && e.getKeyCode() == KeyEvent.VK_Z && !e.isShiftDown()) {
+                undo();
+                return true;
+            }
+            
+            if ((e.isControlDown() && e.isShiftDown() && e.getKeyCode() == KeyEvent.VK_Z) ||
+                (e.isControlDown() && e.getKeyCode() == KeyEvent.VK_Y)) {
+                redo();
+                return true;
+            }
+            
+            // Ctrl+A: Select all tracks
+            if (e.isControlDown() && e.getKeyCode() == KeyEvent.VK_A) {
+                selectAllTracks();
+                return true;
+            }
+            
+            return false;
+        });
+
+        // Controls - Professional toolbar with solid background
+        // Use BoxLayout to prevent wrapping - components stay in a single row
+        JPanel controlPanel = new JPanel() {
+            @Override
+            protected void paintComponent(Graphics g) {
+                super.paintComponent(g);
+                Graphics2D g2d = (Graphics2D) g;
+                g2d.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+                // Solid background color based on theme
+                g2d.setColor(PANEL_DARK);
+                g2d.fillRect(0, 0, getWidth(), getHeight());
+            }
+            
+            @Override
+            public Dimension getPreferredSize() {
+                // Calculate the width needed for all components in a single row
+                Dimension pref = super.getPreferredSize();
+                // Force a fixed height to prevent vertical growth
+                return new Dimension(pref.width, 52);
+            }
+        };
+        controlPanel.setLayout(new BoxLayout(controlPanel, BoxLayout.X_AXIS));
+        controlPanel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createMatteBorder(1, 0, 0, 0, BORDER_DARK),
+            BorderFactory.createEmptyBorder(6, 15, 6, 15)
+        ));
+        controlPanel.setOpaque(false);
+        
+        // Create styled buttons (using class fields for preview mode disable/enable)
+        openButton = createStyledButton("Open File", "open");
+        JButton adjustButton = createStyledButton("Adjust Brightness", "brightness");
+        importButton = createStyledButton("Import", "import");
+        exportButton = createStyledButton("Export", "export");
+        helpButton = createStyledButton("Help", "help");
+        
+        gotoFrameField = createStyledTextField("1", 4);
+        gotoFrameButton = createStyledButton("Go To");
+
+        fpsField = createStyledTextField("1", 3);
+        playButton = createStyledButton("Play", "play");
+
+        flowVizToggle = createStyledButton("Flow Viz", "flow");
+        flowVizToggle.setEnabled(false);
+        flowVizToggle.setToolTipText("Toggle optical flow visualization");
+
+        pixelValueLabel = new JLabel("Pixel: N/A");
+        pixelValueLabel.setFont(new Font("Consolas", Font.PLAIN, 12));
+        pixelValueLabel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(BORDER_DARK, 1),
+            BorderFactory.createEmptyBorder(4, 10, 4, 10)
+        ));
+        pixelValueLabel.setBackground(SECONDARY_DARK);
+        pixelValueLabel.setForeground(ACCENT_BLUE);
+        pixelValueLabel.setOpaque(true);
+
+        // Add components with horizontal struts for spacing (BoxLayout doesn't use FlowLayout gaps)
+        controlPanel.add(Box.createHorizontalStrut(5));
+        controlPanel.add(openButton);
+        controlPanel.add(Box.createHorizontalStrut(8));
+        controlPanel.add(adjustButton);
+        controlPanel.add(Box.createHorizontalStrut(8));
+        controlPanel.add(createSeparator());
+        controlPanel.add(Box.createHorizontalStrut(8));
+        controlPanel.add(importButton);
+        controlPanel.add(Box.createHorizontalStrut(8));
+        controlPanel.add(exportButton);
+        controlPanel.add(Box.createHorizontalStrut(8));
+        controlPanel.add(createSeparator());
+        controlPanel.add(Box.createHorizontalStrut(8));
+        controlPanel.add(helpButton);
+        controlPanel.add(Box.createHorizontalStrut(8));
+        controlPanel.add(createSeparator());
+        controlPanel.add(Box.createHorizontalStrut(8));
+        controlPanel.add(createStyledLabel("Frame:"));
+        controlPanel.add(Box.createHorizontalStrut(4));
+        controlPanel.add(gotoFrameField);
+        controlPanel.add(Box.createHorizontalStrut(4));
+        controlPanel.add(gotoFrameButton);
+        controlPanel.add(Box.createHorizontalStrut(8));
+        controlPanel.add(createSeparator());
+        controlPanel.add(Box.createHorizontalStrut(8));
+        controlPanel.add(createStyledLabel("FPS:"));
+        controlPanel.add(Box.createHorizontalStrut(4));
+        controlPanel.add(fpsField);
+        controlPanel.add(Box.createHorizontalStrut(4));
+        controlPanel.add(playButton);
+        controlPanel.add(Box.createHorizontalStrut(8));
+        controlPanel.add(createSeparator());
+        controlPanel.add(Box.createHorizontalStrut(8));
+        controlPanel.add(flowVizToggle);
+        controlPanel.add(Box.createHorizontalStrut(8));
+        
+        // Fine-Tune button (GPU only) - prominent placement for LocoTrack fine-tuning
+        if (isGpuAvailable) {
+            fineTuneButton = createStyledButton("Fine-Tune", "train");
+            fineTuneButton.setBackground(new Color(139, 69, 19));  // Saddle brown for distinction
+            fineTuneButton.setToolTipText("Fine-tune LocoTrack model on completed annotations (GPU required)");
+            fineTuneButton.setEnabled(false);  // Enable when tracks are ready
+            fineTuneButton.addActionListener(e -> startLocoTrackFineTuning());
+            controlPanel.add(fineTuneButton);
+            controlPanel.add(Box.createHorizontalStrut(8));
+        }
+        
+        controlPanel.add(createSeparator());
+        controlPanel.add(Box.createHorizontalStrut(8));
+        JLabel cursorSizeLabel = createStyledLabel("Cursor:");
+        cursorSizeLabel.setToolTipText("Hover cursor size in pixels (odd numbers only)");
+        controlPanel.add(cursorSizeLabel);
+        controlPanel.add(Box.createHorizontalStrut(4));
+        // Slider uses internal range 1-25, mapped to odd values 3, 5, 7, ..., 51
+        int initialSliderValue = (hoverCursorSize - 1) / 2;  // Convert odd size to slider index
+        JSlider cursorSizeSlider = new JSlider(1, 25, initialSliderValue);
+        cursorSizeSlider.setPreferredSize(new Dimension(100, 20));
+        cursorSizeSlider.setMaximumSize(new Dimension(100, 20));
+        cursorSizeSlider.setToolTipText("Adjust the size of the hover cursor (odd numbers: 3x3 to 51x51)");
+        cursorSizeSlider.setOpaque(false);
+        JLabel cursorSizeValueLabel = createStyledLabel(hoverCursorSize + "x" + hoverCursorSize);
+        cursorSizeValueLabel.setPreferredSize(new Dimension(50, 20));
+        cursorSizeSlider.addChangeListener(e -> {
+            // Convert slider value (1-25) to odd cursor size (3, 5, 7, ..., 51)
+            hoverCursorSize = cursorSizeSlider.getValue() * 2 + 1;
+            cursorSizeValueLabel.setText(hoverCursorSize + "x" + hoverCursorSize);
+            imageLabel.repaint();
+        });
+        controlPanel.add(cursorSizeSlider);
+        controlPanel.add(Box.createHorizontalStrut(4));
+        controlPanel.add(cursorSizeValueLabel);
+        controlPanel.add(Box.createHorizontalStrut(8));
+        
+        // Cursor shape options
+        JCheckBox circleCheckbox = createStyledCheckbox("Circle");
+        circleCheckbox.setSelected(cursorCircleMode);
+        circleCheckbox.setToolTipText("Use circle shape instead of square");
+        circleCheckbox.addActionListener(e -> {
+            cursorCircleMode = circleCheckbox.isSelected();
+            imageLabel.repaint();
+        });
+        controlPanel.add(circleCheckbox);
+        controlPanel.add(Box.createHorizontalStrut(4));
+        
+        JCheckBox opaqueCheckbox = createStyledCheckbox("Opaque");
+        opaqueCheckbox.setSelected(cursorOpaqueMode);
+        opaqueCheckbox.setToolTipText("Fill the cursor shape with color");
+        opaqueCheckbox.addActionListener(e -> {
+            cursorOpaqueMode = opaqueCheckbox.isSelected();
+            imageLabel.repaint();
+        });
+        controlPanel.add(opaqueCheckbox);
+        controlPanel.add(Box.createHorizontalStrut(4));
+        
+        JCheckBox persistentCheckbox = createStyledCheckbox("Persistent");
+        persistentCheckbox.setSelected(cursorPersistentMode);
+        persistentCheckbox.setToolTipText("Apply cursor shape to all track points, not just selected track");
+        persistentCheckbox.addActionListener(e -> {
+            cursorPersistentMode = persistentCheckbox.isSelected();
+            imageLabel.repaint();
+        });
+        controlPanel.add(persistentCheckbox);
+        controlPanel.add(Box.createHorizontalStrut(12));
+        controlPanel.add(pixelValueLabel);
+        controlPanel.add(Box.createHorizontalStrut(8));
+        controlPanel.add(createSeparator());
+        controlPanel.add(Box.createHorizontalStrut(8));
+        
+        // Zoom controls
+        JLabel zoomLabelText = createStyledLabel("Zoom:");
+        zoomLabelText.setToolTipText("Current zoom level (Ctrl+scroll to zoom)");
+        controlPanel.add(zoomLabelText);
+        controlPanel.add(Box.createHorizontalStrut(4));
+        
+        zoomLabel = new JLabel("100%");
+        zoomLabel.setFont(new Font("Consolas", Font.BOLD, 12));
+        zoomLabel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(BORDER_DARK, 1),
+            BorderFactory.createEmptyBorder(4, 8, 4, 8)
+        ));
+        zoomLabel.setBackground(SECONDARY_DARK);
+        zoomLabel.setForeground(ACCENT_BLUE);
+        zoomLabel.setOpaque(true);
+        zoomLabel.setPreferredSize(new Dimension(60, 24));
+        zoomLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        zoomLabel.setToolTipText("Current zoom level");
+        controlPanel.add(zoomLabel);
+        controlPanel.add(Box.createHorizontalStrut(4));
+        
+        zoomOutButton = createStyledButton("-");
+        zoomOutButton.setPreferredSize(new Dimension(40, 28));
+        zoomOutButton.setMinimumSize(new Dimension(40, 28));
+        zoomOutButton.setToolTipText("Zoom Out (or Ctrl+scroll down)");
+        zoomOutButton.addActionListener(e -> {
+            if (currentImage == null) return;
+            // Zoom centered on viewport center
+            Point center = new Point(imageLabel.getWidth() / 2, imageLabel.getHeight() / 2);
+            zoomCenteredAt(center, 0.8);
+            updateZoomLabel();
+        });
+        controlPanel.add(zoomOutButton);
+        controlPanel.add(Box.createHorizontalStrut(2));
+        
+        zoomInButton = createStyledButton("+");
+        zoomInButton.setPreferredSize(new Dimension(40, 28));
+        zoomInButton.setMinimumSize(new Dimension(40, 28));
+        zoomInButton.setToolTipText("Zoom In (or Ctrl+scroll up)");
+        zoomInButton.addActionListener(e -> {
+            if (currentImage == null) return;
+            // Zoom centered on viewport center
+            Point center = new Point(imageLabel.getWidth() / 2, imageLabel.getHeight() / 2);
+            zoomCenteredAt(center, 1.25);
+            updateZoomLabel();
+        });
+        controlPanel.add(zoomInButton);
+        controlPanel.add(Box.createHorizontalStrut(4));
+        
+        zoomFitButton = createStyledButton("Fit");
+        zoomFitButton.setPreferredSize(new Dimension(50, 28));
+        zoomFitButton.setMinimumSize(new Dimension(50, 28));
+        zoomFitButton.setToolTipText("Fit image to window");
+        zoomFitButton.addActionListener(e -> {
+            if (currentImage == null) return;
+            fitImageToWindow();
+            updateZoomLabel();
+        });
+        controlPanel.add(zoomFitButton);
+        controlPanel.add(Box.createHorizontalStrut(4));
+        
+        zoomResetButton = createStyledButton("1:1");
+        zoomResetButton.setPreferredSize(new Dimension(50, 28));
+        zoomResetButton.setMinimumSize(new Dimension(50, 28));
+        zoomResetButton.setToolTipText("Reset to 100% zoom (actual pixels)");
+        zoomResetButton.addActionListener(e -> {
+            if (currentImage == null) return;
+            resetZoomToActual();
+            updateZoomLabel();
+        });
+        controlPanel.add(zoomResetButton);
+        
+        controlPanel.add(Box.createHorizontalGlue());
+        controlPanel.add(Box.createHorizontalStrut(10));
+        // Status bar with professional dark styling
+        statusLabel = new JLabel("  ● Ready");
+        statusLabel.setBorder(BorderFactory.createEmptyBorder(8, 15, 8, 15));
+        statusLabel.setOpaque(true);
+        statusLabel.setBackground(PRIMARY_DARK);
+        statusLabel.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        statusLabel.setForeground(ACCENT_GREEN);
+        
+        // Wrap control panel in a scroll pane for horizontal scrolling when window is narrow
+        // This prevents the toolbar from growing vertically and blocking window resize
+        JScrollPane controlScrollPane = new JScrollPane(controlPanel);
+        controlScrollPane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_AS_NEEDED);
+        controlScrollPane.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_NEVER);
+        controlScrollPane.setBorder(null);
+        controlScrollPane.setBackground(PANEL_DARK);
+        controlScrollPane.getViewport().setBackground(PANEL_DARK);
+        // Set a fixed preferred height so toolbar doesn't grow
+        controlScrollPane.setPreferredSize(new Dimension(100, controlPanel.getPreferredSize().height + 5));
+        controlScrollPane.setMinimumSize(new Dimension(100, 50));
+        
+        JPanel bottomPanel = new JPanel(new BorderLayout());
+        bottomPanel.setBackground(PRIMARY_DARK);
+        bottomPanel.add(controlScrollPane, BorderLayout.CENTER);
+        bottomPanel.add(statusLabel, BorderLayout.SOUTH);
+        frame.add(bottomPanel, BorderLayout.SOUTH);
+
+        rowHeight = openButton.getPreferredSize().height;
+
+        // Listeners
+        openButton.addActionListener(e -> openTiff(pageLabel));
+        adjustButton.addActionListener(e -> adjustBrightness());
+        importButton.addActionListener(e -> importAnnotations());
+        exportButton.addActionListener(e -> exportAnnotations());
+        helpButton.addActionListener(e -> showInstructions());
+        
+        flowVizToggle.addActionListener(e -> toggleFlowVisualization(flowVizToggle));
+        
+        satCheckbox.addActionListener(e -> {
+            satEnabled = satCheckbox.isSelected();
+            satAdjustButton.setEnabled(satEnabled);
+            showMaskCheckbox.setEnabled(satEnabled);
+            showRegionsCheckbox.setEnabled(satEnabled);
+            if (satEnabled && imp != null) {
+                // Open threshold adjustment dialog when enabling SAT
+                adjustSegmentationThreshold();
+                // Precompute regions for all frames
+                precomputeAllRegions();
+            } else {
+                // Clear mask and region data
+                showMask = false;
+                showRegionBoundaries = false;
+                showMaskCheckbox.setSelected(false);
+                showRegionsCheckbox.setSelected(false);
+                segmentationMask = null;
+                frameRegions.clear();
+                trackToRegion.clear();
+                imageLabel.repaint();
+            }
+        });
+        
+        satAdjustButton.addActionListener(e -> {
+            if (imp != null && satEnabled) {
+                adjustSegmentationThreshold();
+            }
+        });
+        
+        showMaskCheckbox.addActionListener(e -> {
+            showMask = showMaskCheckbox.isSelected();
+            imageLabel.repaint();
+        });
+        
+        showRegionsCheckbox.addActionListener(e -> {
+            showRegionBoundaries = showRegionsCheckbox.isSelected();
+            imageLabel.repaint();
+        });
+        
+        gotoFrameButton.addActionListener(e -> {
+            // Block frame navigation during trim mode
+            if (trimModeActive) {
+                setStatus("Complete or cancel trim mode before navigating to a different frame");
+                return;
+            }
+            
+            try {
+                int frameNum = Integer.parseInt(gotoFrameField.getText().trim());
+                if (frameNum < 1 || frameNum > totalSlices) {
+                    JOptionPane.showMessageDialog(frame, "Frame number should be between 1 and " + totalSlices,
+                        "Invalid Frame Number", JOptionPane.WARNING_MESSAGE);
+                    return;
+                }
+                currentSlice = frameNum;
+                loadSliceImage();
+                refreshAnnotationList();
+                pageLabel.setText(String.format("Frame: %d / %d", currentSlice, totalSlices));
+                frameSlider.setValue(currentSlice); // Update slider position
+            } catch (NumberFormatException ex) {
+                JOptionPane.showMessageDialog(frame, "Invalid frame number", "Error", JOptionPane.ERROR_MESSAGE);
+            }
+        });
+
+        playButton.addActionListener(e -> {
+            // Block playback during trim mode
+            if (trimModeActive) {
+                setStatus("Complete or cancel trim mode before playing video");
+                return;
+            }
+            
+            int max_fps = 50;
+            try {
+                int fps = Integer.parseInt(fpsField.getText().trim());
+                if (fps < 1 || fps > max_fps) {
+                    JOptionPane.showMessageDialog(frame, "FPS value should be between 1 and " + max_fps,
+                        "Invalid FPS", JOptionPane.WARNING_MESSAGE);
+                    return;
+                }
+                
+                int delay = 1000 / fps;
+
+                if (playButton.getText().contains("Play") || playButton.getText().equals("Play")) {
+                    if (playTimer != null && playTimer.isRunning()) {
+                        playTimer.stop();
+                    }
+
+                    playTimer = new Timer(delay, new ActionListener() {
+                        private int slice = currentSlice;
+
+                        @Override
+                        public void actionPerformed(ActionEvent evt) {
+                            if (slice >= totalSlices) {
+                                ((Timer) evt.getSource()).stop();
+                                playButton.setText("Play");
+                                return;
+                            }
+                            slice++;
+                            currentSlice = slice;
+                            loadSliceImage();
+                            refreshAnnotationList();
+                            pageLabel.setText(String.format("Frame: %d / %d", currentSlice, totalSlices));
+                            frameSlider.setValue(currentSlice); // Update slider during playback
+                        }
+                    });
+                    playTimer.start();
+                    playButton.setText("Pause");
+                } else { 
+                    if (playTimer != null && playTimer.isRunning()) {
+                        playTimer.stop();
+                    }
+                    playButton.setText("Play");
+                }
+            } catch (NumberFormatException ex) {
+                JOptionPane.showMessageDialog(frame, "Invalid FPS value", "Error", JOptionPane.ERROR_MESSAGE);
+            }
+        });
+
+        // Add window listener for exit prompt
+        frame.addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowClosing(WindowEvent e) {
+                // Show confirmation dialog before exiting
+                int confirm = JOptionPane.showConfirmDialog(frame,
+                    "Are you sure you want to exit RIPPLE?\n\n" +
+                    "Any unsaved annotations will be lost.",
+                    "Confirm Exit",
+                    JOptionPane.YES_NO_OPTION,
+                    JOptionPane.QUESTION_MESSAGE);
+                
+                if (confirm != JOptionPane.YES_OPTION) {
+                    return;  // User cancelled, don't exit
+                }
+                
+                // Pause all active track timers before exit
+                for (String trackId : trackAnnotations.keySet()) {
+                    pauseTrackTimer(trackId);
+                }
+                // Clean up temp compressed video file
+                cleanupTempVideoFile();
+                promptServerShutdownOnExit();
+                
+                // Actually exit the application
+                frame.dispose();
+                System.exit(0);
+            }
+        });
+
+        // Pack the frame first to get the preferred size of all components
+        frame.pack();
+        
+        // Set minimum and default size
+        // Minimum calculated from: collapsed panels (40+40) + center min (400) + dividers (16) + margin
+        frame.setMinimumSize(new Dimension(600, 400));
+        frame.setSize(1600, 800);
+        frame.setLocationRelativeTo(null);
+        frame.setVisible(true);
+        
+        // Set split pane divider locations after frame is visible (proportional doesn't work before sizing)
+        SwingUtilities.invokeLater(() -> {
+            if (leftSplitPane != null) {
+                leftSplitPane.setDividerLocation(configPanelWidth);
+            }
+            if (rightSplitPane != null) {
+                // Set right split pane to show annotation panel at its configured width
+                int rightPanelLocation = rightSplitPane.getWidth() - annotationPanelWidth - rightSplitPane.getDividerSize();
+                if (rightPanelLocation > 0) {
+                    rightSplitPane.setDividerLocation(rightPanelLocation);
+                }
+            }
+        });
+        
+        // Check server status on startup and prompt for restart if needed
+        SwingUtilities.invokeLater(() -> {
+            checkServerOnStartup();
+        });
+        
+        // Detect available GPUs in background (for GPU selector in config)
+        SwingUtilities.invokeLater(() -> {
+            detectAvailableGpus();
+        });
+        
+        SwingUtilities.invokeLater(() -> {
+            if (currentImage != null) {
+                fitImageToPanel(scrollPane);
+            }
+        });
+    }
+
+    // KEEPING ALL ORIGINAL HELPER METHODS
+    private void fitImageToPanel(JScrollPane scrollPane) {
+        if (currentImage == null) return;
+        
+        Dimension viewSize = scrollPane.getViewport().getExtentSize();
+        double scaleX = (double) viewSize.width / currentImage.getWidth();
+        double scaleY = (double) viewSize.height / currentImage.getHeight();
+        zoomFactor = Math.min(scaleX, scaleY);
+        zoomFactor = Math.max(MIN_ZOOM, Math.min(zoomFactor, MAX_ZOOM));
+        
+        centerImage();
+        updateZoomLabel();
+        imageLabel.repaint();
+    }
+    
+    private void centerImage() {
+        if (currentImage == null || imageLabel.getParent() == null) return;
+        
+        // Get the visible area size
+        JScrollPane scrollPane = (JScrollPane) imageLabel.getParent().getParent();
+        Dimension viewSize = scrollPane.getViewport().getExtentSize();
+        
+        // Calculate offset to center the image
+        double imageWidth = currentImage.getWidth() * zoomFactor;
+        double imageHeight = currentImage.getHeight() * zoomFactor;
+        
+        imageOffsetX = (viewSize.width - imageWidth) / 2.0;
+        imageOffsetY = (viewSize.height - imageHeight) / 2.0;
+    }
+
+    private void showInstructions() {
+        // Load help content from external resource files
+        Map<String, String> helpContent = HelpContentLoader.loadAllHelpContent();
+        
+        // Create main dialog with modern styling
+        JDialog helpDialog = new JDialog(frame, "RIPPLE Help", true);
+        helpDialog.setDefaultCloseOperation(JDialog.DISPOSE_ON_CLOSE);
+        helpDialog.getContentPane().setBackground(PRIMARY_DARK);
+        
+        // Create main panel with border layout
+        JPanel mainPanel = new JPanel(new BorderLayout());
+        mainPanel.setBackground(PRIMARY_DARK);
+        mainPanel.setBorder(BorderFactory.createEmptyBorder(0, 0, 0, 0));
+        
+        // Create header panel with title and version
+        JPanel headerPanel = new JPanel(new BorderLayout());
+        headerPanel.setBackground(new Color(30, 35, 45));
+        headerPanel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createMatteBorder(0, 0, 1, 0, BORDER_DARK),
+            BorderFactory.createEmptyBorder(16, 20, 16, 20)
+        ));
+        
+        JLabel titleLabel = new JLabel("RIPPLE Documentation");
+        titleLabel.setFont(new Font("Segoe UI", Font.BOLD, 18));
+        titleLabel.setForeground(TEXT_PRIMARY);
+        
+        String modeText = isGpuAvailable ? "GPU Mode" : "CPU Mode";
+        JLabel modeLabel = new JLabel(modeText);
+        modeLabel.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        modeLabel.setForeground(isGpuAvailable ? ACCENT_GREEN : new Color(255, 180, 100));
+        modeLabel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(modeLabel.getForeground().darker(), 1),
+            BorderFactory.createEmptyBorder(4, 10, 4, 10)
+        ));
+        
+        headerPanel.add(titleLabel, BorderLayout.WEST);
+        headerPanel.add(modeLabel, BorderLayout.EAST);
+        mainPanel.add(headerPanel, BorderLayout.NORTH);
+        
+        // Create custom tabbed pane with side tabs
+        JSplitPane contentPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT);
+        contentPane.setBackground(PRIMARY_DARK);
+        contentPane.setDividerSize(1);
+        contentPane.setBorder(null);
+        
+        // Left side: Tab list (vertical navigation)
+        JPanel tabListPanel = new JPanel();
+        tabListPanel.setLayout(new BoxLayout(tabListPanel, BoxLayout.Y_AXIS));
+        tabListPanel.setBackground(new Color(25, 30, 38));
+        tabListPanel.setBorder(BorderFactory.createEmptyBorder(8, 0, 8, 0));
+        
+        // Content panel (right side)
+        JPanel contentPanel = new JPanel(new BorderLayout());
+        contentPanel.setBackground(PANEL_DARK);
+        
+        // Card layout for switching content
+        CardLayout cardLayout = new CardLayout();
+        JPanel cardPanel = new JPanel(cardLayout);
+        cardPanel.setBackground(PANEL_DARK);
+        
+        // Create tab buttons and content panels
+        ButtonGroup tabGroup = new ButtonGroup();
+        boolean first = true;
+        
+        // Tab icons/emojis for visual appeal
+        String[] tabIcons = {"🚀", "🧭", "📍", "🔍", "🌊", "🎯", "⚡", "📁", "⌨️"};
+        int iconIndex = 0;
+        
+        for (Map.Entry<String, String> entry : helpContent.entrySet()) {
+            String tabName = entry.getKey();
+            String content = entry.getValue();
+            String icon = iconIndex < tabIcons.length ? tabIcons[iconIndex++] : "•";
+            
+            // Create styled toggle button for tab
+            JToggleButton tabButton = new JToggleButton(icon + "  " + tabName);
+            tabButton.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+            tabButton.setForeground(TEXT_SECONDARY);
+            tabButton.setBackground(new Color(25, 30, 38));
+            tabButton.setBorder(BorderFactory.createEmptyBorder(12, 16, 12, 16));
+            tabButton.setFocusPainted(false);
+            tabButton.setBorderPainted(false);
+            tabButton.setContentAreaFilled(false);
+            tabButton.setHorizontalAlignment(SwingConstants.LEFT);
+            tabButton.setMaximumSize(new Dimension(Integer.MAX_VALUE, 44));
+            tabButton.setCursor(new Cursor(Cursor.HAND_CURSOR));
+            
+            // Hover and selection effects
+            final String cardName = tabName;
+            tabButton.addMouseListener(new MouseAdapter() {
+                @Override
+                public void mouseEntered(MouseEvent e) {
+                    if (!tabButton.isSelected()) {
+                        tabButton.setBackground(new Color(35, 42, 52));
+                        tabButton.setContentAreaFilled(true);
+                    }
+                }
+                @Override
+                public void mouseExited(MouseEvent e) {
+                    if (!tabButton.isSelected()) {
+                        tabButton.setContentAreaFilled(false);
+                    }
+                }
+            });
+            
+            tabButton.addActionListener(e -> {
+                // Update all button styles
+                for (Component c : tabListPanel.getComponents()) {
+                    if (c instanceof JToggleButton) {
+                        JToggleButton btn = (JToggleButton) c;
+                        btn.setForeground(btn.isSelected() ? TEXT_PRIMARY : TEXT_SECONDARY);
+                        btn.setBackground(btn.isSelected() ? ACCENT_BLUE : new Color(25, 30, 38));
+                        btn.setContentAreaFilled(btn.isSelected());
+                    }
+                }
+                cardLayout.show(cardPanel, cardName);
+            });
+            
+            tabGroup.add(tabButton);
+            tabListPanel.add(tabButton);
+            
+            // Create content panel for this tab
+            JScrollPane scrollPane = createModernHelpPanel(
+                HelpContentLoader.formatForDisplay(content), tabName);
+            cardPanel.add(scrollPane, tabName);
+            
+            // Select first tab
+            if (first) {
+                tabButton.setSelected(true);
+                tabButton.setForeground(TEXT_PRIMARY);
+                tabButton.setBackground(ACCENT_BLUE);
+                tabButton.setContentAreaFilled(true);
+                first = false;
+            }
+        }
+        
+        // Wrap tab list in scroll pane for many tabs
+        JScrollPane tabListScroll = new JScrollPane(tabListPanel);
+        tabListScroll.setBorder(null);
+        tabListScroll.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
+        tabListScroll.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
+        tabListScroll.getViewport().setBackground(new Color(25, 30, 38));
+        tabListScroll.setPreferredSize(new Dimension(180, 0));
+        
+        contentPanel.add(cardPanel, BorderLayout.CENTER);
+        
+        contentPane.setLeftComponent(tabListScroll);
+        contentPane.setRightComponent(contentPanel);
+        contentPane.setDividerLocation(180);
+        
+        mainPanel.add(contentPane, BorderLayout.CENTER);
+        
+        // Footer with keyboard shortcut hint
+        JPanel footerPanel = new JPanel(new FlowLayout(FlowLayout.CENTER));
+        footerPanel.setBackground(new Color(30, 35, 45));
+        footerPanel.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, BORDER_DARK));
+        JLabel footerLabel = new JLabel("Press ESC to close  •  RIPPLE v1.0");
+        footerLabel.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+        footerLabel.setForeground(TEXT_SECONDARY);
+        footerPanel.add(footerLabel);
+        mainPanel.add(footerPanel, BorderLayout.SOUTH);
+        
+        // ESC key to close
+        helpDialog.getRootPane().registerKeyboardAction(
+            e -> helpDialog.dispose(),
+            KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0),
+            JComponent.WHEN_IN_FOCUSED_WINDOW
+        );
+        
+        helpDialog.add(mainPanel);
+        helpDialog.setSize(900, 650);
+        helpDialog.setLocationRelativeTo(frame);
+        helpDialog.setVisible(true);
+    }
+    
+    /**
+     * Creates a modern styled help panel with proper formatting.
+     */
+    private JScrollPane createModernHelpPanel(String content, String title) {
+        JPanel panel = new JPanel(new BorderLayout());
+        panel.setBackground(PANEL_DARK);
+        panel.setBorder(BorderFactory.createEmptyBorder(20, 24, 20, 24));
+        
+        JTextArea textArea = new JTextArea(content);
+        textArea.setEditable(false);
+        textArea.setFont(new Font("JetBrains Mono", Font.PLAIN, 13));
+        textArea.setLineWrap(true);
+        textArea.setWrapStyleWord(true);
+        textArea.setBackground(PANEL_DARK);
+        textArea.setForeground(TEXT_PRIMARY);
+        textArea.setCaretColor(TEXT_PRIMARY);
+        textArea.setSelectionColor(ACCENT_BLUE);
+        textArea.setSelectedTextColor(Color.WHITE);
+        textArea.setBorder(null);
+        
+        // Try JetBrains Mono, fall back to Consolas, then monospaced
+        String[] monoFonts = {"JetBrains Mono", "Consolas", "Monaco", "Menlo", Font.MONOSPACED};
+        for (String fontName : monoFonts) {
+            Font testFont = new Font(fontName, Font.PLAIN, 13);
+            if (!testFont.getFamily().equals(Font.DIALOG)) {
+                textArea.setFont(testFont);
+                break;
+            }
+        }
+        
+        panel.add(textArea, BorderLayout.CENTER);
+        
+        JScrollPane scrollPane = new JScrollPane(panel);
+        scrollPane.setBorder(null);
+        scrollPane.getViewport().setBackground(PANEL_DARK);
+        scrollPane.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
+        scrollPane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
+        
+        // Scroll to top when shown
+        SwingUtilities.invokeLater(() -> scrollPane.getVerticalScrollBar().setValue(0));
+        
+        return scrollPane;
+    }
+    
+    // Keep legacy method for potential backward compatibility
+    @SuppressWarnings("unused")
+    private JScrollPane createHelpPanel_legacy(String content) {
+        // Legacy method retained for reference
+        return createModernHelpPanel(content, "Help");
+    }
+
+    /**
+     * Find all cached optical flow files for the current video and method.
+     * Returns a list of files sorted by modification time (newest first).
+     */
+    private java.util.List<File> findCachedFlowFiles(String videoPath, String method) {
+        java.util.List<File> result = new java.util.ArrayList<>();
+        if (videoPath == null) return result;
+        
+        String outputDir = getOutputDirectory();
+        String videoName = new File(videoPath).getName();
+        String baseName = videoName.replaceFirst("\\.[^.]+$", "");
+        
+        File dir = new File(outputDir);
+        if (!dir.exists() || !dir.isDirectory()) {
+            return result;
+        }
+        
+        String prefix = baseName + "_" + method;
+        String suffix = "_optical_flow.npz";
+        
+        File[] matchingFiles = dir.listFiles((d, name) -> 
+            name.startsWith(prefix) && name.endsWith(suffix));
+        
+        if (matchingFiles != null) {
+            result = new java.util.ArrayList<>(java.util.Arrays.asList(matchingFiles));
+            // Sort by modification time, newest first
+            result.sort((a, b) -> Long.compare(b.lastModified(), a.lastModified()));
+        }
+        
+        return result;
+    }
+    
+    /**
+     * Extract resolution (WxH) from a flow filename if present.
+     * Flow files may have resolution suffix like "_512x384_" when video was compressed.
+     * @return int[] {width, height} or null if no resolution suffix found
+     */
+    private int[] extractResolutionFromFlowFile(File flowFile) {
+        String filename = flowFile.getName();
+        // Pattern: _WxH_ where W and H are integers (e.g., _512x384_)
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("_(\\d+)x(\\d+)_");
+        java.util.regex.Matcher matcher = pattern.matcher(filename);
+        if (matcher.find()) {
+            try {
+                int width = Integer.parseInt(matcher.group(1));
+                int height = Integer.parseInt(matcher.group(2));
+                return new int[] { width, height };
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }
+        return null; // No resolution suffix = original resolution
+    }
+    
+    /**
+     * Check if a flow file's resolution matches the current working resolution.
+     * This is CRITICAL to prevent using flow data computed at a different resolution.
+     * 
+     * @param flowFile The cached flow file
+     * @return true if resolution matches or is compatible, false otherwise
+     */
+    private boolean flowFileMatchesWorkingResolution(File flowFile) {
+        if (imp == null) return false;
+        
+        int workingWidth = imp.getWidth();
+        int workingHeight = imp.getHeight();
+        
+        int[] flowResolution = extractResolutionFromFlowFile(flowFile);
+        
+        if (flowResolution == null) {
+            // No resolution in filename = legacy file from before resolution tagging
+            // For safety, only use if we're at original/uncompressed resolution
+            // AND check the filename doesn't suggest it's for a compressed video
+            if (scaleFactorX == 1.0 && scaleFactorY == 1.0) {
+                // We're at original resolution, file has no resolution tag = likely compatible
+                return true;
+            } else {
+                // We're working with a compressed video but file has no resolution tag
+                // This is unsafe - the file was likely computed at a different resolution
+                System.out.println("[FlowFilter] Rejecting '" + flowFile.getName() + 
+                    "' - no resolution tag, but working at compressed resolution " + 
+                    workingWidth + "x" + workingHeight);
+                return false;
+            }
+        } else {
+            // Flow file has explicit resolution - must match working dimensions exactly
+            boolean matches = flowResolution[0] == workingWidth && flowResolution[1] == workingHeight;
+            if (!matches) {
+                System.out.println("[FlowFilter] Rejecting '" + flowFile.getName() + 
+                    "' - resolution " + flowResolution[0] + "x" + flowResolution[1] + 
+                    " != working " + workingWidth + "x" + workingHeight);
+            }
+            return matches;
+        }
+    }
+
+    private void updateHoverPointFromScreen(int screenX, int screenY) {
+        if (currentImage == null) {
+            hoverPoint = null;
+            pixelValueLabel.setText("Pixel: N/A");
+            return;
+        }
+
+        // Use helper methods for consistent coordinate conversion
+        int imgX = screenToImageX(screenX);
+        int imgY = screenToImageY(screenY);
+
+        if (imgX >= 0 && imgX < currentImage.getWidth() && imgY >= 0 && imgY < currentImage.getHeight()) {
+            hoverPoint = new Point(imgX, imgY);
+
+            int rgb = currentImage.getRGB(imgX, imgY);
+            int r = (rgb >> 16) & 0xFF;
+            int g = (rgb >> 8) & 0xFF;
+            int b = rgb & 0xFF;
+
+            if (r == g && g == b) {
+                pixelValueLabel.setText(String.format("Pixel: (%d, %d) = %d", imgX, imgY, r));
+            } else {
+                pixelValueLabel.setText(String.format("Pixel: (%d, %d) RGB=(%d, %d, %d)", imgX, imgY, r, g, b));
+            }
+        } else {
+            hoverPoint = null;
+            pixelValueLabel.setText("Pixel: N/A");
+        }
+    }
+    
+    /**
+     * Filter cached flow files to only include those matching the current working resolution.
+     * This prevents the critical bug of using flow data from a different resolution.
+     */
+    private java.util.List<File> filterFlowFilesByResolution(java.util.List<File> flowFiles) {
+        java.util.List<File> compatible = new java.util.ArrayList<>();
+        for (File f : flowFiles) {
+            if (flowFileMatchesWorkingResolution(f)) {
+                compatible.add(f);
+            }
+        }
+        return compatible;
+    }
+    
+    /**
+     * Build expected filename suffix based on current configuration settings.
+     * This helps match cached files with the user's current settings.
+     */
+    private String buildExpectedFlowFileSuffix(String method) {
+        if ("raft".equals(method)) {
+            return "_raft"; // RAFT files may have optional size suffix
+        } else if ("locotrack".equals(method)) {
+            String radius = config.getProperty("locotrack.dog.radius", "2.5");
+            String threshold = config.getProperty("locotrack.dog.threshold", "0.0");
+            String kernel = config.getProperty("locotrack.kernel", "gaussian_rbf");
+            String flowSmooth = config.getProperty("locotrack.flow.smoothing", "15.0");
+            String temporal = config.getProperty("locotrack.temporal.smooth", "0.1");
+            
+            // Build expected pattern (matching _build_flow_filename in Python)
+            return String.format("_locotrack_r%.1f_t%.2f_k%s_fs%.0f_ts%.2f",
+                Double.parseDouble(radius),
+                Double.parseDouble(threshold),
+                kernel.length() >= 3 ? kernel.substring(0, 3) : kernel,
+                Double.parseDouble(flowSmooth),
+                Double.parseDouble(temporal));
+        } else if ("trackpy".equals(method)) {
+            // Trackpy uses native detection (diameter, minmass)
+            String diameter = config.getProperty("trackpy.diameter", "11");
+            String minmass = config.getProperty("trackpy.minmass", "0");
+            String searchRange = config.getProperty("trackpy.search.range", "15");
+            String memory = config.getProperty("trackpy.memory", "5");
+            String kernel = config.getProperty("trackpy.kernel", "gaussian_rbf");
+            String flowSmooth = config.getProperty("trackpy.flow.smoothing", "15");
+            
+            return String.format("_trackpy_d%s_mm%s_sr%s_m%s_k%s_fs%.0f",
+                diameter, minmass,
+                searchRange, memory,
+                kernel.length() >= 3 ? kernel.substring(0, 3) : kernel,
+                Double.parseDouble(flowSmooth));
+        }
+        return "_" + method;
+    }
+    
+    /**
+     * Check if a cached file matches the current configuration settings.
+     */
+    private boolean flowFileMatchesCurrentSettings(File flowFile, String method) {
+        String filename = flowFile.getName();
+        String expectedSuffix = buildExpectedFlowFileSuffix(method);
+        
+        // For RAFT, any file starting with the method is considered a match
+        if ("raft".equals(method)) {
+            return filename.contains("_raft");
+        }
+        
+        // For other methods, check if filename contains the expected parameter pattern
+        return filename.contains(expectedSuffix);
+    }
+    
+    /**
+     * Extract a human-readable description of settings from a flow filename.
+     * Includes resolution information extracted from the filename.
+     */
+    private String describeFlowFile(File flowFile, String method) {
+        String filename = flowFile.getName();
+        StringBuilder desc = new StringBuilder();
+        
+        // Extract resolution if present
+        int[] resolution = extractResolutionFromFlowFile(flowFile);
+        if (resolution != null) {
+            desc.append(resolution[0]).append("x").append(resolution[1]).append(" ");
+        } else {
+            desc.append("full-res ");
+        }
+        
+        // Extract the parameter portion from filename
+        // Format: videoname_method[_size][_params]_optical_flow.npz
+        int methodIdx = filename.indexOf("_" + method);
+        int suffixIdx = filename.indexOf("_optical_flow.npz");
+        
+        if (methodIdx >= 0 && suffixIdx > methodIdx) {
+            String paramPart = filename.substring(methodIdx + method.length() + 1, suffixIdx);
+            
+            // Remove resolution part from paramPart if present (we already showed it)
+            paramPart = paramPart.replaceFirst("_?\\d+x\\d+_?", "");
+            
+            if (paramPart.isEmpty()) {
+                desc.append("(default settings)");
+            } else if ("raft".equals(method)) {
+                desc.append("(default settings)");
+            } else {
+                // Show abbreviated params
+                desc.append("(").append(paramPart.replaceFirst("^_", "").replace("_", ", ")).append(")");
+            }
+        }
+        
+        // Add file size and date
+        long sizeKB = flowFile.length() / 1024;
+        String sizeStr = sizeKB > 1024 ? String.format("%.1f MB", sizeKB / 1024.0) : sizeKB + " KB";
+        java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("MMM dd HH:mm");
+        String dateStr = sdf.format(new java.util.Date(flowFile.lastModified()));
+        
+        return desc.toString() + " [" + sizeStr + ", " + dateStr + "]";
+    }
+
+    /**
+     * Find a track that has a point at the given image coordinates on the current frame.
+     * Uses a hit detection radius based on the cursor size setting to match visual appearance.
+     * If multiple tracks overlap at the same location, prioritizes:
+     * 1. The currently selected track (if it's at that position)
+     * 2. Tracks in reverse sorted order (higher track numbers first, since they're drawn last/on top)
+     * 
+     * @param imgX The X coordinate in image space
+     * @param imgY The Y coordinate in image space
+     * @return The track ID of the track at this position, or null if no track found
+     */
+    private String findTrackAtPoint(int imgX, int imgY) {
+        if (trackAnnotations.isEmpty()) {
+            return null;
+        }
+        
+        int frameIndex = currentSlice - 1;  // Convert 1-indexed to 0-indexed
+        
+        // Calculate hit detection radius - use cursor size for consistency with visual appearance
+        // For small cursor sizes (3-5), use a minimum radius of 2 pixels for easier clicking
+        int hitRadius = Math.max(2, hoverCursorSize / 2 + 1);
+        
+        // First, check if the currently selected track is at this position (prioritize it)
+        if (selectedTrackId != null && trackAnnotations.containsKey(selectedTrackId)) {
+            Point p = trackAnnotations.get(selectedTrackId).get(frameIndex);
+            if (p != null) {
+                int dx = Math.abs(p.x - imgX);
+                int dy = Math.abs(p.y - imgY);
+                if (dx <= hitRadius && dy <= hitRadius) {
+                    return selectedTrackId;  // Already selected, return it for feedback
+                }
+            }
+        }
+        
+        // Check all other tracks - iterate in reverse sorted order so later-drawn tracks
+        // (which appear on top) are checked first
+        List<String> sortedTrackIds = getSortedTrackIds();
+        java.util.Collections.reverse(sortedTrackIds);
+        
+        for (String trackId : sortedTrackIds) {
+            // Skip the selected track since we already checked it
+            if (trackId.equals(selectedTrackId)) {
+                continue;
+            }
+            
+            Map<Integer, Point> frameMap = trackAnnotations.get(trackId);
+            if (frameMap == null) continue;
+            
+            Point p = frameMap.get(frameIndex);
+            if (p != null) {
+                int dx = Math.abs(p.x - imgX);
+                int dy = Math.abs(p.y - imgY);
+                if (dx <= hitRadius && dy <= hitRadius) {
+                    return trackId;
+                }
+            }
+        }
+        
+        return null;  // No track found at this position
+    }
+
+    private void handleImageClick(MouseEvent e) {
+        if (imp == null) return;
+        
+        // Block image editing during trim mode
+        if (trimModeActive) {
+            setStatus("Complete or cancel trim mode before editing track points");
+            return;
+        }
+        
+        // Handle Shift+click for quick track switching
+        // This allows users to click on a painted point to switch to its track
+        if (e.isShiftDown()) {
+            handleTrackSwitchClick(e);
+            return;
+        }
+        
+        // Handle Ctrl+click for toggling track selection checkbox
+        // This allows users to select/deselect tracks for batch operations
+        if (e.isControlDown()) {
+            handleTrackSelectionToggle(e);
+            return;
+        }
+        
+        // Check if optical flow is computed
+        if (!opticalFlowComputed) {
+            String flowMethod = config.getProperty("flow.method", getDefaultFlowMethod());
+            java.util.List<File> allCachedFiles = findCachedFlowFiles(currentVideoPath, flowMethod);
+            
+            // CRITICAL: Filter by resolution to prevent using wrong-resolution flow data
+            java.util.List<File> compatibleFiles = filterFlowFilesByResolution(allCachedFiles);
+            int incompatibleCount = allCachedFiles.size() - compatibleFiles.size();
+            
+            if (!compatibleFiles.isEmpty()) {
+                // Find if any compatible file matches current settings
+                File matchingFile = null;
+                for (File f : compatibleFiles) {
+                    if (flowFileMatchesCurrentSettings(f, flowMethod)) {
+                        matchingFile = f;
+                        break;
+                    }
+                }
+                
+                // Build informative message
+                StringBuilder message = new StringBuilder();
+                message.append("Optical flow is required for tracking.\n\n");
+                message.append("Current method: ").append(flowMethod.toUpperCase());
+                if (imp != null) {
+                    message.append(" | Working resolution: ").append(imp.getWidth()).append("x").append(imp.getHeight());
+                }
+                message.append("\n");
+                message.append("Found ").append(compatibleFiles.size()).append(" compatible cached file(s):\n\n");
+                
+                for (int i = 0; i < Math.min(compatibleFiles.size(), 5); i++) {
+                    File f = compatibleFiles.get(i);
+                    boolean isMatch = flowFileMatchesCurrentSettings(f, flowMethod);
+                    message.append(isMatch ? "  ✓ " : "  • ");
+                    message.append(describeFlowFile(f, flowMethod));
+                    if (isMatch) {
+                        message.append(" ← matches current settings");
+                    }
+                    message.append("\n");
+                }
+                if (compatibleFiles.size() > 5) {
+                    message.append("  ... and ").append(compatibleFiles.size() - 5).append(" more\n");
+                }
+                
+                // Warn about incompatible files
+                if (incompatibleCount > 0) {
+                    message.append("\n⚠ ").append(incompatibleCount).append(" cached file(s) ignored (different resolution)\n");
+                }
+                
+                message.append("\n");
+                if (matchingFile != null) {
+                    message.append("A cached file matches your current settings.\n");
+                    message.append("Load Existing: Use this cached file (fast)\n");
+                } else {
+                    message.append("No cached file matches your current settings.\n");
+                    message.append("Load Existing: Use newest compatible file (may differ from settings)\n");
+                }
+                message.append("Recalculate: Compute with current settings (slow)");
+                
+                String[] options = {"Load Existing", "Recalculate", "Cancel"};
+                int choice = JOptionPane.showOptionDialog(
+                    frame,
+                    message.toString(),
+                    "Optical Flow Required",
+                    JOptionPane.YES_NO_CANCEL_OPTION,
+                    JOptionPane.QUESTION_MESSAGE,
+                    null,
+                    options,
+                    matchingFile != null ? options[0] : options[1]  // Default based on match
+                );
+                
+                if (choice == 0) { // Load Existing
+                    // Prefer a cached file that matches current settings; otherwise newest compatible.
+                    File fileToLoad = (matchingFile != null) ? matchingFile : compatibleFiles.get(0);
+                    loadExistingOpticalFlow(fileToLoad);
+                    return;
+                } else if (choice == 1) { // Recalculate
+                    computeOpticalFlowRemote(true);
+                    return;
+                } else {
+                    return; // Cancel
+                }
+            } else {
+                // No compatible cached files - either none exist or all are wrong resolution
+                StringBuilder message = new StringBuilder();
+                message.append("Optical flow hasn't been computed for this resolution.\n\n");
+                message.append("Current method: ").append(flowMethod.toUpperCase());
+                if (imp != null) {
+                    message.append("\nWorking resolution: ").append(imp.getWidth()).append("x").append(imp.getHeight());
+                }
+                
+                if (incompatibleCount > 0) {
+                    message.append("\n\n⚠ Found ").append(incompatibleCount).append(" cached file(s) at DIFFERENT resolution(s).");
+                    message.append("\nThese cannot be used - resolution must match exactly.\n");
+                    // Show what resolutions are available
+                    message.append("\nIncompatible cached files:\n");
+                    for (int i = 0; i < Math.min(allCachedFiles.size(), 3); i++) {
+                        File f = allCachedFiles.get(i);
+                        int[] res = extractResolutionFromFlowFile(f);
+                        message.append("  • ");
+                        if (res != null) {
+                            message.append(res[0]).append("x").append(res[1]);
+                        } else {
+                            message.append("original resolution");
+                        }
+                        message.append(" - ").append(f.getName()).append("\n");
+                    }
+                    if (allCachedFiles.size() > 3) {
+                        message.append("  ... and ").append(allCachedFiles.size() - 3).append(" more\n");
+                    }
+                }
+                
+                message.append("\nWould you like to compute optical flow now?\n");
+                message.append("This may take a few minutes but only needs to be done once per resolution.");
+                
+                int result = JOptionPane.showConfirmDialog(frame,
+                    message.toString(),
+                    "Optical Flow Required",
+                    JOptionPane.YES_NO_OPTION,
+                    JOptionPane.QUESTION_MESSAGE);
+                
+                if (result == JOptionPane.YES_OPTION) {
+                    computeOpticalFlowRemote();
+                } else {
+                    return;
+                }
+            }
+            return; // Don't proceed with click until flow is ready
+        }
+        
+        int imgX = (int) Math.floor((e.getX() - imageOffsetX) / zoomFactor);
+        int imgY = (int) Math.floor((e.getY() - imageOffsetY) / zoomFactor);
+        
+        if (imgX >= 0 && imgX < currentImage.getWidth() && imgY >= 0 && imgY < currentImage.getHeight()) {
+            
+            // Check if selected track is completed (locked)
+            if (selectedTrackId != null && trackCompleted.getOrDefault(selectedTrackId, false)) {
+                JOptionPane.showMessageDialog(frame,
+                    "Track \"" + selectedTrackId + "\" is marked as complete and locked.\n\n" +
+                    "Please click the edit button (✏) next to the track to unlock it\n" +
+                    "before making any corrections.",
+                    "Track Locked",
+                    JOptionPane.WARNING_MESSAGE);
+                return;
+            }
+
+            // Check if we have a selected track
+            if (selectedTrackId != null && 
+                    trackAnnotations.containsKey(selectedTrackId) && 
+                    !trackAnnotations.get(selectedTrackId).isEmpty()) {
+                // Track already exists - add correction
+                handleCorrectionClick(imgX, imgY);
+            }
+            else if (selectedTrackId != null) {
+                // Initialize track on current frame (bidirectional propagation)
+                handleTrackInitialization(imgX, imgY, currentSlice);
+            }
+            else {
+                JOptionPane.showMessageDialog(frame,
+                    "Please create a track first by clicking the '+ New Track' button,\n" +
+                    "then click on the image to initialize it.",
+                    "Create Track First",
+                    JOptionPane.INFORMATION_MESSAGE);
+            }
+        }
+    }
+
+    /**
+     * Handle Shift+click for quick track switching.
+     * Allows users to click on a painted point to immediately switch to its track.
+     * This is useful when annotating many tracks and needing to quickly find and select
+     * a specific track by clicking on its visual representation.
+     * 
+     * Edge cases handled:
+     * - No track at clicked location: Shows informative message
+     * - Clicking on already selected track: Shows confirmation but no action needed
+     * - Preview mode active: Blocks switching (tracks may be hidden)
+     * - Multiple overlapping tracks: Switches to the topmost (highest track number)
+     * - Track is completed/locked: Still allows switching for viewing
+     * 
+     * @param e The mouse event from the click
+     */
+    private void handleTrackSwitchClick(MouseEvent e) {
+        if (currentImage == null) {
+            return;
+        }
+        
+        // Block in preview mode - tracks may be hidden
+        if (previewModeActive || trajectoryPreviewActive) {
+            setStatus("Track switching disabled in preview mode");
+            return;
+        }
+        
+        // Convert screen coordinates to image coordinates
+        int imgX = screenToImageX(e.getX());
+        int imgY = screenToImageY(e.getY());
+        
+        // Check bounds
+        if (imgX < 0 || imgX >= currentImage.getWidth() || 
+            imgY < 0 || imgY >= currentImage.getHeight()) {
+            return;
+        }
+        
+        // Find track at this position
+        String trackAtPoint = findTrackAtPoint(imgX, imgY);
+        
+        if (trackAtPoint == null) {
+            // No track found at this position
+            setStatus("No track found at this position (Shift+click to switch)");
+            return;
+        }
+        
+        // Even if clicking on the same track, deselect all others
+        // This is useful after Ctrl+A to quickly narrow down to just one track
+        boolean wasAlreadySelected = trackAtPoint.equals(selectedTrackId);
+        
+        // Deselect all other tracks first
+        for (String trackId : trackSelected.keySet()) {
+            trackSelected.put(trackId, false);
+        }
+        trackSelected.put(trackAtPoint, true);
+        
+        if (wasAlreadySelected) {
+            // Already the active track, but we still deselected others
+            refreshAnnotationList();
+            imageLabel.repaint();
+            setStatus(trackAtPoint + " - deselected all other tracks");
+            return;
+        }
+        
+        // Pause timer for the previously selected track
+        if (selectedTrackId != null) {
+            pauseTrackTimer(selectedTrackId);
+        }
+        
+        // Switch to the new track
+        String previousTrackId = selectedTrackId;
+        selectedTrackId = trackAtPoint;
+        
+        // Start timer for the newly selected track if it's not completed
+        if (!trackCompleted.getOrDefault(trackAtPoint, false)) {
+            startTrackTimer(trackAtPoint);
+        }
+        
+        // Update UI
+        refreshAnnotationList();
+        imageLabel.repaint();
+        frameSlider.repaint();  // Refresh slider to show selected track's anchors
+        
+        // Scroll the annotation panel to show the newly selected track
+        scrollToTrack(trackAtPoint);
+        
+        // Provide feedback
+        String completedNote = trackCompleted.getOrDefault(trackAtPoint, false) ? " (completed)" : "";
+        setStatus("Switched to " + trackAtPoint + completedNote + " (was: " + 
+                  (previousTrackId != null ? previousTrackId : "none") + ")");
+    }
+    
+    /**
+     * Handle Ctrl+click for toggling track selection checkbox.
+     * This allows users to select/deselect tracks for batch operations (mark complete, delete).
+     * Works in both single-seed and multi-seed modes.
+     * 
+     * Edge cases handled:
+     * - No track at clicked location: Shows informative message
+     * - Preview mode active: Blocks selection (tracks may be hidden)
+     * - Multiple overlapping tracks: Toggles the topmost (highest track number)
+     * 
+     * @param e The mouse event from the click
+     */
+    private void handleTrackSelectionToggle(MouseEvent e) {
+        if (currentImage == null) {
+            return;
+        }
+        
+        // Block in preview mode - tracks may be hidden
+        if (previewModeActive || trajectoryPreviewActive) {
+            setStatus("Track selection disabled in preview mode");
+            return;
+        }
+        
+        // Convert screen coordinates to image coordinates
+        int imgX = screenToImageX(e.getX());
+        int imgY = screenToImageY(e.getY());
+        
+        // Check bounds
+        if (imgX < 0 || imgX >= currentImage.getWidth() || 
+            imgY < 0 || imgY >= currentImage.getHeight()) {
+            return;
+        }
+        
+        // Find track at this position
+        String trackAtPoint = findTrackAtPoint(imgX, imgY);
+        
+        if (trackAtPoint == null) {
+            // No track found at this position
+            setStatus("No track found at this position (Ctrl+click to select/deselect)");
+            return;
+        }
+        
+        // Toggle the selection state
+        boolean currentlySelected = trackSelected.getOrDefault(trackAtPoint, false);
+        trackSelected.put(trackAtPoint, !currentlySelected);
+        
+        // Update UI
+        refreshAnnotationList();
+        imageLabel.repaint();
+        
+        // Provide feedback
+        String action = !currentlySelected ? "Selected" : "Deselected";
+        int selectedCount = (int) trackSelected.values().stream().filter(v -> v).count();
+        setStatus(action + " " + trackAtPoint + " (" + selectedCount + " tracks selected)");
+    }
+
+    private void handleTrackInitialization(int imgX, int imgY, int frameNumber) {
+        // Initialize track on any frame (bidirectional propagation supported)
+        if (selectedTrackId == null) {
+            JOptionPane.showMessageDialog(frame,
+                "Please create or select a track first by clicking the '+ New Track' button.",
+                "No Track Selected",
+                JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        
+        Map<Integer, Point> frameMap = trackAnnotations.get(selectedTrackId);
+        
+        if (!frameMap.isEmpty()) {
+            // Track already exists - ask if user wants to replace
+            int confirm = JOptionPane.showConfirmDialog(frame,
+                "Do you want to remove this track and create a new one?",
+                "Replace Track",
+                JOptionPane.YES_NO_OPTION);
+            
+            if (confirm == JOptionPane.YES_OPTION) {
+                saveState();
+                frameMap.clear();
+                trackAnchors.get(selectedTrackId).clear();
+                trackOptimized.put(selectedTrackId, false);
+                trackToRegion.remove(selectedTrackId); // Clear region association
+            } else {
+                return;
+            }
+        } else {
+            saveState();
+        }
+        
+        // Use current frame for initialization (0-indexed internally, 1-indexed in UI)
+        int frameIndex = frameNumber - 1;
+        
+        // Check if SAT is enabled and point is in a segmented region on this frame
+        if (satEnabled && frameRegions.containsKey(frameIndex)) {
+            Map<Integer, SegmentedRegion> regions = frameRegions.get(frameIndex);
+            for (SegmentedRegion region : regions.values()) {
+                if (region.contains(imgX, imgY)) {
+                    trackToRegion.put(selectedTrackId, region.id);
+                    setStatus("Track associated with segmented region " + region.id);
+                    
+                    // Snap initial point to brightest pixel in region
+                    ImageProcessor ip = imp.getStack().getProcessor(frameNumber);
+                    Point brightestPoint = region.findBrightestPixel(ip);
+                    if (brightestPoint != null) {
+                        imgX = brightestPoint.x;
+                        imgY = brightestPoint.y;
+                        setStatus("Track snapped to brightest pixel in region " + region.id + " at (" + imgX + "," + imgY + ")");
+                    }
+                    break;
+                }
+            }
+        }
+        
+        // Add first anchor at current frame (for bidirectional propagation)
+        trackAnchors.get(selectedTrackId).add(new Anchor(frameIndex, imgX, imgY));
+        
+        boolean multiSeedMode = isMultiSeedMode();
+        
+        if (multiSeedMode) {
+            // Multi-seed mode: Just add the anchor point, don't propagate automatically
+            frameMap.put(frameIndex, new Point(imgX, imgY));
+            correctionMode = true;
+            setStatus("Added anchor at Frame " + frameNumber + ". Add more anchors, then click 'Run Track Optimization'.");
+            
+            // Update UI
+            imageLabel.repaint();
+            refreshAnnotationList();
+        } else {
+            // Single-seed mode: Propagate immediately (bidirectional from current frame)
+            // Enable correction mode immediately
+            correctionMode = true;
+            
+            // Now propagate the track (async operation) - pass frame index for bidirectional
+            propagateTrackRemote(selectedTrackId, imgX, imgY, frameIndex);
+            
+            // Update UI
+            imageLabel.repaint();
+            refreshAnnotationList();
+            
+            setStatus("Creating track from Frame " + frameNumber + " (bidirectional)...");
+        }
+    }
+
+    private void handleCorrectionClick(int imgX, int imgY) {
+        saveState();
+        
+        // Frame is 1-indexed in display, 0-indexed internally
+        int frameIndex = currentSlice - 1;
+        
+        // Check if this frame already has a correction
+        List<Anchor> anchors = trackAnchors.get(selectedTrackId);  // Should be List<Anchor>
+        boolean hasAnchor = false;
+        for (Anchor anchor : anchors) {  // Should iterate over Anchor, not Point
+            if (anchor.frame == frameIndex) {
+                hasAnchor = true;
+                break;
+            }
+        }
+        
+        if (hasAnchor) {
+            int confirm = JOptionPane.showConfirmDialog(frame,
+                "Frame " + currentSlice + " already has a correction.\n" +
+                "Do you want to update it?",
+                "Update Correction",
+                JOptionPane.YES_NO_OPTION);
+            
+            if (confirm != JOptionPane.YES_OPTION) {
+                return;
+            }
+            
+            // Remove old anchor
+            anchors.removeIf(a -> a.frame == frameIndex);
+        }
+        
+        // Add new anchor
+        anchors.add(new Anchor(frameIndex, imgX, imgY));
+        
+        // Sort anchors by frame
+        anchors.sort((a, b) -> Integer.compare(a.frame, b.frame));
+        
+        // Mark track as unoptimized when adding new corrections
+        trackOptimized.put(selectedTrackId, false);
+        
+        setStatus("Optimizing track with " + anchors.size() + " anchor points...");
+        
+        // In multi-seed mode, just add the anchor without auto-optimization
+        boolean multiSeedMode = isMultiSeedMode();
+        if (multiSeedMode) {
+            // Just update the display with the new anchor point
+            Map<Integer, Point> frameMap = trackAnnotations.get(selectedTrackId);
+            frameMap.put(frameIndex, new Point(imgX, imgY));
+            loadSliceImage();
+            refreshAnnotationList();
+            imageLabel.repaint();
+            frameSlider.repaint(); // Update slider to show new anchor
+            setStatus("Added correction anchor. Click 'Run Track Optimization' to apply changes.");
+        } else {
+            // Single-seed mode: Optimize immediately (original behavior)
+            // Pass the frame index of the correction just made for local mode
+            optimizeTrackWithAnchors(selectedTrackId, frameIndex);
+        }
+    }
+
+    private void optimizeTrackWithAnchors(String trackId) {
+        // Default: no specific correction frame (use global mode behavior)
+        optimizeTrackWithAnchors(trackId, -1);
+    }
+    
+    private void optimizeTrackWithAnchors(String trackId, int correctionFrame) {
+        if (currentVideoPath == null || imp == null) {
+            JOptionPane.showMessageDialog(frame,
+                "No video loaded.",
+                "Error",
+                JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        
+        if (blockIfServerBusy("Optimize track")) {
+            return;
+        }
+        
+        // Check if server is available
+        if (!serverAvailable && !isServerRunning()) {
+            JOptionPane.showMessageDialog(frame,
+                "The tracking engine is not running.\n\n" +
+                "Please start it via: Server > Restart Server",
+                "Tracking Unavailable",
+                JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        
+        List<Anchor> anchors = trackAnchors.get(trackId);
+        if (anchors == null || anchors.isEmpty()) {
+            return;
+        }
+        
+        System.out.println("[DEBUG] Original anchors (" + anchors.size() + "):");
+        for (Anchor a : anchors) {
+            System.out.println("[DEBUG]   Original anchor: frame=" + a.frame + ", x=" + a.x + ", y=" + a.y);
+        }
+        
+        // Check if local correction mode is enabled
+        boolean localMode = Boolean.parseBoolean(config.getProperty("correction.local.mode", "false"));
+        int localWindow = Integer.parseInt(config.getProperty("correction.local.window", "11"));
+        // Ensure window is odd
+        if (localWindow % 2 == 0) localWindow++;
+        int halfWindow = localWindow / 2;
+        
+        System.out.println("[DEBUG] localMode=" + localMode + ", localWindow=" + localWindow + ", halfWindow=" + halfWindow);
+        
+        // Get existing track data
+        Map<Integer, Point> existingTrack = trackAnnotations.get(trackId);
+        
+        // Check if track is already optimized (has existing track data beyond just anchors)
+        boolean trackHasData = existingTrack != null && existingTrack.size() > anchors.size();
+        
+        // Prepare anchors for optimization
+        List<Anchor> effectiveAnchors;
+        int windowStart = 0;
+        // Use existingTrack size for frame count (more reliable than imp.getNSlices() which can return 1 in certain view modes)
+        int totalFrames = (existingTrack != null && !existingTrack.isEmpty()) 
+            ? existingTrack.keySet().stream().max(Integer::compareTo).orElse(0) + 1 
+            : imp.getNSlices();
+        int windowEnd = totalFrames - 1;
+        
+        // Local mode triggers when: enabled, track has existing data, and we want to do a local fix
+        // Use correctionFrame if provided, otherwise fall back to last anchor
+        if (localMode && trackHasData) {
+            // Local correction mode: Only optimize a window around the correction
+            int corrFrame;
+            Anchor correction;
+            
+            if (correctionFrame >= 0) {
+                // Use the specific correction frame that was just clicked
+                corrFrame = correctionFrame;
+                // Find the anchor at this frame
+                correction = anchors.stream()
+                    .filter(a -> a.frame == corrFrame)
+                    .findFirst()
+                    .orElse(anchors.get(anchors.size() - 1));
+            } else {
+                // Fallback: use the last anchor (by frame order)
+                correction = anchors.get(anchors.size() - 1);
+                corrFrame = correction.frame;
+            }
+            
+            System.out.println("[DEBUG] corrFrame=" + corrFrame + " (from correctionFrame param: " + correctionFrame + ")");
+            System.out.println("[DEBUG] halfWindow=" + halfWindow);
+            System.out.println("[DEBUG] totalFrames=" + totalFrames);
+            
+            // Calculate window boundaries
+            System.out.println("[DEBUG] BEFORE: windowStart=" + windowStart + ", windowEnd=" + windowEnd);
+            windowStart = Math.max(0, corrFrame - halfWindow);
+            System.out.println("[DEBUG] After windowStart calc: " + windowStart);
+            windowEnd = Math.min(totalFrames - 1, corrFrame + halfWindow);
+            System.out.println("[DEBUG] After windowEnd calc: " + windowEnd);
+            System.out.println("[DEBUG] FINAL: windowStart=" + windowStart + ", windowEnd=" + windowEnd);
+            
+            // Create effective anchors with virtual boundary anchors
+            effectiveAnchors = new ArrayList<>();
+            
+            // Add virtual anchor at window start (from existing track)
+            if (existingTrack.containsKey(windowStart) && windowStart != corrFrame) {
+                Point startPoint = existingTrack.get(windowStart);
+                effectiveAnchors.add(new Anchor(windowStart, startPoint.x, startPoint.y));
+            }
+            
+            // Add the actual correction
+            effectiveAnchors.add(correction);
+            
+            // Add virtual anchor at window end (from existing track)
+            if (existingTrack.containsKey(windowEnd) && windowEnd != corrFrame) {
+                Point endPoint = existingTrack.get(windowEnd);
+                effectiveAnchors.add(new Anchor(windowEnd, endPoint.x, endPoint.y));
+            }
+            
+            // Sort by frame
+            effectiveAnchors.sort((a, b) -> Integer.compare(a.frame, b.frame));
+            
+            setStatus("Local correction: optimizing frames " + (windowStart + 1) + "-" + (windowEnd + 1) + "...");
+        } else {
+            // Global correction mode: Use all anchors
+            effectiveAnchors = anchors;
+            setStatus("Optimizing track...");
+        }
+        
+        final int finalWindowStart = windowStart;
+        final int finalWindowEnd = windowEnd;
+        final boolean finalLocalMode = localMode && trackHasData;
+        final List<Anchor> finalEffectiveAnchors = effectiveAnchors;
+        
+        // Save original track state for potential revert
+        final Map<Integer, Point> originalTrackData = new HashMap<>(trackAnnotations.getOrDefault(trackId, new HashMap<>()));
+        
+        // Cancellation flag
+        final AtomicBoolean cancelled = new AtomicBoolean(false);
+        
+        // Create modal progress dialog with professional dark styling
+        final JDialog progressDialog = new JDialog(frame, "Optimizing Track", true);
+        progressDialog.setUndecorated(true);
+        progressDialog.setDefaultCloseOperation(JDialog.DO_NOTHING_ON_CLOSE);
+        progressDialog.setLayout(new BorderLayout(10, 10));
+        
+        JPanel contentPanel = new JPanel(new BorderLayout(12, 12));
+        contentPanel.setBackground(PANEL_DARK);
+        contentPanel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(ACCENT_BLUE, 2),
+            BorderFactory.createEmptyBorder(24, 28, 24, 28)
+        ));
+        
+        JLabel titleLabel = new JLabel(finalLocalMode ? "Local Correction" : "Optimizing Track");
+        titleLabel.setFont(new Font("Segoe UI Semibold", Font.BOLD, 16));
+        titleLabel.setForeground(TEXT_PRIMARY);
+        titleLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        contentPanel.add(titleLabel, BorderLayout.NORTH);
+        
+        String messageText = finalLocalMode 
+            ? "<html><center>Correcting frames " + (finalWindowStart + 1) + "-" + (finalWindowEnd + 1) + "...</center></html>"
+            : "<html><center>Optimizing track with " + anchors.size() + " corrections...</center></html>";
+        JLabel messageLabel = new JLabel(messageText);
+        messageLabel.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        messageLabel.setForeground(TEXT_SECONDARY);
+        messageLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        contentPanel.add(messageLabel, BorderLayout.CENTER);
+        
+        // Bottom panel with elapsed time and cancel button
+        JPanel bottomPanel = new JPanel(new BorderLayout(10, 5));
+        bottomPanel.setBackground(PANEL_DARK);
+        
+        final JLabel elapsedLabel = new JLabel("Elapsed: 0s");
+        elapsedLabel.setFont(new Font("Segoe UI", Font.BOLD, 14));
+        elapsedLabel.setForeground(ACCENT_BLUE);
+        elapsedLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        bottomPanel.add(elapsedLabel, BorderLayout.CENTER);
+        
+        JButton cancelButton = new JButton("Cancel");
+        cancelButton.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        cancelButton.setBackground(new Color(120, 40, 40));
+        cancelButton.setForeground(TEXT_PRIMARY);
+        cancelButton.setFocusPainted(false);
+        cancelButton.setBorder(BorderFactory.createEmptyBorder(8, 20, 8, 20));
+        cancelButton.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        JPanel cancelPanel = new JPanel(new FlowLayout(FlowLayout.CENTER));
+        cancelPanel.setBackground(PANEL_DARK);
+        cancelPanel.add(cancelButton);
+        bottomPanel.add(cancelPanel, BorderLayout.SOUTH);
+        
+        contentPanel.add(bottomPanel, BorderLayout.SOUTH);
+        
+        progressDialog.add(contentPanel);
+        progressDialog.setSize(480, 220);
+        progressDialog.setLocationRelativeTo(frame);
+        
+        // Timer to update elapsed time
+        final long startTime = System.currentTimeMillis();
+        final Timer elapsedTimer = new Timer(1000, e -> {
+            long elapsed = (System.currentTimeMillis() - startTime) / 1000;
+            elapsedLabel.setText(String.format("Elapsed: %ds", elapsed));
+        });
+        elapsedTimer.start();
+        
+        // Reference to worker for cancellation
+        final SwingWorker<Map<Integer, Point>, Void>[] workerRef = new SwingWorker[1];
+        
+        cancelButton.addActionListener(e -> {
+            cancelled.set(true);
+            beginCancellationAndWait(
+                "Track optimization",
+                () -> {
+                    // Undo the entire operation (restores anchors and track state)
+                    // This properly reverts the anchor added in handleCorrectionClick
+                    undo();
+                },
+                workerRef[0],
+                elapsedTimer,
+                progressDialog
+            );
+            setStatus("Track optimization cancelled");
+        });
+        
+        SwingWorker<Map<Integer, Point>, Void> worker = new SwingWorker<Map<Integer, Point>, Void>() {
+            @Override
+            protected Map<Integer, Point> doInBackground() throws Exception {
+                String outputDir = getOutputDirectory();
+                
+                // Create anchors JSON file
+                File anchorsFile = new File(outputDir, "anchors_temp.json");
+                JSONArray anchorsArray = new JSONArray();
+                
+                System.out.println("[DEBUG] Sending " + finalEffectiveAnchors.size() + " anchors for optimization:");
+                for (Anchor anchor : finalEffectiveAnchors) {
+                    System.out.println("[DEBUG]   Anchor: frame=" + anchor.frame + ", x=" + anchor.x + ", y=" + anchor.y);
+                    JSONObject anchorObj = new JSONObject();
+                    anchorObj.put("frame", anchor.frame);  // Send 0-indexed frame
+                    anchorObj.put("x", anchor.x);
+                    anchorObj.put("y", anchor.y);
+                    anchorsArray.put(anchorObj);
+                }
+                
+                try (FileWriter writer = new FileWriter(anchorsFile)) {
+                    writer.write(anchorsArray.toString(2));
+                }
+                
+                // Call Python script in optimization mode (cross-platform)
+                File scriptFile = getTrackingScript();
+                if (!scriptFile.exists()) {
+                    throw new FileNotFoundException("Tracking script not found: " + scriptFile.getAbsolutePath());
+                }
+                
+                String pythonScript = config.getProperty("local.python.script", "");
+                String workDir = config.getProperty("local.work.dir", "/tmp/tracking_temp");
+                String condaEnv = config.getProperty("local.conda.env", "ripple-env");
+                String modelSize = config.getProperty("raft.model.size", "large");
+                String timeout = config.getProperty("local.timeout", "300");
+                
+                // Use original video name for output file naming (important for compressed videos)
+                String videoBaseName = new File(currentVideoPath).getName().replaceFirst("\\.[^.]+$", "");
+                
+                // Get correction method settings
+                String correctionMethod = config.getProperty("correction.method", "full_blend");
+                String blobSearchRadius = config.getProperty("dis.blob.search.radius", "15");
+                String blobRadius = config.getProperty("dis.blob.radius", "5.0");
+                String corridorWidth = config.getProperty("corridor.width", "adaptive");
+                int linearInterpThreshold = Integer.parseInt(config.getProperty("correction.linear.interp.threshold", "0"));
+                
+                List<String> args = new ArrayList<>();
+                args.add("track_anchors");
+                args.add("--tiff");
+                args.add(workingVideoPath);
+                args.add("--output-dir");
+                args.add(outputDir);
+                args.add("--video-name");
+                args.add(videoBaseName);
+                args.add("--python-script");
+                args.add(pythonScript);
+                args.add("--work-dir");
+                args.add(workDir);
+                args.add("--conda-env");
+                args.add(condaEnv);
+                args.add("--timeout");
+                args.add(timeout);
+                args.add("--model");
+                args.add(modelSize);
+                args.add("--anchors");
+                args.add(anchorsFile.getAbsolutePath());
+                args.add("--correction-method");
+                args.add(correctionMethod);
+                args.add("--blob-search-radius");
+                args.add(blobSearchRadius);
+                args.add("--blob-radius");
+                args.add(blobRadius);
+                args.add("--corridor-width");
+                args.add(corridorWidth);
+                args.add("--linear-interp-threshold");
+                args.add(String.valueOf(linearInterpThreshold));
+                
+                List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
+                ProcessBuilder pb = new ProcessBuilder(command);
+                pb.redirectErrorStream(true);
+                Process process = pb.start();
+                
+                BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    System.out.println("[Optimize] " + line);
+                }
+                
+                int exitCode = process.waitFor();
+                if (exitCode != 0) {
+                    throw new IOException("Local track optimization failed with exit code " + exitCode);
+                }
+                
+                // Parse result JSON
+                String videoName = new File(currentVideoPath).getName();
+                if (videoName.contains(".")) {
+                    videoName = videoName.substring(0, videoName.lastIndexOf('.'));
+                }
+                File jsonFile = new File(outputDir, videoName + "_annotations.json");
+                
+                if (!jsonFile.exists()) {
+                    throw new FileNotFoundException("Output JSON file not found: " + jsonFile.getAbsolutePath());
+                }
+                
+                Map<Integer, Point> points = new HashMap<>();
+                String content = new String(Files.readAllBytes(jsonFile.toPath()));
+                System.out.println("[DEBUG] JSON file: " + jsonFile.getAbsolutePath());
+                JSONObject json = new JSONObject(content);
+                JSONArray tracksArray = json.getJSONArray("tracks");
+                
+                if (tracksArray.length() > 0) {
+                    JSONObject trackObj = tracksArray.getJSONObject(0);
+                    JSONArray framesArray = trackObj.getJSONArray("frames");
+                    System.out.println("[DEBUG] Parsed " + framesArray.length() + " frames from JSON");
+                    
+                    for (int i = 0; i < framesArray.length(); i++) {
+                        JSONObject frameObj = framesArray.getJSONObject(i);
+                        int frame = frameObj.getInt("frame");
+                        int x = frameObj.getInt("x");
+                        int y = frameObj.getInt("y");
+                        points.put(frame, new Point(x, y));
+                    }
+                    if (!points.isEmpty()) {
+                        int minFrame = points.keySet().stream().min(Integer::compareTo).orElse(-1);
+                        int maxFrame = points.keySet().stream().max(Integer::compareTo).orElse(-1);
+                        System.out.println("[DEBUG] Points range: " + minFrame + " - " + maxFrame);
+                    }
+                }
+                
+                // Clean up temp files
+                anchorsFile.delete();
+                jsonFile.delete();  // Clean up intermediate annotations file
+                
+                return points;
+            }
+            
+            @Override
+            protected void done() {
+                serverOperationInProgress = false;  // Operation complete
+                serverCancellationInProgress = false;
+                elapsedTimer.stop();;
+                progressDialog.dispose();
+                
+                if (cancelled.get() || isCancelled()) {
+                    return; // Already handled by cancel button
+                }
+                
+                try {
+                    Map<Integer, Point> optimizedPoints = get();
+                    Map<Integer, Point> finalPoints;
+                    
+                    System.out.println("[DEBUG] Local mode: " + finalLocalMode);
+                    System.out.println("[DEBUG] Window: " + finalWindowStart + " - " + finalWindowEnd);
+                    System.out.println("[DEBUG] Optimized points received: " + optimizedPoints.size());
+                    System.out.println("[DEBUG] Original track points: " + originalTrackData.size());
+                    
+                    if (finalLocalMode) {
+                        // Local correction mode: Merge only the window into existing track
+                        finalPoints = new HashMap<>(originalTrackData);
+                        
+                        // Replace only frames within the window
+                        int replaced = 0;
+                        for (int frame = finalWindowStart; frame <= finalWindowEnd; frame++) {
+                            if (optimizedPoints.containsKey(frame)) {
+                                finalPoints.put(frame, optimizedPoints.get(frame));
+                                replaced++;
+                            }
+                        }
+                        System.out.println("[DEBUG] Replaced " + replaced + " points in window");
+                        
+                        setStatus("Local correction applied (frames " + (finalWindowStart + 1) + "-" + (finalWindowEnd + 1) + ")");
+                    } else {
+                        // Global mode: Replace entire track
+                        finalPoints = optimizedPoints;
+                        
+                        // Apply SAT region constraints if enabled
+                        if (satEnabled && trackToRegion.containsKey(trackId)) {
+                            finalPoints = applyRegionConstraints(trackId, finalPoints);
+                            setStatus("Track optimized with SAT constraints (" + anchors.size() + " corrections)");
+                        } else {
+                            setStatus("Track optimized successfully with " + anchors.size() + " corrections");
+                        }
+                    }
+                    
+                    trackAnnotations.put(trackId, finalPoints);
+                    
+                    // Re-apply smoothing if it was enabled (keeps user's preference)
+                    reapplyTrackSmoothingIfEnabled(trackId);
+                    
+                    // Mark track as optimized after optimization (single-seed mode)
+                    if (!isMultiSeedMode()) {
+                        trackOptimized.put(trackId, true);
+                    }
+                    
+                    loadSliceImage();
+                    refreshAnnotationList();
+                    imageLabel.repaint();
+                    frameSlider.repaint(); // Update slider to show anchor points
+                } catch (Exception ex) {
+                    elapsedTimer.stop();
+                    if (!cancelled.get()) {
+                        setStatus("Track optimization failed: " + ex.getMessage());
+                        JOptionPane.showMessageDialog(frame,
+                            "Failed to optimize track:\n" + ex.getMessage(),
+                            "Error",
+                            JOptionPane.ERROR_MESSAGE);
+                    }
+                    ex.printStackTrace();
+                }
+            }
+        };
+        
+        workerRef[0] = worker;
+        serverCancellationInProgress = false;
+        serverOperationInProgress = true;  // Mark operation as in progress
+        worker.execute();
+        progressDialog.setVisible(true);
+    }
+    
+    // NEW METHOD: Batch optimize all selected tracks (multi-seed mode)
+    private void runBatchTrackOptimization() {
+        if (currentVideoPath == null || imp == null) {
+            JOptionPane.showMessageDialog(frame,
+                "No video loaded.",
+                "Error",
+                JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        
+        if (!opticalFlowComputed) {
+            JOptionPane.showMessageDialog(frame,
+                "Optical flow not computed yet. Please compute optical flow first.",
+                "Error",
+                JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+
+        if (blockIfServerBusy("Batch optimize tracks")) {
+            return;
+        }
+        
+        // Collect ALL unoptimized tracks (checkboxes are now for batch selection, not optimization filtering)
+        List<String> tracksToOptimize = new ArrayList<>();
+        for (String trackId : trackAnnotations.keySet()) {
+            if (!trackOptimized.getOrDefault(trackId, false)) {
+                tracksToOptimize.add(trackId);
+            }
+        }
+        
+        if (tracksToOptimize.isEmpty()) {
+            JOptionPane.showMessageDialog(frame,
+                "All tracks are already optimized.",
+                "Info",
+                JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        
+        int unoptimizedCount = tracksToOptimize.size();
+        
+        setStatus("Optimizing " + unoptimizedCount + " unoptimized track(s)...");
+        
+        // Save state for undo before batch optimization
+        saveState();
+        
+        // Cancellation flag
+        final AtomicBoolean cancelled = new AtomicBoolean(false);
+        
+        // Create modal progress dialog with professional dark styling
+        final JDialog progressDialog = new JDialog(frame, "Optimizing Tracks", true);
+        progressDialog.setUndecorated(true);
+        progressDialog.setDefaultCloseOperation(JDialog.DO_NOTHING_ON_CLOSE);
+        progressDialog.setLayout(new BorderLayout(10, 10));
+        
+        JPanel contentPanel = new JPanel(new BorderLayout(12, 12));
+        contentPanel.setBackground(PANEL_DARK);
+        contentPanel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(ACCENT_BLUE, 2),
+            BorderFactory.createEmptyBorder(24, 28, 24, 28)
+        ));
+        
+        JLabel titleLabel = new JLabel("Optimizing Tracks");
+        titleLabel.setFont(new Font("Segoe UI Semibold", Font.BOLD, 16));
+        titleLabel.setForeground(TEXT_PRIMARY);
+        titleLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        contentPanel.add(titleLabel, BorderLayout.NORTH);
+        
+        final int finalUnoptimizedCount = unoptimizedCount;
+        JLabel messageLabel = new JLabel("<html><center>Optimizing " + unoptimizedCount + " unoptimized track(s)...</center></html>");
+        messageLabel.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        messageLabel.setForeground(TEXT_SECONDARY);
+        messageLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        contentPanel.add(messageLabel, BorderLayout.CENTER);
+        
+        // Bottom panel with elapsed time and cancel button
+        JPanel bottomPanel = new JPanel(new BorderLayout(10, 5));
+        bottomPanel.setBackground(PANEL_DARK);
+        
+        final JLabel elapsedLabel = new JLabel("Elapsed: 0s");
+        elapsedLabel.setFont(new Font("Segoe UI", Font.BOLD, 14));
+        elapsedLabel.setForeground(ACCENT_BLUE);
+        elapsedLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        bottomPanel.add(elapsedLabel, BorderLayout.CENTER);
+        
+        JButton cancelButton = new JButton("Cancel");
+        cancelButton.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        cancelButton.setBackground(new Color(120, 40, 40));
+        cancelButton.setForeground(TEXT_PRIMARY);
+        cancelButton.setFocusPainted(false);
+        cancelButton.setBorder(BorderFactory.createEmptyBorder(8, 20, 8, 20));
+        cancelButton.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        JPanel cancelPanel = new JPanel(new FlowLayout(FlowLayout.CENTER));
+        cancelPanel.setBackground(PANEL_DARK);
+        cancelPanel.add(cancelButton);
+        bottomPanel.add(cancelPanel, BorderLayout.SOUTH);
+        
+        contentPanel.add(bottomPanel, BorderLayout.SOUTH);
+        
+        progressDialog.add(contentPanel);
+        progressDialog.setSize(480, 220);
+        progressDialog.setLocationRelativeTo(frame);
+        
+        // Timer to update elapsed time
+        final long startTime = System.currentTimeMillis();
+        final Timer elapsedTimer = new Timer(1000, e -> {
+            long elapsed = (System.currentTimeMillis() - startTime) / 1000;
+            elapsedLabel.setText(String.format("Elapsed: %ds", elapsed));
+        });
+        elapsedTimer.start();
+        
+        // Reference to worker for cancellation
+        final SwingWorker<Map<String, Map<Integer, Point>>, Void>[] workerRef = new SwingWorker[1];
+        
+        cancelButton.addActionListener(e -> {
+            cancelled.set(true);
+            beginCancellationAndWait(
+                "Batch track optimization",
+                () -> {
+                    // Undo the entire operation (restores all tracks and anchors)
+                    undo();
+                },
+                workerRef[0],
+                elapsedTimer,
+                progressDialog
+            );
+            setStatus("Batch track optimization cancelled");
+        });
+        
+        SwingWorker<Map<String, Map<Integer, Point>>, Void> worker = new SwingWorker<Map<String, Map<Integer, Point>>, Void>() {
+            @Override
+            protected Map<String, Map<Integer, Point>> doInBackground() throws Exception {
+                Map<String, Map<Integer, Point>> results = new HashMap<>();
+
+                List<String> batchedTrackIds = new ArrayList<>();
+                List<List<Anchor>> batchedAnchors = new ArrayList<>();
+
+                for (String trackId : tracksToOptimize) {
+                    // Check for cancellation
+                    if (cancelled.get() || isCancelled()) {
+                        return results;
+                    }
+                    
+                    // Tracks already filtered - all are unoptimized
+                    
+                    List<Anchor> anchors = trackAnchors.get(trackId);
+                    // Tracks with 0 or 1 anchors: Use blob-based propagation from seed
+                    // Tracks with 2+ anchors: Use anchor-based flow blending optimization
+                    if (anchors == null || anchors.isEmpty() || anchors.size() == 1) {
+                        // For single-anchor tracks, use blob detection propagation
+                        int seedFrame;
+                        int seedX, seedY;
+                        
+                        if (anchors != null && anchors.size() == 1) {
+                            // Use the single anchor as seed point
+                            Anchor anchor = anchors.get(0);
+                            seedFrame = anchor.frame;
+                            seedX = anchor.x;
+                            seedY = anchor.y;
+                        } else {
+                            // No anchors - use first existing point
+                            Map<Integer, Point> existingPoints = trackAnnotations.get(trackId);
+                            if (existingPoints == null || existingPoints.isEmpty()) {
+                                continue;  // Skip tracks with no data
+                            }
+                            seedFrame = existingPoints.keySet().stream().min(Integer::compareTo).orElse(0);
+                            Point firstPoint = existingPoints.get(seedFrame);
+                            seedX = firstPoint.x;
+                            seedY = firstPoint.y;
+                        }
+
+                        Map<Integer, Point> propagatedTrack = propagateTrackSync(trackId, seedX, seedY, seedFrame);
+                        if (propagatedTrack != null) {
+                            results.put(trackId, propagatedTrack);
+                        }
+                    } else {
+                        // 2+ anchors: Use anchor-based flow blending optimization
+                        batchedTrackIds.add(trackId);
+                        batchedAnchors.add(new ArrayList<>(anchors));
+                    }
+                }
+
+                if (!batchedTrackIds.isEmpty() && !cancelled.get() && !isCancelled()) {
+                    Map<String, Map<Integer, Point>> batchResults = optimizeTracksRemoteBatch(batchedTrackIds, batchedAnchors);
+                    results.putAll(batchResults);
+                }
+
+                return results;
+            }
+            
+            @Override
+            protected void done() {
+                serverOperationInProgress = false;
+                serverCancellationInProgress = false;
+                elapsedTimer.stop();
+                progressDialog.dispose();
+                
+                // If cancelled, don't process results
+                if (cancelled.get() || isCancelled()) {
+                    return;
+                }
+                
+                try {
+                    Map<String, Map<Integer, Point>> results = get();
+                    
+                    // Update tracks with SAT constraints applied
+                    for (Map.Entry<String, Map<Integer, Point>> entry : results.entrySet()) {
+                        String trackId = entry.getKey();
+                        Map<Integer, Point> points = entry.getValue();
+                        
+                        // Apply SAT region constraints if enabled
+                        if (satEnabled && trackToRegion.containsKey(trackId)) {
+                            points = applyRegionConstraints(trackId, points);
+                        }
+                        
+                        trackAnnotations.put(trackId, points);
+                        trackOptimized.put(trackId, true);
+                        
+                        // Re-apply smoothing if it was enabled (keeps user's preference)
+                        reapplyTrackSmoothingIfEnabled(trackId);
+                    }
+                    
+                    setStatus("Optimized " + results.size() + " track(s) successfully");
+                    loadSliceImage();
+                    refreshAnnotationList();
+                    imageLabel.repaint();
+                    frameSlider.repaint(); // Update slider to show anchor points
+                    
+                    JOptionPane.showMessageDialog(frame,
+                        "Successfully optimized " + results.size() + " track(s).",
+                        "Success",
+                        JOptionPane.INFORMATION_MESSAGE);
+                    
+                } catch (Exception ex) {
+                    if (cancelled.get() || isCancelled()) {
+                        return;
+                    }
+                    elapsedTimer.stop();
+                    setStatus("Batch optimization failed: " + ex.getMessage());
+                    JOptionPane.showMessageDialog(frame,
+                        "Failed to optimize tracks:\n" + ex.getMessage(),
+                        "Error",
+                        JOptionPane.ERROR_MESSAGE);
+                    ex.printStackTrace();
+                }
+            }
+        };
+        
+        workerRef[0] = worker;
+        serverCancellationInProgress = false;
+        serverOperationInProgress = true;
+        worker.execute();
+        progressDialog.setVisible(true);
+    }
+    
+    // Helper to check if running on Windows
+    private boolean isWindowsOS() {
+        return System.getProperty("os.name").toLowerCase().contains("win");
+    }
+    
+    // Helper to check if WSL is available on Windows
+    private boolean isWSLAvailable() {
+        if (!isWindowsOS()) return false;
+        try {
+            Process p = new ProcessBuilder("wsl.exe", "--status").start();
+            int exitCode = p.waitFor();
+            return exitCode == 0;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+    
+    /**
+     * Send a cancel command to the tracking server.
+     * This is called when the user clicks Cancel on a long-running operation.
+     * The server will set a cancellation flag that interrupts the current operation.
+     */
+    private void sendCancelToServer() {
+        try {
+            // Fast path: talk directly to the server socket (Linux/macOS).
+            if (canUseDirectTrackingIpc() && isServerRunning()) {
+                JSONObject req = new JSONObject();
+                req.put("command", "cancel");
+                JSONObject resp = sendTrackingServerRequest(req);
+                System.out.println("[Cancel] Server response: " + resp);
+                return;
+            }
+
+            File scriptFile = getTrackingScript();
+            if (!scriptFile.exists()) {
+                System.out.println("[Cancel] Tracking script not found, cannot send cancel");
+                return;
+            }
+            
+            List<String> args = new ArrayList<>();
+            args.add("cancel");
+            
+            List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
+            System.out.println("[Cancel] Sending cancel command to server: " + String.join(" ", command));
+            
+            ProcessBuilder pb = new ProcessBuilder(command);
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+            
+            // Wait briefly for the cancel to be acknowledged (non-blocking)
+            boolean finished = process.waitFor(2, java.util.concurrent.TimeUnit.SECONDS);
+            if (finished) {
+                int exitCode = process.exitValue();
+                System.out.println("[Cancel] Cancel command sent, exit code: " + exitCode);
+            } else {
+                System.out.println("[Cancel] Cancel command sent (still running)");
+                process.destroyForcibly();
+            }
+        } catch (Exception e) {
+            System.out.println("[Cancel] Error sending cancel command: " + e.getMessage());
+        }
+    }
+
+    private boolean isTrackingServerBusy() {
+        try {
+            if (canUseDirectTrackingIpc() && isServerRunning()) {
+                JSONObject req = new JSONObject();
+                req.put("command", "status");
+                JSONObject resp = sendTrackingServerRequest(req);
+                return resp.optBoolean("busy", false);
+            }
+
+            File scriptFile = getTrackingScript();
+            if (!scriptFile.exists()) {
+                return false;
+            }
+
+            List<String> args = new ArrayList<>();
+            args.add("status_json");
+            List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
+
+            ProcessBuilder pb = new ProcessBuilder(command);
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+
+            StringBuilder out = new StringBuilder();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    out.append(line).append("\n");
+                }
+            }
+
+            process.waitFor(3, java.util.concurrent.TimeUnit.SECONDS);
+            String output = out.toString().trim();
+
+            int start = output.indexOf('{');
+            int end = output.lastIndexOf('}');
+            if (start >= 0 && end > start) {
+                JSONObject json = new JSONObject(output.substring(start, end + 1));
+                return json.optBoolean("busy", false);
+            }
+        } catch (Exception e) {
+            System.out.println("[Status] Error checking server busy: " + e.getMessage());
+        }
+        return false;
+    }
+
+    private void showCancellationInProgressDialog(String operationName) {
+        final JDialog cancellingDialog = new JDialog(frame, "Cancelling Operation", true);
+        cancellingDialog.setUndecorated(true);
+        cancellingDialog.setDefaultCloseOperation(JDialog.DO_NOTHING_ON_CLOSE);
+        cancellingDialog.setLayout(new BorderLayout(10, 10));
+
+        JPanel contentPanel = new JPanel(new BorderLayout(12, 12));
+        contentPanel.setBackground(PANEL_DARK);
+        contentPanel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(ACCENT_BLUE, 2),
+            BorderFactory.createEmptyBorder(24, 28, 24, 28)
+        ));
+
+        JLabel titleLabel = new JLabel("Cancelling Operation In Progress");
+        titleLabel.setFont(new Font("Segoe UI Semibold", Font.BOLD, 16));
+        titleLabel.setForeground(TEXT_PRIMARY);
+        titleLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        contentPanel.add(titleLabel, BorderLayout.NORTH);
+
+        String msg = "<html><center><span style='color: #E8EAED;'>Cancelling" +
+            (operationName != null && !operationName.isBlank() ? ": " + operationName : "") +
+            "...</span><br><span style='color: #9AA0A6; font-size: 11px;'>Please wait</span></center></html>";
+        JLabel messageLabel = new JLabel(msg);
+        messageLabel.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        messageLabel.setForeground(TEXT_SECONDARY);
+        messageLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        contentPanel.add(messageLabel, BorderLayout.CENTER);
+
+        final JLabel elapsedLabel = new JLabel("Elapsed: 0s");
+        elapsedLabel.setFont(new Font("Segoe UI", Font.BOLD, 14));
+        elapsedLabel.setForeground(ACCENT_BLUE);
+        elapsedLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        contentPanel.add(elapsedLabel, BorderLayout.SOUTH);
+
+        cancellingDialog.add(contentPanel);
+        cancellingDialog.setSize(520, 210);
+        cancellingDialog.setLocationRelativeTo(frame);
+
+        final long startTime = System.currentTimeMillis();
+        final Timer elapsedTimer = new Timer(1000, e -> {
+            long elapsed = (System.currentTimeMillis() - startTime) / 1000;
+            elapsedLabel.setText(String.format("Elapsed: %ds", elapsed));
+        });
+        elapsedTimer.start();
+
+        SwingWorker<Void, Void> poller = new SwingWorker<Void, Void>() {
+            @Override
+            protected Void doInBackground() throws Exception {
+                final long deadlineMs = System.currentTimeMillis() + 120_000;
+                while (System.currentTimeMillis() < deadlineMs) {
+                    if (!isTrackingServerBusy()) {
+                        return null;
+                    }
+                    Thread.sleep(250);
+                }
+                throw new IOException("Timed out waiting for cancellation to complete");
+            }
+
+            @Override
+            protected void done() {
+                elapsedTimer.stop();
+                try {
+                    get();
+                } catch (Exception ex) {
+                    JOptionPane.showMessageDialog(frame,
+                        "Cancellation is taking longer than expected.\n\n" +
+                        "You can try again after a few moments.",
+                        "Cancellation Slow",
+                        JOptionPane.WARNING_MESSAGE);
+                } finally {
+                    // Once the server is idle (or we give up), allow operations again.
+                    serverOperationInProgress = false;
+                    serverCancellationInProgress = false;
+                    cancellingDialog.dispose();
+                }
+            }
+        };
+
+        poller.execute();
+        cancellingDialog.setVisible(true);
+    }
+
+    private void beginCancellationAndWait(
+        String operationName,
+        Runnable cleanup,
+        SwingWorker<?, ?> workerToCancel,
+        Timer elapsedTimer,
+        JDialog progressDialog
+    ) {
+        serverCancellationInProgress = true;
+        setStatus("Cancelling" + (operationName != null && !operationName.isBlank() ? ": " + operationName : "") + "...");
+
+        // Send cancel immediately, before allowing any other server request.
+        sendCancelToServer();
+
+        if (workerToCancel != null) {
+            workerToCancel.cancel(true);
+        }
+        if (elapsedTimer != null) {
+            elapsedTimer.stop();
+        }
+        if (progressDialog != null) {
+            progressDialog.dispose();
+        }
+
+        if (cleanup != null) {
+            cleanup.run();
+        }
+
+        // Block UI until server reports idle.
+        showCancellationInProgressDialog(operationName);
+    }
+
+    /**
+     * Direct IPC support (avoids spawning run_persistent_tracking.sh + python for every request).
+     *
+     * IMPORTANT: Windows users frequently run Ripple through WSL; in that case the Unix socket lives
+     * inside WSL and is not reachable from the Windows JVM. So we only enable direct IPC on non-Windows.
+     */
+    private boolean canUseDirectTrackingIpc() {
+        return !isWindowsOS();
+    }
+
+    private String getTrackingTransport() {
+        // Optional override via config property.
+        // Default is TCP to match run_persistent_tracking.sh which defaults to TCP for Windows parity.
+        String configured = config.getProperty("local.transport", "").trim().toLowerCase();
+        if (!configured.isEmpty()) {
+            return configured;
+        }
+        // Default to TCP (matches shell script default)
+        return "tcp";
+    }
+
+    private JSONObject sendTrackingServerRequest(JSONObject request) throws IOException {
+        String transport = getTrackingTransport();
+        byte[] payload = (request.toString() + "\n").getBytes(StandardCharsets.UTF_8);
+
+        if ("tcp".equals(transport) || "inet".equals(transport)) {
+            String host = config.getProperty("local.tcp.host", "127.0.0.1");
+            int port = Integer.parseInt(config.getProperty("local.tcp.port", "9876"));
+            try (Socket socket = new Socket()) {
+                socket.connect(new InetSocketAddress(host, port), 500);
+                // For long-running ops the server holds the connection open; keep this generous.
+                socket.setSoTimeout(600_000);
+                socket.getOutputStream().write(payload);
+                socket.getOutputStream().flush();
+                socket.shutdownOutput();
+                String resp = readJsonLineFromStream(socket.getInputStream());
+                return new JSONObject(resp);
+            }
+        }
+
+        String socketPath = config.getProperty("local.socket.path", "/tmp/ripple-env.sock");
+        UnixDomainSocketAddress addr = UnixDomainSocketAddress.of(Paths.get(socketPath));
+        try (SocketChannel channel = SocketChannel.open(StandardProtocolFamily.UNIX)) {
+            channel.connect(addr);
+            channel.write(ByteBuffer.wrap(payload));
+            channel.shutdownOutput();
+            String resp = readJsonLineFromChannel(channel);
+            return new JSONObject(resp);
+        }
+    }
+
+    private static String readJsonLineFromStream(InputStream in) throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        byte[] buf = new byte[4096];
+        while (true) {
+            int n = in.read(buf);
+            if (n < 0) break;
+            for (int i = 0; i < n; i++) {
+                byte b = buf[i];
+                if (b == (byte) '\n') {
+                    return baos.toString(StandardCharsets.UTF_8).trim();
+                }
+                baos.write(b);
+            }
+        }
+        return baos.toString(StandardCharsets.UTF_8).trim();
+    }
+
+    private static String readJsonLineFromChannel(SocketChannel channel) throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        ByteBuffer buf = ByteBuffer.allocate(4096);
+        while (true) {
+            buf.clear();
+            int n = channel.read(buf);
+            if (n < 0) break;
+            buf.flip();
+            while (buf.hasRemaining()) {
+                byte b = buf.get();
+                if (b == (byte) '\n') {
+                    return baos.toString(StandardCharsets.UTF_8).trim();
+                }
+                baos.write(b);
+            }
+        }
+        return baos.toString(StandardCharsets.UTF_8).trim();
+    }
+
+    private void ensureOkResponse(JSONObject response) throws IOException {
+        String status = response.optString("status", "error");
+        if (!"ok".equals(status)) {
+            String msg = response.optString("message", "Tracking engine error");
+            throw new IOException(msg);
+        }
+    }
+
+    /**
+     * Parse annotations from a JSON file produced by the tracking server.
+     * The file is deleted after parsing since it's an intermediate file.
+     */
+    private Map<Integer, Point> parseAnnotationsJson(File jsonFile) throws IOException {
+        if (!jsonFile.exists()) {
+            throw new FileNotFoundException("Output JSON file not found: " + jsonFile.getAbsolutePath());
+        }
+        Map<Integer, Point> points = new HashMap<>();
+        try {
+            String content = new String(Files.readAllBytes(jsonFile.toPath()));
+            JSONObject json = new JSONObject(content);
+            JSONArray tracksArray = json.optJSONArray("tracks");
+            if (tracksArray == null || tracksArray.length() == 0) {
+                return points;
+            }
+            JSONObject trackObj = tracksArray.getJSONObject(0);
+            JSONArray framesArray = trackObj.getJSONArray("frames");
+            for (int i = 0; i < framesArray.length(); i++) {
+                JSONObject frameObj = framesArray.getJSONObject(i);
+                int frame = frameObj.getInt("frame");
+                int x = frameObj.getInt("x");
+                int y = frameObj.getInt("y");
+                points.put(frame, new Point(x, y));
+            }
+        } finally {
+            // Clean up intermediate file
+            jsonFile.delete();
+        }
+        return points;
+    }
+    
+    // Get the appropriate script file for the current OS
+    private File getTrackingScript() {
+        String bashScript = config.getProperty("bash.script.path", "scripts/run_persistent_tracking.sh");
+        File bashFile = new File(bashScript);
+        
+        // If on Windows and the .sh file doesn't exist or WSL isn't available, try .bat
+        if (isWindowsOS() && (!bashFile.exists() || !isWSLAvailable())) {
+            // Try the batch file instead
+            String batScript = bashScript.replace(".sh", ".bat");
+            File batFile = new File(batScript);
+            if (batFile.exists()) {
+                return batFile;
+            }
+            // Also try in scripts directory
+            batFile = new File("scripts/run_persistent_tracking.bat");
+            if (batFile.exists()) {
+                return batFile;
+            }
+        }
+        
+        // Try relative path from current directory
+        if (!bashFile.exists()) {
+            bashFile = new File("scripts/run_persistent_tracking.sh");
+        }
+        
+        return bashFile;
+    }
+    
+    // Helper method to build command with WSL support or native Windows batch
+    private List<String> buildWSLCommand(String bashScript, List<String> args) {
+        List<String> command = new ArrayList<>();
+        String os = System.getProperty("os.name").toLowerCase();
+        
+        // Debug: print OS detection
+        System.out.println("[DEBUG] OS detected: " + os);
+        System.out.println("[DEBUG] Input bashScript: " + bashScript);
+        
+        // Check if on Windows
+        boolean isWindows = os.contains("win");
+        
+        // Check if this is a .bat file (native Windows)
+        boolean isBatFile = bashScript.toLowerCase().endsWith(".bat");
+        
+        if (isWindows && isBatFile) {
+            // Native Windows batch file execution
+            // Use cmd.exe /c call to ensure proper execution and exit
+            command.add("cmd.exe");
+            command.add("/c");
+            command.add("call");
+            command.add(bashScript);
+            command.addAll(args);
+            System.out.println("[DEBUG] Using native Windows batch: " + String.join(" ", command));
+            return command;
+        }
+        
+        // Also check for WSL path patterns which indicate Windows access
+        if (!isWindows && (bashScript.startsWith("/home/") || bashScript.startsWith("/mnt/"))) {
+            // If we see Linux-style paths but we're not detected as Windows,
+            // check if WSL is available (this handles edge cases)
+            if (isWSLAvailable()) {
+                isWindows = true;
+                System.out.println("[DEBUG] WSL detected via wsl.exe --status");
+            }
+        }
+        
+        if (isWindows) {
+            // On Windows, use wsl.exe to execute bash
+            command.add("wsl.exe");
+            command.add("bash");
+            // Convert Windows path to WSL path if needed
+            if (bashScript.startsWith("\\\\wsl.localhost\\") || bashScript.startsWith("//wsl.localhost/")) {
+                // Extract the distro and path from \\wsl.localhost\Ubuntu\home\leonz\...
+                // Format: \\wsl.localhost\{distro}\{path} -> /{path}
+                String temp = bashScript.replace("\\\\wsl.localhost\\", "");
+                temp = temp.replace("//wsl.localhost/", "");
+                // Remove distro name (first segment)
+                int firstSlash = temp.indexOf('\\');
+                if (firstSlash == -1) firstSlash = temp.indexOf('/');
+                if (firstSlash > 0) {
+                    bashScript = temp.substring(firstSlash).replace("\\", "/");
+                }
+                System.out.println("[DEBUG] Converted bashScript: " + bashScript);
+            }
+            // bashScript is already in Linux format, no conversion needed
+        } else {
+            // On Linux/Mac, use bash directly
+            command.add("bash");
+        }
+        
+        command.add(bashScript);
+        command.addAll(args);
+        
+        // Debug: print the command being executed
+        System.out.println("[DEBUG] Executing command: " + String.join(" ", command));
+        
+        return command;
+    }
+    
+    // Helper method for remote track propagation (synchronous, for batch operations)
+    private Map<Integer, Point> propagateTrackSync(String trackId, int seedX, int seedY, int seedFrame) throws Exception {
+        File scriptFile = getTrackingScript();
+        if (!scriptFile.exists()) {
+            throw new FileNotFoundException("Tracking script not found: " + scriptFile.getAbsolutePath());
+        }
+        
+        String outputDir = getOutputDirectory();
+        // Use original video name for output file naming (important for compressed videos)
+        String videoBaseName = new File(currentVideoPath).getName().replaceFirst("\\.[^.]+$", "");
+        
+        // Blob detection settings for DIS
+        String useBlobDetection = config.getProperty("dis.use.blob.detection", "false");
+        String blobSearchRadius = config.getProperty("dis.blob.search.radius", "15");
+        String blobRadius = config.getProperty("dis.blob.radius", "5.0");
+        
+        List<String> args = new ArrayList<>();
+        args.add("track_seed");
+        args.add("--tiff");
+        args.add(workingVideoPath);
+        args.add("--output-dir");
+        args.add(outputDir);
+        args.add("--seed-x");
+        args.add(String.valueOf(seedX));
+        args.add("--seed-y");
+        args.add(String.valueOf(seedY));
+        args.add("--seed-frame");
+        args.add(String.valueOf(seedFrame));
+        args.add("--video-name");
+        args.add(videoBaseName);
+        // Blob detection parameters
+        args.add("--use-blob-detection");
+        args.add(useBlobDetection);
+        args.add("--blob-search-radius");
+        args.add(blobSearchRadius);
+        args.add("--blob-radius");
+        args.add(blobRadius);
+        
+        List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
+        ProcessBuilder pb = new ProcessBuilder(command);
+        pb.redirectErrorStream(true);
+        
+        Process proc = pb.start();
+        BufferedReader reader = new BufferedReader(new InputStreamReader(proc.getInputStream()));
+        StringBuilder output = new StringBuilder();
+        String line;
+        while ((line = reader.readLine()) != null) {
+            output.append(line).append("\n");
+            System.out.println("[TRACK_SEED] " + line);  // Debug output
+        }
+        
+        int exitCode = proc.waitFor();
+        if (exitCode != 0) {
+            throw new Exception("Track propagation failed: " + output.toString());
+        }
+        
+        // Load the result (use videoBaseName already defined above)
+        File outputFile = new File(outputDir, videoBaseName + "_annotations.json");
+        
+        if (!outputFile.exists()) {
+            throw new FileNotFoundException("Output file not found: " + outputFile.getAbsolutePath());
+        }
+        
+        // Parse JSON
+        StringBuilder jsonContent = new StringBuilder();
+        try (BufferedReader br = new BufferedReader(new FileReader(outputFile))) {
+            while ((line = br.readLine()) != null) {
+                jsonContent.append(line);
+            }
+        }
+        
+        JSONObject json = new JSONObject(jsonContent.toString());
+        JSONArray tracksArray = json.getJSONArray("tracks");
+        
+        if (tracksArray.length() > 0) {
+            JSONObject trackObj = tracksArray.getJSONObject(0);
+            JSONArray framesArray = trackObj.getJSONArray("frames");
+            
+            Map<Integer, Point> points = new HashMap<>();
+            for (int i = 0; i < framesArray.length(); i++) {
+                JSONObject frameObj = framesArray.getJSONObject(i);
+                int frame = frameObj.getInt("frame");
+                int x = frameObj.getInt("x");
+                int y = frameObj.getInt("y");
+                points.put(frame, new Point(x, y));
+            }
+            
+            // Clean up intermediate annotations file
+            outputFile.delete();
+            
+            return points;
+        }
+        
+        // Clean up intermediate annotations file even if no tracks found
+        outputFile.delete();
+        
+        return null;
+    }
+    
+    // Helper method for remote track optimization with anchors
+    private Map<Integer, Point> optimizeTrackRemote(String trackId, List<Anchor> anchors) throws Exception {
+        String outputDir = getOutputDirectory();
+        String videoBaseName = new File(currentVideoPath).getName().replaceFirst("\\.[^.]+$", "");
+
+        // Get correction method settings
+        String correctionMethod = config.getProperty("correction.method", "full_blend");
+        String blobSearchRadius = config.getProperty("dis.blob.search.radius", "15");
+        String blobRadius = config.getProperty("dis.blob.radius", "5.0");
+        String corridorWidth = config.getProperty("corridor.width", "adaptive");
+        int linearInterpThreshold = Integer.parseInt(config.getProperty("correction.linear.interp.threshold", "0"));
+
+        // Fast path: direct IPC (Linux/macOS). Avoids temp file + process overhead per assist step.
+        if (canUseDirectTrackingIpc()) {
+            JSONArray anchorsArray = new JSONArray();
+            for (Anchor anchor : anchors) {
+                JSONObject anchorObj = new JSONObject();
+                anchorObj.put("frame", anchor.frame);
+                anchorObj.put("x", anchor.x);
+                anchorObj.put("y", anchor.y);
+                anchorsArray.put(anchorObj);
+            }
+
+            JSONObject req = new JSONObject();
+            req.put("command", "optimize_track");
+            req.put("video_path", workingVideoPath);
+            req.put("output_path", outputDir);
+            req.put("video_name", videoBaseName);
+            req.put("anchors", anchorsArray);
+            req.put("correction_method", correctionMethod);
+            req.put("blob_search_radius", Integer.parseInt(blobSearchRadius));
+            req.put("blob_radius", Double.parseDouble(blobRadius));
+            req.put("corridor_width", corridorWidth);
+            req.put("cache_video", Boolean.parseBoolean(config.getProperty("dis.cache.video", "false")));
+            req.put("linear_interp_threshold", linearInterpThreshold);
+
+            JSONObject resp = sendTrackingServerRequest(req);
+            ensureOkResponse(resp);
+        } else {
+            // Fallback: legacy wrapper path (Windows / WSL)
+            File scriptFile = getTrackingScript();
+            if (!scriptFile.exists()) {
+                throw new FileNotFoundException("Tracking script not found: " + scriptFile.getAbsolutePath());
+            }
+
+            // Create temporary anchors JSON file
+            File tempAnchorsFile = File.createTempFile("anchors_", ".json");
+            try (FileWriter writer = new FileWriter(tempAnchorsFile)) {
+                JSONArray anchorsArray = new JSONArray();
+                for (Anchor anchor : anchors) {
+                    JSONObject anchorObj = new JSONObject();
+                    anchorObj.put("frame", anchor.frame);
+                    anchorObj.put("x", anchor.x);
+                    anchorObj.put("y", anchor.y);
+                    anchorsArray.put(anchorObj);
+                }
+                writer.write(anchorsArray.toString());
+            }
+
+            List<String> args = new ArrayList<>();
+            args.add("track_anchors");
+            args.add("--tiff");
+            args.add(workingVideoPath);
+            args.add("--output-dir");
+            args.add(outputDir);
+            args.add("--video-name");
+            args.add(videoBaseName);
+            args.add("--anchors");
+            args.add(tempAnchorsFile.getAbsolutePath());
+            args.add("--correction-method");
+            args.add(correctionMethod);
+            args.add("--blob-search-radius");
+            args.add(blobSearchRadius);
+            args.add("--blob-radius");
+            args.add(blobRadius);
+            args.add("--corridor-width");
+            args.add(corridorWidth);
+            args.add("--linear-interp-threshold");
+            args.add(String.valueOf(linearInterpThreshold));
+
+            List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
+            ProcessBuilder pb = new ProcessBuilder(command);
+            pb.redirectErrorStream(true);
+
+            Process proc = pb.start();
+            BufferedReader reader = new BufferedReader(new InputStreamReader(proc.getInputStream()));
+            StringBuilder output = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                output.append(line).append("\n");
+                System.out.println("[TRACK_OPTIMIZE] " + line);  // Debug output
+            }
+
+            int exitCode = proc.waitFor();
+            tempAnchorsFile.delete();
+
+            if (exitCode != 0) {
+                throw new Exception("Track optimization failed: " + output.toString());
+            }
+        }
+        
+        // Load the result (use videoBaseName already defined above)
+        File outputFile = new File(outputDir, videoBaseName + "_annotations.json");
+        
+        return parseAnnotationsJson(outputFile);
+    }
+
+    // Helper method for batch remote optimization
+    private Map<String, Map<Integer, Point>> optimizeTracksRemoteBatch(List<String> trackIds, List<List<Anchor>> anchorsList) throws Exception {
+        if (trackIds == null || trackIds.isEmpty()) {
+            return Collections.emptyMap();
+        }
+
+        File scriptFile = getTrackingScript();
+        if (!scriptFile.exists()) {
+            throw new FileNotFoundException("Tracking script not found: " + scriptFile.getAbsolutePath());
+        }
+
+        String outputDir = getOutputDirectory();
+
+        // Bundle anchors into a single JSON payload
+        File tempBundleFile = File.createTempFile("anchors_bundle_", ".json");
+        JSONObject bundleObj = new JSONObject();
+        JSONArray tracksArray = new JSONArray();
+
+        for (int i = 0; i < trackIds.size(); i++) {
+            String trackId = trackIds.get(i);
+            List<Anchor> anchors = anchorsList.get(i);
+            JSONObject trackObj = new JSONObject();
+            trackObj.put("track_id", trackId);
+
+            JSONArray anchorsArray = new JSONArray();
+            for (Anchor anchor : anchors) {
+                JSONObject anchorObj = new JSONObject();
+                anchorObj.put("frame", anchor.frame);
+                anchorObj.put("x", anchor.x);
+                anchorObj.put("y", anchor.y);
+                anchorsArray.put(anchorObj);
+            }
+            trackObj.put("anchors", anchorsArray);
+            tracksArray.put(trackObj);
+        }
+
+        bundleObj.put("tracks", tracksArray);
+
+        try (FileWriter writer = new FileWriter(tempBundleFile)) {
+            writer.write(bundleObj.toString());
+        }
+
+        try {
+            // Get correction method settings
+            String correctionMethod = config.getProperty("correction.method", "full_blend");
+            String blobSearchRadius = config.getProperty("dis.blob.search.radius", "15");
+            String blobRadius = config.getProperty("dis.blob.radius", "5.0");
+            String corridorWidth = config.getProperty("corridor.width", "adaptive");
+            int linearInterpThreshold = Integer.parseInt(config.getProperty("correction.linear.interp.threshold", "0"));
+            
+            List<String> args = new ArrayList<>();
+            args.add("optimize_tracks");
+            args.add("--tiff");
+            args.add(workingVideoPath);
+            args.add("--output-dir");
+            args.add(outputDir);
+            args.add("--anchors-bundle");
+            args.add(tempBundleFile.getAbsolutePath());
+            args.add("--correction-method");
+            args.add(correctionMethod);
+            args.add("--blob-search-radius");
+            args.add(blobSearchRadius);
+            args.add("--blob-radius");
+            args.add(blobRadius);
+            args.add("--corridor-width");
+            args.add(corridorWidth);
+            args.add("--linear-interp-threshold");
+            args.add(String.valueOf(linearInterpThreshold));
+
+            List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
+            ProcessBuilder pb = new ProcessBuilder(command);
+            pb.redirectErrorStream(true);
+
+            Process proc = pb.start();
+            BufferedReader reader = new BufferedReader(new InputStreamReader(proc.getInputStream()));
+            String line;
+            StringBuilder output = new StringBuilder();
+            while ((line = reader.readLine()) != null) {
+                output.append(line).append("\n");
+                System.out.println("[BATCH_OPTIMIZE] " + line);
+            }
+
+            int exitCode = proc.waitFor();
+            if (exitCode != 0) {
+                throw new Exception("Batch track optimization failed: " + output);
+            }
+
+            String videoBaseName = new File(currentVideoPath).getName().replaceFirst("\\.[^.]+$", "");
+            File outputFile = new File(outputDir, videoBaseName + "_annotations.json");
+            if (!outputFile.exists()) {
+                throw new FileNotFoundException("Output file not found: " + outputFile.getAbsolutePath());
+            }
+
+            StringBuilder jsonContent = new StringBuilder();
+            try (BufferedReader br = new BufferedReader(new FileReader(outputFile))) {
+                while ((line = br.readLine()) != null) {
+                    jsonContent.append(line);
+                }
+            }
+
+            Map<String, Map<Integer, Point>> results = new HashMap<>();
+            JSONObject json = new JSONObject(jsonContent.toString());
+            JSONArray tracks = json.getJSONArray("tracks");
+
+            for (int i = 0; i < tracks.length(); i++) {
+                JSONObject trackObj = tracks.getJSONObject(i);
+                String trackId = trackObj.getString("track_id");
+                JSONArray framesArray = trackObj.getJSONArray("frames");
+
+                Map<Integer, Point> points = new HashMap<>();
+                for (int j = 0; j < framesArray.length(); j++) {
+                    JSONObject frameObj = framesArray.getJSONObject(j);
+                    int frame = frameObj.getInt("frame");
+                    int x = frameObj.getInt("x");
+                    int y = frameObj.getInt("y");
+                    points.put(frame, new Point(x, y));
+                }
+                results.put(trackId, points);
+            }
+
+            for (String trackId : trackIds) {
+                if (!results.containsKey(trackId)) {
+                    throw new Exception("Server response missing track: " + trackId);
+                }
+            }
+
+            return results;
+        } finally {
+            if (tempBundleFile.exists()) {
+                tempBundleFile.delete();
+            }
+        }
+    }
+
+    /**
+     * Run physics-informed global optimization on all incomplete tracks using completed tracks as constraints.
+     * Uses Delaunay triangulation mesh and IDW interpolation to correct optical flow drift.
+     */
+    private void runPhysicsInformedOptimization() {
+        // Count completed and incomplete tracks
+        List<String> completedTrackIds = new ArrayList<>();
+        List<String> incompleteTrackIds = new ArrayList<>();
+        
+        for (String trackId : trackAnnotations.keySet()) {
+            if (Boolean.TRUE.equals(trackCompleted.get(trackId))) {
+                completedTrackIds.add(trackId);
+            } else {
+                incompleteTrackIds.add(trackId);
+            }
+        }
+        
+        if (completedTrackIds.isEmpty()) {
+            JOptionPane.showMessageDialog(frame,
+                "No completed tracks found.\n\n" +
+                "Physics-informed optimization requires at least one\n" +
+                "completed track to use as a reference constraint.",
+                "No Reference Tracks",
+                JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        
+        if (incompleteTrackIds.isEmpty()) {
+            JOptionPane.showMessageDialog(frame,
+                "No incomplete tracks to optimize.\n\n" +
+                "All tracks are already marked as complete.",
+                "Nothing to Optimize",
+                JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        
+        // Show confirmation dialog
+        int choice = JOptionPane.showConfirmDialog(frame,
+            "Physics-Informed Global Optimization\n\n" +
+            "This will use " + completedTrackIds.size() + " completed track(s) as constraints\n" +
+            "to correct drift in " + incompleteTrackIds.size() + " incomplete track(s).\n\n" +
+            "The optimization uses Delaunay triangulation and inverse\n" +
+            "distance weighting to propagate corrections across frames.\n\n" +
+            "Proceed with optimization?",
+            "Run Physics Optimization",
+            JOptionPane.YES_NO_OPTION,
+            JOptionPane.QUESTION_MESSAGE);
+        
+        if (choice != JOptionPane.YES_OPTION) {
+            return;
+        }
+        
+        // Check server availability
+        if (blockIfServerBusy("Physics-informed optimization")) {
+            return;
+        }
+        
+        if (!serverAvailable && !isServerRunning()) {
+            JOptionPane.showMessageDialog(frame,
+                "The tracking engine is not running.\n\n" +
+                "Please start the tracking engine first.",
+                "Tracking Unavailable",
+                JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        
+        // Build track data for the request
+        JSONArray completedTracksArray = new JSONArray();
+        for (String trackId : completedTrackIds) {
+            JSONObject trackObj = new JSONObject();
+            trackObj.put("track_id", trackId);
+            JSONArray positionsArray = new JSONArray();
+            Map<Integer, Point> frameMap = trackAnnotations.get(trackId);
+            for (Map.Entry<Integer, Point> entry : frameMap.entrySet()) {
+                JSONObject posObj = new JSONObject();
+                posObj.put("frame", entry.getKey());
+                posObj.put("x", entry.getValue().x);
+                posObj.put("y", entry.getValue().y);
+                positionsArray.put(posObj);
+            }
+            trackObj.put("positions", positionsArray);
+            completedTracksArray.put(trackObj);
+        }
+        
+        JSONArray incompleteTracksArray = new JSONArray();
+        for (String trackId : incompleteTrackIds) {
+            JSONObject trackObj = new JSONObject();
+            trackObj.put("track_id", trackId);
+            JSONArray positionsArray = new JSONArray();
+            Map<Integer, Point> frameMap = trackAnnotations.get(trackId);
+            for (Map.Entry<Integer, Point> entry : frameMap.entrySet()) {
+                JSONObject posObj = new JSONObject();
+                posObj.put("frame", entry.getKey());
+                posObj.put("x", entry.getValue().x);
+                posObj.put("y", entry.getValue().y);
+                positionsArray.put(posObj);
+            }
+            trackObj.put("positions", positionsArray);
+            incompleteTracksArray.put(trackObj);
+        }
+        
+        setStatus("Running physics-informed optimization...");
+        
+        // Create progress dialog
+        final AtomicBoolean cancelled = new AtomicBoolean(false);
+        final JDialog progressDialog = new JDialog(frame, "Physics Optimization", true);
+        progressDialog.setUndecorated(true);
+        progressDialog.setDefaultCloseOperation(JDialog.DO_NOTHING_ON_CLOSE);
+        progressDialog.setLayout(new BorderLayout(10, 10));
+        
+        JPanel contentPanel = new JPanel(new BorderLayout(12, 12));
+        contentPanel.setBackground(PANEL_DARK);
+        contentPanel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(ACCENT_BLUE, 2),
+            BorderFactory.createEmptyBorder(24, 28, 24, 28)
+        ));
+        
+        JLabel titleLabel = new JLabel("🔬 Physics-Informed Optimization");
+        titleLabel.setFont(new Font("Segoe UI Semibold", Font.BOLD, 16));
+        titleLabel.setForeground(TEXT_PRIMARY);
+        titleLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        contentPanel.add(titleLabel, BorderLayout.NORTH);
+        
+        JLabel messageLabel = new JLabel("<html><center>" +
+            "<span style='color: #E8EAED;'>Optimizing tracks using mesh constraints...</span><br>" +
+            "<span style='color: #9AA0A6; font-size: 11px;'>Using " + completedTrackIds.size() + 
+            " reference track(s)</span></center></html>");
+        messageLabel.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        messageLabel.setForeground(TEXT_SECONDARY);
+        messageLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        contentPanel.add(messageLabel, BorderLayout.CENTER);
+        
+        final JLabel elapsedLabel = new JLabel("Elapsed: 0s");
+        elapsedLabel.setFont(new Font("Segoe UI", Font.BOLD, 14));
+        elapsedLabel.setForeground(ACCENT_BLUE);
+        elapsedLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        contentPanel.add(elapsedLabel, BorderLayout.SOUTH);
+        
+        progressDialog.add(contentPanel, BorderLayout.CENTER);
+        progressDialog.pack();
+        progressDialog.setSize(350, 150);
+        progressDialog.setLocationRelativeTo(frame);
+        
+        // Elapsed time timer
+        final long startTime = System.currentTimeMillis();
+        Timer elapsedTimer = new Timer(500, e -> {
+            long elapsed = (System.currentTimeMillis() - startTime) / 1000;
+            elapsedLabel.setText("Elapsed: " + elapsed + "s");
+        });
+        elapsedTimer.start();
+        
+        // Run in background
+        SwingWorker<JSONObject, Void> worker = new SwingWorker<JSONObject, Void>() {
+            @Override
+            protected JSONObject doInBackground() throws Exception {
+                String outputDir = getOutputDirectory();
+                String videoBaseName = new File(currentVideoPath).getName().replaceFirst("\\.[^.]+$", "");
+                
+                // Get physics optimization settings from config
+                // Optimal parameters from experimental validation:
+                // - correction_radius: 100px (interpolation radius)
+                // - blend_factor: 0.9 (90% GT motion, 10% optical flow)
+                // - idw_power: 2.0 (inverse square weighting)
+                double correctionRadius = Double.parseDouble(
+                    config.getProperty("physics.correction.radius", "100.0"));
+                double blendFactor = Double.parseDouble(
+                    config.getProperty("physics.blend.factor", "0.9"));
+                double idwPower = Double.parseDouble(
+                    config.getProperty("physics.idw.power", "2.0"));
+                
+                JSONObject req = new JSONObject();
+                req.put("command", "physics_optimize_global");
+                req.put("video_path", workingVideoPath);
+                req.put("output_path", outputDir);
+                req.put("video_name", videoBaseName);
+                req.put("completed_tracks", completedTracksArray);
+                req.put("incomplete_tracks", incompleteTracksArray);
+                req.put("correction_radius", correctionRadius);
+                req.put("blend_factor", blendFactor);
+                req.put("idw_power", idwPower);
+                
+                return sendTrackingServerRequest(req);
+            }
+            
+            @Override
+            protected void done() {
+                elapsedTimer.stop();
+                progressDialog.dispose();
+                
+                if (cancelled.get() || isCancelled()) {
+                    setStatus("Physics optimization cancelled");
+                    return;
+                }
+                
+                try {
+                    JSONObject resp = get();
+                    ensureOkResponse(resp);
+                    
+                    // Parse and apply the optimized tracks
+                    JSONArray optimizedTracks = resp.getJSONArray("optimized_tracks");
+                    int updatedCount = 0;
+                    
+                    saveState(); // For undo
+                    
+                    for (int i = 0; i < optimizedTracks.length(); i++) {
+                        JSONObject trackObj = optimizedTracks.getJSONObject(i);
+                        String trackId = trackObj.getString("track_id");
+                        JSONArray positions = trackObj.getJSONArray("positions");
+                        
+                        Map<Integer, Point> frameMap = trackAnnotations.get(trackId);
+                        if (frameMap != null) {
+                            for (int j = 0; j < positions.length(); j++) {
+                                JSONObject posObj = positions.getJSONObject(j);
+                                int frameNum = posObj.getInt("frame");
+                                int x = (int) Math.round(posObj.getDouble("x"));
+                                int y = (int) Math.round(posObj.getDouble("y"));
+                                frameMap.put(frameNum, new Point(x, y));
+                            }
+                            updatedCount++;
+                        }
+                    }
+                    
+                    // Get statistics from response if available
+                    double avgImprovement = resp.optDouble("avg_improvement", 0.0);
+                    
+                    refreshAnnotationList();
+                    imageLabel.repaint();
+                    
+                    String improvementStr = avgImprovement > 0 ? 
+                        String.format(" (avg correction: %.1fpx)", avgImprovement) : "";
+                    
+                    setStatus("Physics optimization complete: " + updatedCount + 
+                        " track(s) updated" + improvementStr);
+                    
+                    JOptionPane.showMessageDialog(frame,
+                        "Physics-Informed Optimization Complete\n\n" +
+                        "Updated " + updatedCount + " track(s) using " + 
+                        completedTrackIds.size() + " reference track(s)." +
+                        (avgImprovement > 0 ? 
+                            "\n\nAverage correction: " + String.format("%.1f", avgImprovement) + " pixels" : "") +
+                        "\n\nThe optimized tracks have been applied.\n" +
+                        "Use Edit > Undo to revert if needed.",
+                        "Optimization Complete",
+                        JOptionPane.INFORMATION_MESSAGE);
+                    
+                } catch (Exception ex) {
+                    setStatus("Physics optimization failed: " + ex.getMessage());
+                    JOptionPane.showMessageDialog(frame,
+                        "Physics optimization failed:\n\n" + ex.getMessage(),
+                        "Optimization Error",
+                        JOptionPane.ERROR_MESSAGE);
+                    ex.printStackTrace();
+                }
+            }
+        };
+        
+        worker.execute();
+        progressDialog.setVisible(true);
+    }
+
+    // NEW METHOD: Compute optical flow locally
+    private void computeOpticalFlowRemote() {
+        computeOpticalFlowRemote(false);
+    }
+    
+    private void computeOpticalFlowRemote(boolean forceRecompute) {
+        if (currentVideoPath == null || imp == null) {
+            JOptionPane.showMessageDialog(frame,
+                "No video loaded.",
+                "Error",
+                JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        
+        if (blockIfServerBusy("Recalculate optical flow")) {
+            return;
+        }
+        
+        // Check if server is available
+        if (!serverAvailable && !isServerRunning()) {
+            int choice = JOptionPane.showConfirmDialog(frame,
+                "The tracking engine is not running.\n\n" +
+                "Would you like to start it now?",
+                "Tracking Unavailable",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.QUESTION_MESSAGE);
+            if (choice == JOptionPane.YES_OPTION) {
+                restartServer();
+                // Return after starting - user needs to try again after server starts
+                return;
+            } else {
+                setStatus("Optical flow computation cancelled - tracking unavailable");
+                return;
+            }
+        }
+        
+        setStatus("Computing optical flow...");
+        
+        // Cancellation flag
+        final AtomicBoolean cancelled = new AtomicBoolean(false);
+        
+        // Create modal progress dialog with professional dark styling
+        final JDialog progressDialog = new JDialog(frame, "Computing Optical Flow", true);
+        progressDialog.setUndecorated(true);
+        progressDialog.setDefaultCloseOperation(JDialog.DO_NOTHING_ON_CLOSE);
+        progressDialog.setLayout(new BorderLayout(10, 10));
+        
+        JPanel contentPanel = new JPanel(new BorderLayout(12, 12));
+        contentPanel.setBackground(PANEL_DARK);
+        contentPanel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(ACCENT_BLUE, 2),
+            BorderFactory.createEmptyBorder(24, 28, 24, 28)
+        ));
+        
+        JLabel titleLabel = new JLabel("⚡ Computing Optical Flow");
+        titleLabel.setFont(new Font("Segoe UI Semibold", Font.BOLD, 16));
+        titleLabel.setForeground(TEXT_PRIMARY);
+        titleLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        contentPanel.add(titleLabel, BorderLayout.NORTH);
+        
+        JLabel messageLabel = new JLabel("<html><center>Computing optical flow...<br><span style='color: #9AA0A6; font-size: 11px;'>This may take a few minutes</span></center></html>");
+        messageLabel.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        messageLabel.setForeground(TEXT_SECONDARY);
+        messageLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        contentPanel.add(messageLabel, BorderLayout.CENTER);
+        
+        // Bottom panel with elapsed time and cancel button
+        JPanel bottomPanel = new JPanel(new BorderLayout(10, 5));
+        bottomPanel.setBackground(PANEL_DARK);
+        
+        final JLabel elapsedLabel = new JLabel("Elapsed: 0s");
+        elapsedLabel.setFont(new Font("Segoe UI", Font.BOLD, 14));
+        elapsedLabel.setForeground(ACCENT_BLUE);
+        elapsedLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        bottomPanel.add(elapsedLabel, BorderLayout.CENTER);
+        
+        JButton cancelButton = new JButton("Cancel");
+        cancelButton.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        cancelButton.setBackground(new Color(120, 40, 40));
+        cancelButton.setForeground(TEXT_PRIMARY);
+        cancelButton.setFocusPainted(false);
+        cancelButton.setBorder(BorderFactory.createEmptyBorder(8, 20, 8, 20));
+        cancelButton.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        JPanel cancelPanel = new JPanel(new FlowLayout(FlowLayout.CENTER));
+        cancelPanel.setBackground(PANEL_DARK);
+        cancelPanel.add(cancelButton);
+        bottomPanel.add(cancelPanel, BorderLayout.SOUTH);
+        
+        contentPanel.add(bottomPanel, BorderLayout.SOUTH);
+        
+        progressDialog.add(contentPanel);
+        progressDialog.setSize(500, 240);
+        progressDialog.setLocationRelativeTo(frame);
+        
+        // Timer to update elapsed time
+        final long startTime = System.currentTimeMillis();
+        final Timer elapsedTimer = new Timer(1000, e -> {
+            long elapsed = (System.currentTimeMillis() - startTime) / 1000;
+            elapsedLabel.setText(String.format("Elapsed: %ds", elapsed));
+        });
+        elapsedTimer.start();
+        
+        // Reference to worker for cancellation
+        final SwingWorker<Boolean, Void>[] workerRef = new SwingWorker[1];
+        
+        cancelButton.addActionListener(e -> {
+            cancelled.set(true);
+            beginCancellationAndWait(
+                "Optical flow computation",
+                null,
+                workerRef[0],
+                elapsedTimer,
+                progressDialog
+            );
+            setStatus("Optical flow computation cancelled");
+        });
+        
+        SwingWorker<Boolean, Void> worker = new SwingWorker<Boolean, Void>() {
+            
+            @Override
+            protected Boolean doInBackground() throws Exception {
+                File scriptFile = getTrackingScript();
+                if (!scriptFile.exists()) {
+                    throw new FileNotFoundException("Tracking script not found: " + scriptFile.getAbsolutePath());
+                }
+                
+                String pythonScript = config.getProperty("local.python.script", "");
+                String workDir = config.getProperty("local.work.dir", "/tmp/tracking_temp");
+                String condaEnv = config.getProperty("local.conda.env", "ripple-env");
+                String modelSize = config.getProperty("raft.model.size", "large");
+                String timeout = config.getProperty("local.timeout", "300");
+                String outputDir = getOutputDirectory();
+                
+                // Flow method and locotrack settings (TrackMate-style DoG parameters)
+                String flowMethod = config.getProperty("flow.method", getDefaultFlowMethod());
+                
+                // Clear previous flow cache and GPU models before computing new flow
+                // This ensures we don't have stale data from a different method
+                clearMemoryBeforeSwitch();
+                
+                // Clear flow visualization on EDT since we're recalculating
+                SwingUtilities.invokeLater(() -> clearFlowVisualizationAndSwitchToVideo());
+                
+                String locotrackDogRadius = config.getProperty("locotrack.dog.radius", "2.5");
+                String locotrackDogThreshold = config.getProperty("locotrack.dog.threshold", "0.0");
+                String locotrackMedianFilter = config.getProperty("locotrack.dog.median.filter", "false");
+                String locotrackSubpixel = config.getProperty("locotrack.dog.subpixel", "true");
+                String locotrackOcclusionThreshold = config.getProperty("locotrack.occlusion.threshold", "0.5");
+                String locotrackWeight = config.getProperty("locotrack.weight", "0.5");
+                String locotrackFlowSmoothing = config.getProperty("locotrack.flow.smoothing", "15.0");
+                String locotrackTemporalSmooth = config.getProperty("locotrack.temporal.smooth", "0.1");
+                String locotrackKernel = config.getProperty("locotrack.kernel", "gaussian_rbf");
+                
+                // Trackpy settings (native trackpy detection)
+                String trackpyDiameter = config.getProperty("trackpy.diameter", "11");
+                String trackpyMinmass = config.getProperty("trackpy.minmass", "0");
+                String trackpySearchRange = config.getProperty("trackpy.search.range", "15");
+                String trackpyMemory = config.getProperty("trackpy.memory", "5");
+                String trackpyRequirePersistent = config.getProperty("trackpy.require.persistent", "false");
+                String trackpySmoothFactor = config.getProperty("trackpy.smooth.factor", "0.1");
+                String trackpyFlowSmoothing = config.getProperty("trackpy.flow.smoothing", "15");
+                String trackpyKernel = config.getProperty("trackpy.kernel", "gaussian_rbf");
+                
+                // DIS settings
+                String disDownsampleFactor = config.getProperty("dis.downsample.factor", "2");
+                
+                // Call bash script WITHOUT seed coordinates to compute optical flow only
+                // Use original video name for output file naming (important for compressed videos)
+                String videoBaseName = new File(currentVideoPath).getName().replaceFirst("\\.[^.]+$", "");
+                
+                List<String> args = new ArrayList<>();
+                args.add("compute_flow");
+                args.add("--tiff");
+                args.add(workingVideoPath);
+                args.add("--output-dir");
+                args.add(outputDir);
+                args.add("--video-name");
+                args.add(videoBaseName);
+                args.add("--python-script");
+                args.add(pythonScript);
+                args.add("--work-dir");
+                args.add(workDir);
+                args.add("--conda-env");
+                args.add(condaEnv);
+                args.add("--timeout");
+                args.add(timeout);
+                args.add("--model");
+                args.add(modelSize);
+                args.add("--flow-method");
+                args.add(flowMethod);
+                args.add("--locotrack-dog-radius");
+                args.add(locotrackDogRadius);
+                args.add("--locotrack-dog-threshold");
+                args.add(locotrackDogThreshold);
+                args.add("--locotrack-median-filter");
+                args.add(locotrackMedianFilter);
+                args.add("--locotrack-subpixel");
+                args.add(locotrackSubpixel);
+                args.add("--locotrack-occlusion-threshold");
+                args.add(locotrackOcclusionThreshold);
+                args.add("--locotrack-weight");
+                args.add(locotrackWeight);
+                args.add("--locotrack-flow-smoothing");
+                args.add(locotrackFlowSmoothing);
+                args.add("--locotrack-temporal-smooth");
+                args.add(locotrackTemporalSmooth);
+                args.add("--locotrack-kernel");
+                args.add(locotrackKernel);
+                // Use current frame for LocoTrack seed detection (0-indexed)
+                args.add("--locotrack-seed-frame");
+                args.add(String.valueOf(currentSlice - 1));
+                // Trackpy parameters (native trackpy detection)
+                args.add("--trackpy-diameter");
+                args.add(trackpyDiameter);
+                args.add("--trackpy-minmass");
+                args.add(trackpyMinmass);
+                args.add("--trackpy-search-range");
+                args.add(trackpySearchRange);
+                args.add("--trackpy-memory");
+                args.add(trackpyMemory);
+                args.add("--trackpy-require-persistent");
+                args.add(trackpyRequirePersistent);
+                args.add("--trackpy-smooth-factor");
+                args.add(trackpySmoothFactor);
+                args.add("--trackpy-flow-smoothing");
+                args.add(trackpyFlowSmoothing);
+                args.add("--trackpy-kernel");
+                args.add(trackpyKernel);
+                // DIS parameters
+                args.add("--dis-downsample-factor");
+                args.add(disDownsampleFactor);
+                // Incremental allocation for low-memory systems (applies to all flow methods)
+                String flowIncrementalAlloc = config.getProperty("flow.incremental.allocation", "auto");
+                args.add("--flow-incremental-allocation");
+                args.add(flowIncrementalAlloc);
+                // Pass working resolution for proper cache filtering when video is compressed
+                args.add("--working-width");
+                args.add(String.valueOf(imp.getWidth()));
+                args.add("--working-height");
+                args.add(String.valueOf(imp.getHeight()));
+                // Cache flow to disk setting (keep consistent with Load Existing)
+                args.add("--save-to-disk");
+                args.add(config.getProperty("cache.flow.to.disk", "false"));
+                // Force recompute flag
+                args.add("--force-recompute");
+                args.add(String.valueOf(forceRecompute));
+                
+                List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
+                ProcessBuilder pb = new ProcessBuilder(command);
+                pb.redirectErrorStream(true);
+                Process process = pb.start();
+                
+                // Capture output for error detection (especially GPU_OOM)
+                StringBuilder outputBuilder = new StringBuilder();
+                BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    System.out.println("[Flow] " + line);
+                    outputBuilder.append(line).append("\n");
+                }
+                
+                int exitCode = process.waitFor();
+                if (exitCode != 0) {
+                    String output = outputBuilder.toString();
+                    // If the tracking server returned a structured JSON error (from send_command.py),
+                    // try to extract a user-friendly message (especially for "Server busy").
+                    String serverMsg = null;
+                    boolean serverBusy = false;
+                    try {
+                        // send_command.py prints pretty JSON; look for a line containing "\"message\":"
+                        for (String outLine : output.split("\\R")) {
+                            String trimmed = outLine.trim();
+                            if (trimmed.startsWith("\"busy\"") && trimmed.contains(":") && trimmed.contains("true")) {
+                                serverBusy = true;
+                            }
+                            if (trimmed.startsWith("\"message\"") && trimmed.contains(":")) {
+                                int firstQuote = trimmed.indexOf('"', trimmed.indexOf(':'));
+                                int lastQuote = trimmed.lastIndexOf('"');
+                                if (firstQuote >= 0 && lastQuote > firstQuote) {
+                                    serverMsg = trimmed.substring(firstQuote + 1, lastQuote);
+                                }
+                            }
+                        }
+                    } catch (Exception ignore) {
+                        // Fall back to generic handling below
+                    }
+
+                    // Check for GPU OOM error in output
+                    if (output.contains("GPU_OOM")) {
+                        // Extract the GPU_OOM message for the exception
+                        int oomIdx = output.indexOf("GPU_OOM:");
+                        if (oomIdx >= 0) {
+                            int endIdx = output.indexOf("\n", oomIdx);
+                            String oomMsg = endIdx > oomIdx ? 
+                                output.substring(oomIdx, endIdx) : 
+                                output.substring(oomIdx);
+                            throw new IOException(oomMsg);
+                        }
+                    }
+
+                    if (serverBusy) {
+                        throw new IOException(serverMsg != null && !serverMsg.isBlank()
+                            ? serverMsg
+                            : "Tracking engine is busy - another operation is in progress. Cancel it first or wait.");
+                    }
+
+                    if (serverMsg != null && !serverMsg.isBlank()) {
+                        throw new IOException(serverMsg);
+                    }
+
+                    throw new IOException("Local optical flow computation failed with exit code " + exitCode);
+                }
+                
+                return true;
+            }
+            
+            @Override
+            protected void done() {
+                serverOperationInProgress = false;  // Operation complete
+                serverCancellationInProgress = false;
+                elapsedTimer.stop();
+                progressDialog.dispose(); // Close the progress dialog
+                
+                // If cancelled, don't process results
+                if (cancelled.get() || isCancelled()) {
+                    return;
+                }
+                
+                try {
+                    Boolean success = get();
+                    if (success) {
+                        opticalFlowComputed = true;
+                        setStatus("Optical flow computed successfully");
+                        
+                        // Enable flow visualization button
+                        Component[] components = frame.getContentPane().getComponents();
+                        for (Component comp : components) {
+                            if (comp instanceof JPanel) {
+                                enableFlowVizButton((JPanel) comp);
+                            }
+                        }
+                        
+                        JOptionPane.showMessageDialog(frame,
+                            "Optical flow computed successfully!\n" +
+                            "The flow has been cached for reuse.\n" +
+                            "You can now create tracks by clicking on any frame.\n\n" +
+                            "Click 'Flow Viz' to view the motion field visualization.",
+                            "Success",
+                            JOptionPane.INFORMATION_MESSAGE);
+                    }
+                } catch (Exception ex) {
+                    if (cancelled.get() || isCancelled()) {
+                        return;
+                    }
+                    elapsedTimer.stop();
+                    
+                    String errorMsg = ex.getMessage();
+                    
+                    // Check if this is a GPU Out-of-Memory error
+                    if (errorMsg != null && errorMsg.contains("GPU_OOM")) {
+                        // Extract the helpful message after "GPU_OOM: "
+                        String oomMessage = errorMsg;
+                        int oomIdx = errorMsg.indexOf("GPU_OOM: ");
+                        if (oomIdx >= 0) {
+                            oomMessage = errorMsg.substring(oomIdx + 9);
+                        }
+                        
+                        setStatus("GPU memory insufficient - choose an option below");
+                        
+                        // First, clear GPU memory via server
+                        clearServerFlowCache();
+                        
+                        // Show error with options: Compress or Switch Method
+                        int choice = JOptionPane.showOptionDialog(frame,
+                            "GPU Out of Memory Error\n\n" +
+                            oomMessage + "\n\n" +
+                            "Choose how to proceed:",
+                            "GPU Memory Error",
+                            JOptionPane.DEFAULT_OPTION,
+                            JOptionPane.WARNING_MESSAGE,
+                            null,
+                            new String[]{"Compress Video", "Switch Method"},
+                            "Compress Video");
+                        
+                        if (choice == 0) {
+                            // User wants to compress - show compression dialog for current video
+                            handleOomCompressVideo();
+                        }
+                        // choice == 1 or closed: user will manually switch method
+                    } else {
+                        // Generic error handling
+                        setStatus("Optical flow computation failed: " + errorMsg);
+                        JOptionPane.showMessageDialog(frame,
+                            "Failed to compute optical flow:\n" + errorMsg +
+                            "\n\nPlease check:\n" +
+                            "1. Bash script is accessible and executable\n" +
+                            "2. Conda environment is properly configured\n" +
+                            "3. Configuration settings (Options > Edit Configuration)",
+                            "Error",
+                            JOptionPane.ERROR_MESSAGE);
+                    }
+                    ex.printStackTrace();
+                }
+            }
+        };
+        
+        workerRef[0] = worker;
+        serverCancellationInProgress = false;
+        serverOperationInProgress = true;  // Mark operation as in progress
+        worker.execute();
+        progressDialog.setVisible(true); // Show modal dialog (blocks until worker calls dispose)
+    }
+    
+    /**
+     * Handle GPU OOM by showing compression dialog for the current video.
+     * Skips the file explorer - goes directly to compression dialog.
+     */
+    private void handleOomCompressVideo() {
+        if (currentVideoPath == null) {
+            JOptionPane.showMessageDialog(frame,
+                "No video path available for compression.",
+                "Error",
+                JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        
+        // Get current video dimensions
+        int origWidth = imp != null ? imp.getWidth() : 0;
+        int origHeight = imp != null ? imp.getHeight() : 0;
+        
+        if (origWidth == 0 || origHeight == 0) {
+            // Try to get dimensions from file
+            int[] dims = getVideoDimensionsLightweight(currentVideoPath);
+            if (dims != null) {
+                origWidth = dims[0];
+                origHeight = dims[1];
+            }
+        }
+        
+        if (origWidth == 0 || origHeight == 0) {
+            JOptionPane.showMessageDialog(frame,
+                "Could not determine video dimensions.",
+                "Error",
+                JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        
+        // Show compression dialog
+        int[] targetRes = showCompressionDialog(origWidth, origHeight);
+        
+        if (targetRes == null) {
+            // User cancelled
+            setStatus("Compression cancelled.");
+            return;
+        }
+        
+        if (targetRes[0] <= 0 || targetRes[1] <= 0) {
+            // User chose no compression - warn them
+            JOptionPane.showMessageDialog(frame,
+                "You chose not to compress the video.\n" +
+                "The same GPU memory error will occur.\n\n" +
+                "Please either compress the video or use DIS (CPU) method.",
+                "Warning",
+                JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        
+        // Load video at new resolution
+        setStatus("Reloading video at compressed resolution...");
+        ImagePlus newImp = loadWithOptionalResize(currentVideoPath, targetRes[0], targetRes[1]);
+        
+        if (newImp == null) {
+            JOptionPane.showMessageDialog(frame,
+                "Failed to load compressed video.",
+                "Error",
+                JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        
+        // Update the current image
+        imp = newImp;
+        totalSlices = imp.getStackSize();
+        
+        // Save compressed video to temp file for backend
+        workingVideoPath = saveCompressedVideoToTemp(imp, currentVideoPath);
+        if (workingVideoPath == null) {
+            workingVideoPath = currentVideoPath;
+            setStatus("Warning: Could not save compressed video");
+        }
+        
+        // Update scale factors
+        int[] origDims = getVideoDimensionsLightweight(currentVideoPath);
+        if (origDims != null) {
+            scaleFactorX = (double) origDims[0] / targetRes[0];
+            scaleFactorY = (double) origDims[1] / targetRes[1];
+            isAviDownsampled = true;
+        }
+        
+        // Reload the display
+        loadSliceImage();
+        pageLabel.setText(String.format("Frame: %d / %d", currentSlice, totalSlices));
+        
+        // Recenter the image on screen
+        SwingUtilities.invokeLater(() -> {
+            JScrollPane scrollPane = (JScrollPane) imageLabel.getParent().getParent();
+            fitImageToPanel(scrollPane);
+        });
+        
+        setStatus(String.format("Video reloaded at %dx%d. Computing optical flow...", 
+            targetRes[0], targetRes[1]));
+        
+        // Now re-run optical flow computation with the compressed video
+        SwingUtilities.invokeLater(() -> computeOpticalFlowRemote(true));
+    }
+
+    // NEW METHOD: Load a specific cached flow file (preferred), or auto-select best match.
+    private void loadExistingOpticalFlow(File preferredFlowFile) {
+        if (currentVideoPath == null || imp == null) {
+            JOptionPane.showMessageDialog(frame,
+                "No video loaded.",
+                "Error",
+                JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        
+        if (blockIfServerBusy("Load existing optical flow")) {
+            return;
+        }
+        
+        // Check if server is running first
+        boolean serverRunning = isServerRunning();
+
+        // CRITICAL: Clear flow visualization FIRST before any other operations
+        // This frees memory and switches user back to video view immediately
+        clearFlowVisualizationAndSwitchToVideo();
+        
+        // Clear previous flow cache and GPU models before loading new flow
+        // This frees both RAM (flow arrays) and VRAM (GPU models)
+        clearMemoryBeforeSwitch();
+        
+        setStatus(serverRunning ? "Loading optical flow from cache..." : "Initializing and loading optical flow...");
+        
+        // Cancellation flag
+        final AtomicBoolean cancelled = new AtomicBoolean(false);
+        
+        // Create modal progress dialog with professional dark styling
+        final JDialog progressDialog = new JDialog(frame, "Loading Optical Flow", true);
+        progressDialog.setUndecorated(true);
+        progressDialog.setDefaultCloseOperation(JDialog.DO_NOTHING_ON_CLOSE);
+        progressDialog.setLayout(new BorderLayout(10, 10));
+        
+        JPanel contentPanel = new JPanel(new BorderLayout(12, 12));
+        contentPanel.setBackground(PANEL_DARK);
+        contentPanel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(ACCENT_BLUE, 2),
+            BorderFactory.createEmptyBorder(24, 28, 24, 28)
+        ));
+        
+        JLabel titleLabel = new JLabel("📂 Loading Optical Flow");
+        titleLabel.setFont(new Font("Segoe UI Semibold", Font.BOLD, 16));
+        titleLabel.setForeground(TEXT_PRIMARY);
+        titleLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        contentPanel.add(titleLabel, BorderLayout.NORTH);
+        
+        final JLabel messageLabel = new JLabel(
+            serverRunning ? 
+            "<html><center><span style='color: #E8EAED;'>Loading cached optical flow...</span></center></html>" :
+            "<html><center><span style='color: #E8EAED;'>Initializing tracking engine...</span><br><span style='color: #9AA0A6; font-size: 11px;'>This may take a few seconds</span></center></html>"
+        );
+        messageLabel.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        messageLabel.setForeground(TEXT_SECONDARY);
+        messageLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        contentPanel.add(messageLabel, BorderLayout.CENTER);
+        
+        // Bottom panel with elapsed time and cancel button
+        JPanel bottomPanel = new JPanel(new BorderLayout(10, 5));
+        bottomPanel.setBackground(PANEL_DARK);
+        
+        final JLabel elapsedLabel = new JLabel("Elapsed: 0s");
+        elapsedLabel.setFont(new Font("Segoe UI", Font.BOLD, 14));
+        elapsedLabel.setForeground(ACCENT_BLUE);
+        elapsedLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        bottomPanel.add(elapsedLabel, BorderLayout.CENTER);
+        
+        JButton cancelButton = new JButton("Cancel");
+        cancelButton.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        cancelButton.setBackground(new Color(120, 40, 40));
+        cancelButton.setForeground(TEXT_PRIMARY);
+        cancelButton.setFocusPainted(false);
+        cancelButton.setBorder(BorderFactory.createEmptyBorder(8, 20, 8, 20));
+        cancelButton.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        JPanel cancelPanel = new JPanel(new FlowLayout(FlowLayout.CENTER));
+        cancelPanel.setBackground(PANEL_DARK);
+        cancelPanel.add(cancelButton);
+        bottomPanel.add(cancelPanel, BorderLayout.SOUTH);
+        
+        contentPanel.add(bottomPanel, BorderLayout.SOUTH);
+        
+        progressDialog.add(contentPanel);
+        progressDialog.setSize(480, 230);
+        progressDialog.setLocationRelativeTo(frame);
+        
+        // Timer to update elapsed time
+        final long startTime = System.currentTimeMillis();
+        final Timer elapsedTimer = new Timer(1000, e -> {
+            long elapsed = (System.currentTimeMillis() - startTime) / 1000;
+            elapsedLabel.setText(String.format("Elapsed: %ds", elapsed));
+        });
+        elapsedTimer.start();
+        
+        // Get flow method for correct logging
+        final String flowMethod = config.getProperty("flow.method", getDefaultFlowMethod());
+        final String flowMethodUpper = flowMethod.toUpperCase();
+
+        // Choose which cached flow file to load from disk.
+        // IMPORTANT: this avoids recomputation and avoids expensive cache-file pattern searches.
+        final File selectedFlowFile;
+        {
+            java.util.List<File> allCachedFiles = findCachedFlowFiles(currentVideoPath, flowMethod);
+            java.util.List<File> compatibleFiles = filterFlowFilesByResolution(allCachedFiles);
+
+            File chosen = null;
+            if (preferredFlowFile != null) {
+                // Only accept preferred file if it's compatible with the current working resolution.
+                if (flowFileMatchesWorkingResolution(preferredFlowFile)) {
+                    chosen = preferredFlowFile;
+                }
+            }
+
+            if (chosen == null) {
+                for (File f : compatibleFiles) {
+                    if (flowFileMatchesCurrentSettings(f, flowMethod)) {
+                        chosen = f;
+                        break;
+                    }
+                }
+            }
+
+            if (chosen == null && !compatibleFiles.isEmpty()) {
+                chosen = compatibleFiles.get(0); // Newest compatible
+            }
+
+            selectedFlowFile = chosen;
+        }
+
+        if (selectedFlowFile == null) {
+            setStatus("No cached optical flow found; please compute it first");
+            JOptionPane.showMessageDialog(frame,
+                "No compatible cached optical flow file was found for the current video/method/resolution.\n\n" +
+                "Compute optical flow first (Recalculate).",
+                "No Cache Found",
+                JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        
+        // Reference to worker for cancellation
+        final SwingWorker<Boolean, Void>[] workerRef = new SwingWorker[1];
+        
+        cancelButton.addActionListener(e -> {
+            cancelled.set(true);
+            beginCancellationAndWait(
+                "Optical flow loading",
+                null,
+                workerRef[0],
+                elapsedTimer,
+                progressDialog
+            );
+            setStatus("Optical flow loading cancelled");
+        });
+        
+        SwingWorker<Boolean, Void> worker = new SwingWorker<Boolean, Void>() {
+            private boolean serverWasStarted = false;
+            
+            @Override
+            protected Boolean doInBackground() throws Exception {
+                File scriptFile = getTrackingScript();
+                if (!scriptFile.exists()) {
+                    throw new FileNotFoundException("Tracking script not found: " + scriptFile.getAbsolutePath());
+                }
+
+                String outputDir = getOutputDirectory();
+                
+                // Get original video name (not temp compressed file name) for output naming
+                String videoBaseName = new File(currentVideoPath).getName().replaceFirst("\\.[^.]+$", "");
+
+                // Call script to LOAD cached optical flow file into the server (fast; no recompute)
+                List<String> args = new ArrayList<>();
+                args.add("load_flow");
+                args.add("--tiff");
+                args.add(workingVideoPath);
+                args.add("--flow-path");
+                args.add(selectedFlowFile.getAbsolutePath());
+                args.add("--flow-method");
+                args.add(flowMethod);
+                // (Optional context for logs / future-proofing)
+                args.add("--output-dir");
+                args.add(outputDir);
+                args.add("--video-name");
+                args.add(videoBaseName);
+                
+                List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
+                ProcessBuilder pb = new ProcessBuilder(command);
+                pb.redirectErrorStream(true);
+                Process process = pb.start();
+
+                StringBuilder outputBuilder = new StringBuilder();
+                
+                BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    System.out.println("[" + flowMethodUpper + "] " + line);
+                    outputBuilder.append(line).append("\n");
+                    
+                    // Detect when server starts vs when flow is being loaded
+                    if (line.contains("Starting persistent tracking server") || 
+                        line.contains("Server not running")) {
+                        serverWasStarted = true;
+                    }
+                }
+                
+                int exitCode = process.waitFor();
+                if (exitCode != 0) {
+                    String output = outputBuilder.toString();
+                    String serverMsg = null;
+                    try {
+                        for (String outLine : output.split("\\R")) {
+                            String trimmed = outLine.trim();
+                            if (trimmed.startsWith("\"message\"") && trimmed.contains(":")) {
+                                int firstQuote = trimmed.indexOf('"', trimmed.indexOf(':'));
+                                int lastQuote = trimmed.lastIndexOf('"');
+                                if (firstQuote >= 0 && lastQuote > firstQuote) {
+                                    serverMsg = trimmed.substring(firstQuote + 1, lastQuote);
+                                }
+                            }
+                        }
+                    } catch (Exception ignore) {
+                    }
+                    throw new IOException(serverMsg != null && !serverMsg.isBlank()
+                        ? serverMsg
+                        : "Failed to load optical flow with exit code " + exitCode);
+                }
+                
+                return true;
+            }
+            
+            @Override
+            protected void done() {
+                serverOperationInProgress = false;
+                serverCancellationInProgress = false;
+                elapsedTimer.stop();
+                progressDialog.dispose();
+                
+                // If cancelled, don't process results
+                if (cancelled.get() || isCancelled()) {
+                    return;
+                }
+                
+                try {
+                    Boolean success = get();
+                    if (success) {
+                        opticalFlowComputed = true;
+                        setStatus("Optical flow loaded from cache (" + flowMethod + ")");
+                        
+                        // Enable flow visualization button
+                        Component[] components = frame.getContentPane().getComponents();
+                        for (Component comp : components) {
+                            if (comp instanceof JPanel) {
+                                enableFlowVizButton((JPanel) comp);
+                            }
+                        }
+                        
+                        String message = serverWasStarted ?
+                            "Application initialized and optical flow loaded successfully (" + flowMethod + ")!\n" +
+                            "You can now create tracks by clicking on any frame.\n\n" +
+                            "Click 'Flow Viz' to view the motion field visualization." :
+                            "Optical flow loaded successfully from cache (" + flowMethod + ")!\n" +
+                            "You can now create tracks by clicking on any frame.\n\n" +
+                            "Click 'Flow Viz' to view the motion field visualization.";
+                        
+                        JOptionPane.showMessageDialog(frame,
+                            message,
+                            "Success",
+                            JOptionPane.INFORMATION_MESSAGE);
+                    }
+                } catch (Exception ex) {
+                    if (cancelled.get() || isCancelled()) {
+                        return;
+                    }
+                    elapsedTimer.stop();
+                    setStatus("Failed to load optical flow: " + ex.getMessage());
+                    JOptionPane.showMessageDialog(frame,
+                        "Failed to load optical flow:\n" + ex.getMessage() +
+                        "\n\nThe cached file may be corrupted. Try recalculating.",
+                        "Error",
+                        JOptionPane.ERROR_MESSAGE);
+                }
+            }
+        };
+        
+        workerRef[0] = worker;
+        serverCancellationInProgress = false;
+        serverOperationInProgress = true;
+        worker.execute();
+        progressDialog.setVisible(true);
+    }
+
+    // Propagate track bidirectionally from seed point at specified frame
+    private void propagateTrackRemote(String trackId, int seedX, int seedY, int seedFrame) {
+        if (currentVideoPath == null || imp == null) {
+            JOptionPane.showMessageDialog(frame,
+                "No video loaded.",
+                "Error",
+                JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        
+        if (blockIfServerBusy("Propagate track")) {
+            return;
+        }
+        
+        // Check if server is available
+        if (!serverAvailable && !isServerRunning()) {
+            int choice = JOptionPane.showConfirmDialog(frame,
+                "The tracking engine is not running.\n\n" +
+                "Would you like to start it now?",
+                "Tracking Unavailable",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.QUESTION_MESSAGE);
+            if (choice == JOptionPane.YES_OPTION) {
+                restartServer();
+                // Return after starting - user needs to try again after server starts
+                return;
+            } else {
+                setStatus("Track propagation cancelled - tracking unavailable");
+                return;
+            }
+        }
+        
+        setStatus("Propagating track bidirectionally from frame " + (seedFrame + 1) + "...");
+        
+        // Cancellation flag
+        final AtomicBoolean cancelled = new AtomicBoolean(false);
+        
+        // Create modal progress dialog with professional dark styling
+        final JDialog progressDialog = new JDialog(frame, "Propagating Track", true);
+        progressDialog.setUndecorated(true);
+        progressDialog.setDefaultCloseOperation(JDialog.DO_NOTHING_ON_CLOSE);
+        progressDialog.setLayout(new BorderLayout(10, 10));
+        
+        JPanel contentPanel = new JPanel(new BorderLayout(12, 12));
+        contentPanel.setBackground(PANEL_DARK);
+        contentPanel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(ACCENT_BLUE, 2),
+            BorderFactory.createEmptyBorder(24, 28, 24, 28)
+        ));
+        
+        JLabel titleLabel = new JLabel("\u27a1 Propagating Track Bidirectionally");
+        titleLabel.setFont(new Font("Segoe UI Semibold", Font.BOLD, 16));
+        titleLabel.setForeground(TEXT_PRIMARY);
+        titleLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        contentPanel.add(titleLabel, BorderLayout.NORTH);
+        
+        JLabel messageLabel = new JLabel("<html><center><span style='color: #E8EAED;'>Propagating track forward and backward from Frame " + (seedFrame + 1) + "...</span></center></html>");
+        messageLabel.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        messageLabel.setForeground(TEXT_SECONDARY);
+        messageLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        contentPanel.add(messageLabel, BorderLayout.CENTER);
+        
+        // Bottom panel with elapsed time and cancel button
+        JPanel bottomPanel = new JPanel(new BorderLayout(10, 5));
+        bottomPanel.setBackground(PANEL_DARK);
+        
+        final JLabel elapsedLabel = new JLabel("Elapsed: 0s");
+        elapsedLabel.setFont(new Font("Segoe UI", Font.BOLD, 14));
+        elapsedLabel.setForeground(ACCENT_BLUE);
+        elapsedLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        bottomPanel.add(elapsedLabel, BorderLayout.CENTER);
+        
+        JButton cancelButton = new JButton("Cancel");
+        cancelButton.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        cancelButton.setBackground(new Color(120, 40, 40));
+        cancelButton.setForeground(TEXT_PRIMARY);
+        cancelButton.setFocusPainted(false);
+        cancelButton.setBorder(BorderFactory.createEmptyBorder(8, 20, 8, 20));
+        cancelButton.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        JPanel cancelPanel = new JPanel(new FlowLayout(FlowLayout.CENTER));
+        cancelPanel.setBackground(PANEL_DARK);
+        cancelPanel.add(cancelButton);
+        bottomPanel.add(cancelPanel, BorderLayout.SOUTH);
+        
+        contentPanel.add(bottomPanel, BorderLayout.SOUTH);
+        
+        progressDialog.add(contentPanel);
+        progressDialog.setSize(480, 220);
+        progressDialog.setLocationRelativeTo(frame);
+        
+        // Timer to update elapsed time
+        final long startTime = System.currentTimeMillis();
+        final Timer elapsedTimer = new Timer(1000, e -> {
+            long elapsed = (System.currentTimeMillis() - startTime) / 1000;
+            elapsedLabel.setText(String.format("Elapsed: %ds", elapsed));
+        });
+        elapsedTimer.start();
+        
+        // Reference to worker for cancellation
+        final SwingWorker<Map<Integer, Point>, Void>[] workerRef = new SwingWorker[1];
+        
+        cancelButton.addActionListener(e -> {
+            cancelled.set(true);
+            beginCancellationAndWait(
+                "Track propagation",
+                () -> {
+                    // Undo the entire operation (restores track state including anchors)
+                    // This properly reverts the anchor added in handleTrackInitialization
+                    undo();
+                },
+                workerRef[0],
+                elapsedTimer,
+                progressDialog
+            );
+            setStatus("Track propagation cancelled");
+        });
+        
+        final int finalSeedFrame = seedFrame;
+        SwingWorker<Map<Integer, Point>, Void> worker = new SwingWorker<Map<Integer, Point>, Void>() {
+            @Override
+            protected Map<Integer, Point> doInBackground() throws Exception {
+                String outputDir = getOutputDirectory();
+                String videoBaseName = new File(currentVideoPath).getName().replaceFirst("\\.[^.]+$", "");
+
+                // Fast path: direct IPC (Linux/macOS). Avoids process+conda overhead per step.
+                if (canUseDirectTrackingIpc()) {
+                    JSONObject req = new JSONObject();
+                    req.put("command", "propagate_track");
+                    req.put("video_path", workingVideoPath);
+                    req.put("output_path", outputDir);
+                    req.put("video_name", videoBaseName);
+                    req.put("seed_x", seedX);
+                    req.put("seed_y", seedY);
+                    req.put("seed_frame", finalSeedFrame);
+                    // Blob detection settings for DIS
+                    req.put("use_blob_detection", Boolean.parseBoolean(config.getProperty("dis.use.blob.detection", "false")));
+                    req.put("blob_search_radius", Integer.parseInt(config.getProperty("dis.blob.search.radius", "15")));
+                    req.put("blob_radius", Double.parseDouble(config.getProperty("dis.blob.radius", "5.0")));
+                    req.put("cache_video", Boolean.parseBoolean(config.getProperty("dis.cache.video", "false")));
+
+                    JSONObject resp = sendTrackingServerRequest(req);
+                    ensureOkResponse(resp);
+
+                    File jsonFile = new File(outputDir, videoBaseName + "_annotations.json");
+                    return parseAnnotationsJson(jsonFile);
+                }
+
+                // Fallback: legacy wrapper path (Windows / WSL)
+                File scriptFile = getTrackingScript();
+                if (!scriptFile.exists()) {
+                    throw new FileNotFoundException("Tracking script not found: " + scriptFile.getAbsolutePath());
+                }
+
+                String pythonScript = config.getProperty("local.python.script", "");
+                String workDir = config.getProperty("local.work.dir", "/tmp/tracking_temp");
+                String condaEnv = config.getProperty("local.conda.env", "ripple-env");
+                String modelSize = config.getProperty("raft.model.size", "large");
+                String timeout = config.getProperty("local.timeout", "300");
+
+                String useBlobDetection = config.getProperty("dis.use.blob.detection", "false");
+                String blobSearchRadius = config.getProperty("dis.blob.search.radius", "15");
+                String blobRadius = config.getProperty("dis.blob.radius", "5.0");
+
+                List<String> args = new ArrayList<>();
+                args.add("track_seed");
+                args.add("--tiff");
+                args.add(workingVideoPath);
+                args.add("--output-dir");
+                args.add(outputDir);
+                args.add("--python-script");
+                args.add(pythonScript);
+                args.add("--work-dir");
+                args.add(workDir);
+                args.add("--conda-env");
+                args.add(condaEnv);
+                args.add("--timeout");
+                args.add(timeout);
+                args.add("--model");
+                args.add(modelSize);
+                args.add("--seed-x");
+                args.add(String.valueOf(seedX));
+                args.add("--seed-y");
+                args.add(String.valueOf(seedY));
+                args.add("--seed-frame");
+                args.add(String.valueOf(finalSeedFrame));
+                args.add("--video-name");
+                args.add(videoBaseName);
+                args.add("--use-blob-detection");
+                args.add(useBlobDetection);
+                args.add("--blob-search-radius");
+                args.add(blobSearchRadius);
+                args.add("--blob-radius");
+                args.add(blobRadius);
+
+                List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
+                ProcessBuilder pb = new ProcessBuilder(command);
+                pb.redirectErrorStream(true);
+                Process process = pb.start();
+
+                BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    System.out.println("[Track] " + line);
+                }
+
+                int exitCode = process.waitFor();
+                if (exitCode != 0) {
+                    throw new IOException("Local track propagation failed with exit code " + exitCode);
+                }
+
+                File jsonFile = new File(outputDir, videoBaseName + "_annotations.json");
+                return parseAnnotationsJson(jsonFile);
+            }
+            
+            @Override
+            protected void done() {
+                serverOperationInProgress = false;  // Operation complete
+                serverCancellationInProgress = false;
+                System.out.println("[DEBUG] SwingWorker done() called");
+                elapsedTimer.stop();
+                progressDialog.dispose();
+                System.out.println("[DEBUG] Progress dialog disposed");
+                
+                // If cancelled, don't process results
+                if (cancelled.get() || isCancelled()) {
+                    System.out.println("[DEBUG] Worker was cancelled, returning");
+                    return;
+                }
+                
+                try {
+                    Map<Integer, Point> points = get();
+                    
+                    // Apply SAT region constraints if enabled
+                    if (satEnabled && trackToRegion.containsKey(trackId)) {
+                        points = applyRegionConstraints(trackId, points);
+                        setStatus("Track propagated with SAT constraints (" + points.size() + " frames)");
+                    } else {
+                        setStatus("Track propagated successfully (" + points.size() + " frames)");
+                    }
+                    
+                    trackAnnotations.put(trackId, points);
+                    
+                    // Re-apply smoothing if it was enabled (keeps user's preference)
+                    reapplyTrackSmoothingIfEnabled(trackId);
+                    
+                    // Mark track as optimized in single-seed mode (it's been propagated successfully)
+                    if (!isMultiSeedMode()) {
+                        trackOptimized.put(trackId, true);
+                    }
+                    
+                    loadSliceImage();
+                    refreshAnnotationList();
+                    imageLabel.repaint();
+                    
+                    String satMessage = (satEnabled && trackToRegion.containsKey(trackId)) 
+                        ? "\n✓ Points constrained to segmented region"
+                        : "";
+                    
+                    JOptionPane.showMessageDialog(frame,
+                        "Track propagated successfully through " + points.size() + " frames!" + satMessage + "\n\n" +
+                        "✓ You can now click on any other frame to add corrections.\n" +
+                        "✓ Each correction will optimize the entire track.",
+                        "Success",
+                        JOptionPane.INFORMATION_MESSAGE);
+                } catch (Exception ex) {
+                    if (cancelled.get() || isCancelled()) {
+                        return;
+                    }
+                    elapsedTimer.stop();
+                    // On error, clean up the state
+                    if (trackAnchors.containsKey(trackId)) {
+                        trackAnchors.get(trackId).clear();
+                    }
+                    correctionMode = false;
+                    
+                    setStatus("Track propagation failed: " + ex.getMessage());
+                    JOptionPane.showMessageDialog(frame,
+                        "Failed to propagate track:\n" + ex.getMessage(),
+                        "Error",
+                        JOptionPane.ERROR_MESSAGE);
+                    ex.printStackTrace();
+                }
+            }
+        };
+        
+        workerRef[0] = worker;
+        serverCancellationInProgress = false;
+        serverOperationInProgress = true;  // Mark operation as in progress
+        worker.execute();
+        progressDialog.setVisible(true); // Show modal dialog (blocks until worker calls dispose)
+    }
+
+    private String getOutputDirectory() {
+        String outputDirTemplate = config.getProperty("output.directory", "{VIDEO_DIR}");
+        
+        if (currentVideoPath == null) {
+            return System.getProperty("user.dir");
+        }
+        
+        File videoFile = new File(currentVideoPath);
+        String videoDir = videoFile.getParent() != null ? videoFile.getParent() : System.getProperty("user.dir");
+        String videoName = videoFile.getName();
+        if (videoName.contains(".")) {
+            videoName = videoName.substring(0, videoName.lastIndexOf('.'));
+        }
+        
+        String outputDir = outputDirTemplate
+            .replace("{VIDEO_DIR}", videoDir)
+            .replace("{VIDEO_NAME}", videoName);
+        
+        return outputDir;
+    }
+
+    private void toggleFlowVisualization(JButton toggleButton) {
+        if (flowVisualization == null) {
+            // Check if optical flow has been computed
+            if (!opticalFlowComputed) {
+                JOptionPane.showMessageDialog(frame,
+                    "Optical flow has not been computed yet.\n" +
+                    "Please compute optical flow first.",
+                    "No Optical Flow",
+                    JOptionPane.WARNING_MESSAGE);
+                return;
+            }
+            
+            // Optical flow exists but visualization hasn't been generated yet
+            int vizChoice = JOptionPane.showConfirmDialog(frame,
+                "Flow visualization has not been generated yet.\n\n" +
+                "Would you like to generate it now?\n" +
+                "This creates a colorful representation of the motion field.",
+                "Generate Flow Visualization?",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.QUESTION_MESSAGE);
+            
+            if (vizChoice == JOptionPane.YES_OPTION) {
+                generateFlowVisualization();
+                
+                // After generation, if successful, toggle to show it
+                if (flowVisualization != null) {
+                    showingFlowViz = true;
+                    toggleButton.setText("Video");
+                    toggleButton.setToolTipText("Switch to video view");
+                    setStatus("Showing optical flow visualization");
+                    loadSliceImage();
+                }
+            }
+            return;
+        }
+        
+        // Toggle between video and flow visualization
+        showingFlowViz = !showingFlowViz;
+        
+        if (showingFlowViz) {
+            toggleButton.setText("Video");
+            toggleButton.setToolTipText("Switch to video view");
+            setStatus("Showing optical flow visualization");
+        } else {
+            toggleButton.setText("Flow Viz");
+            toggleButton.setToolTipText("Toggle optical flow visualization");
+            setStatus("Showing original video");
+        }
+        
+        loadSliceImage();
+    }
+
+    /**
+     * Generate a DoG (Difference of Gaussians) detection preview with TrackMate-style parameters.
+     * Returns the detected spots for overlay display, or null on failure.
+     * 
+     * @param radius Estimated object radius in pixels
+     * @param threshold Quality threshold (0 = accept all)
+     * @param medianFilter Whether to pre-process with median filter
+     * @param subpixel Whether to use sub-pixel localization
+     * @param frame The frame index (0-indexed) to run detection on
+     * @param dispMin Display min value for brightness (null = auto)
+     * @param dispMax Display max value for brightness (null = auto)
+     * @return List of spots as double[] {x, y, quality}, or null on error
+     */
+    private List<double[]> generateDogPreview(double radius, double threshold, boolean medianFilter, boolean subpixel, int frame, Double dispMin, Double dispMax) {
+        if (currentVideoPath == null) {
+            return null;
+        }
+        
+        try {
+            String outputDir = getOutputDirectory();
+            File scriptFile = getTrackingScript();
+            
+            if (!scriptFile.exists()) {
+                System.err.println("Tracking script not found: " + scriptFile.getAbsolutePath());
+                return null;
+            }
+            
+            List<String> args = new ArrayList<>();
+            args.add("preview_dog_detection");
+            args.add("--tiff");
+            args.add(workingVideoPath);
+            args.add("--output-dir");
+            args.add(outputDir);
+            args.add("--radius");
+            args.add(String.valueOf(radius));
+            args.add("--threshold");
+            args.add(String.valueOf(threshold));
+            args.add("--median-filter");
+            args.add(String.valueOf(medianFilter));
+            args.add("--subpixel");
+            args.add(String.valueOf(subpixel));
+            args.add("--frame");
+            args.add(String.valueOf(frame));
+            
+            // Pass display range for brightness-adjusted preview
+            if (dispMin != null && dispMax != null) {
+                args.add("--display-min");
+                args.add(String.valueOf(dispMin));
+                args.add("--display-max");
+                args.add(String.valueOf(dispMax));
+            }
+            
+            List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
+            ProcessBuilder pb = new ProcessBuilder(command);
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+            
+            StringBuilder output = new StringBuilder();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    System.out.println("[DogPreview] " + line);
+                    output.append(line).append("\n");
+                }
+            }
+            
+            int exitCode = process.waitFor();
+            
+            if (exitCode == 0) {
+                // Parse the JSON response to extract spots
+                // Look for JSON line in output (starts with '{' and ends with '}')
+                String outputStr = output.toString();
+                int jsonStart = outputStr.lastIndexOf("\n{");
+                if (jsonStart == -1) jsonStart = outputStr.indexOf("{");
+                int jsonEnd = outputStr.lastIndexOf("}");
+                
+                if (jsonStart >= 0 && jsonEnd > jsonStart) {
+                    String jsonStr = outputStr.substring(jsonStart, jsonEnd + 1).trim();
+                    if (jsonStr.startsWith("{")) {
+                        try {
+                            JSONObject json = new JSONObject(jsonStr);
+                            if ("ok".equals(json.optString("status"))) {
+                                org.json.JSONArray spotsArray = json.optJSONArray("spots");
+                                if (spotsArray != null) {
+                                    List<double[]> spots = new ArrayList<>();
+                                    for (int i = 0; i < spotsArray.length(); i++) {
+                                        JSONObject spotObj = spotsArray.getJSONObject(i);
+                                        double x = spotObj.getDouble("x");
+                                        double y = spotObj.getDouble("y");
+                                        double quality = spotObj.optDouble("quality", 0.0);
+                                        spots.add(new double[]{x, y, quality});
+                                    }
+                                    System.out.println("[DogPreview] Parsed " + spots.size() + " spots from response");
+                                    return spots;
+                                }
+                            }
+                        } catch (Exception jsonEx) {
+                            System.err.println("[DogPreview] JSON parse error: " + jsonEx.getMessage());
+                        }
+                    }
+                }
+                
+                System.err.println("[DogPreview] Could not parse spots from output");
+                return null;
+            } else {
+                System.err.println("[DogPreview] Process failed with exit code " + exitCode);
+                return null;
+            }
+        } catch (Exception e) {
+            System.err.println("[DogPreview] Error: " + e.getMessage());
+            return null;
+        }
+    }
+    
+    /**
+     * Generate a trackpy particle detection preview with DoG detection.
+     * Now uses the SAME DoG detector as LocoTrack for consistent particle detection.
+     * This method is kept for backward compatibility but delegates to generateDogPreview.
+     * 
+     * @param radius Estimated object radius in pixels
+     * @param threshold Quality threshold (0 = accept all)
+     * @param medianFilter Whether to pre-process with median filter
+     * @param subpixel Whether to use sub-pixel localization
+     * @param frame The frame index (0-indexed) to run detection on
+     * @param dispMin Display min value for brightness (null = auto)
+     * @param dispMax Display max value for brightness (null = auto)
+     * @return List of spots as double[] {x, y, quality}, or null on error
+     * @deprecated Use generateDogPreview directly - trackpy now uses same DoG detection as LocoTrack
+     */
+    private List<double[]> generateTrackpyPreview(double radius, double threshold, boolean medianFilter, boolean subpixel, int frame, Double dispMin, Double dispMax) {
+        // Delegate to DoG preview - trackpy now uses same detection as LocoTrack
+        return generateDogPreview(radius, threshold, medianFilter, subpixel, frame, dispMin, dispMax);
+    }
+    
+    /**
+     * Legacy trackpy preview method - converts diameter to radius and delegates.
+     * @deprecated Use generateDogPreview with radius parameter instead
+     */
+    private List<double[]> generateTrackpyPreview(int diameter, double minmass, double searchRange, int memory) {
+        // Legacy method - convert diameter to radius and use DoG detection
+        // Note: minmass, searchRange, memory are ignored as they're trackpy-linking params, not detection params
+        double radius = diameter / 2.0;
+        double threshold = 0.0;  // Use default threshold
+        return generateDogPreview(radius, threshold, false, true, currentSlice - 1, viewMin, viewMax);
+    }
+    
+    /**
+     * Generate a trackpy trajectory preview using native trackpy detection and linking.
+     * Returns trajectory data for all frames, allowing free navigation with overlay.
+     * 
+     * @param diameter Trackpy diameter parameter (in pixels, typically odd integer)
+     * @param minmass Minimum mass threshold for particle detection
+     * @param searchRange Maximum displacement per frame for linking
+     * @param memory Number of frames a particle can disappear and reappear
+     * @param startFrame Start frame (0-indexed) for trajectory detection
+     * @param endFrame End frame (0-indexed, -1 = all frames)
+     * @return Map containing "trajectories", "detections_per_frame", and "statistics", or null on error
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> generateTrackpyTrajectoryPreview(int diameter, double minmass, double searchRange, 
+                                                                   int memory, int startFrame, int endFrame,
+                                                                   boolean requirePersistent) {
+        if (currentVideoPath == null) {
+            return null;
+        }
+        
+        try {
+            String outputDir = getOutputDirectory();
+            File scriptFile = getTrackingScript();
+            
+            if (!scriptFile.exists()) {
+                System.err.println("Tracking script not found: " + scriptFile.getAbsolutePath());
+                return null;
+            }
+            
+            List<String> args = new ArrayList<>();
+            args.add("preview_trackpy_trajectories");
+            args.add("--tiff");
+            args.add(workingVideoPath);
+            args.add("--output-dir");
+            args.add(outputDir);
+            args.add("--diameter");
+            args.add(String.valueOf(diameter));
+            args.add("--minmass");
+            args.add(String.valueOf(minmass));
+            args.add("--search-range");
+            args.add(String.valueOf((int) searchRange));
+            args.add("--memory");
+            args.add(String.valueOf(memory));
+            args.add("--start-frame");
+            args.add(String.valueOf(startFrame));
+            args.add("--end-frame");
+            args.add(String.valueOf(endFrame));
+            args.add("--require-persistent");
+            args.add(String.valueOf(requirePersistent));
+            
+            List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
+            ProcessBuilder pb = new ProcessBuilder(command);
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+            
+            StringBuilder output = new StringBuilder();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    System.out.println("[TrackpyTrajectories] " + line);
+                    output.append(line).append("\n");
+                }
+            }
+            
+            int exitCode = process.waitFor();
+            
+            if (exitCode == 0) {
+                // Parse the JSON response to extract trajectories
+                String outputStr = output.toString();
+                int jsonStart = outputStr.lastIndexOf("\n{");
+                if (jsonStart == -1) jsonStart = outputStr.indexOf("{");
+                int jsonEnd = outputStr.lastIndexOf("}");
+                
+                if (jsonStart >= 0 && jsonEnd > jsonStart) {
+                    String jsonStr = outputStr.substring(jsonStart, jsonEnd + 1).trim();
+                    if (jsonStr.startsWith("{")) {
+                        try {
+                            JSONObject json = new JSONObject(jsonStr);
+                            if ("ok".equals(json.optString("status"))) {
+                                Map<String, Object> result = new HashMap<>();
+                                
+                                // Parse trajectories
+                                org.json.JSONArray trajArray = json.optJSONArray("trajectories");
+                                if (trajArray != null) {
+                                    List<Map<String, Object>> trajectories = new ArrayList<>();
+                                    for (int i = 0; i < trajArray.length(); i++) {
+                                        JSONObject trajObj = trajArray.getJSONObject(i);
+                                        Map<String, Object> traj = new HashMap<>();
+                                        traj.put("id", trajObj.getInt("id"));
+                                        traj.put("length", trajObj.getInt("length"));
+                                        traj.put("start_frame", trajObj.getInt("start_frame"));
+                                        traj.put("end_frame", trajObj.getInt("end_frame"));
+                                        
+                                        // Parse positions per frame
+                                        JSONObject positionsObj = trajObj.getJSONObject("positions");
+                                        Map<Integer, double[]> positions = new HashMap<>();
+                                        for (String frameKey : positionsObj.keySet()) {
+                                            JSONObject posObj = positionsObj.getJSONObject(frameKey);
+                                            positions.put(Integer.parseInt(frameKey), 
+                                                new double[]{posObj.getDouble("x"), posObj.getDouble("y")});
+                                        }
+                                        traj.put("positions", positions);
+                                        trajectories.add(traj);
+                                    }
+                                    result.put("trajectories", trajectories);
+                                }
+                                
+                                // Parse detections per frame
+                                JSONObject detectionsObj = json.optJSONObject("detections_per_frame");
+                                if (detectionsObj != null) {
+                                    Map<Integer, List<double[]>> detectionsPerFrame = new HashMap<>();
+                                    for (String frameKey : detectionsObj.keySet()) {
+                                        org.json.JSONArray frameDetections = detectionsObj.getJSONArray(frameKey);
+                                        List<double[]> detections = new ArrayList<>();
+                                        for (int i = 0; i < frameDetections.length(); i++) {
+                                            JSONObject det = frameDetections.getJSONObject(i);
+                                            detections.add(new double[]{
+                                                det.getDouble("x"), 
+                                                det.getDouble("y"),
+                                                det.optDouble("mass", 0.0)
+                                            });
+                                        }
+                                        detectionsPerFrame.put(Integer.parseInt(frameKey), detections);
+                                    }
+                                    result.put("detections_per_frame", detectionsPerFrame);
+                                }
+                                
+                                // Parse statistics
+                                JSONObject statsObj = json.optJSONObject("statistics");
+                                if (statsObj != null) {
+                                    Map<String, Object> stats = new HashMap<>();
+                                    stats.put("num_trajectories", statsObj.optInt("num_trajectories", 0));
+                                    stats.put("total_detections", statsObj.optInt("total_detections", 0));
+                                    stats.put("frames_processed", statsObj.optInt("frames_processed", 0));
+                                    result.put("statistics", stats);
+                                }
+                                
+                                System.out.println("[TrackpyTrajectories] Parsed " + 
+                                    ((List<?>) result.get("trajectories")).size() + " trajectories");
+                                return result;
+                            }
+                        } catch (Exception jsonEx) {
+                            System.err.println("[TrackpyTrajectories] JSON parse error: " + jsonEx.getMessage());
+                            jsonEx.printStackTrace();
+                        }
+                    }
+                }
+                
+                System.err.println("[TrackpyTrajectories] Could not parse trajectories from output");
+                return null;
+            } else {
+                System.err.println("[TrackpyTrajectories] Process failed with exit code " + exitCode);
+                return null;
+            }
+        } catch (Exception e) {
+            System.err.println("[TrackpyTrajectories] Error: " + e.getMessage());
+            e.printStackTrace();
+            return null;
+        }
+    }
+    
+    /**
+     * Open the preview image in a zoomable/pannable window with proper close handling.
+     * Overload for backward compatibility.
+     */
+    private void openPreviewImage(String previewPath) {
+        openPreviewImage(previewPath, null);
+    }
+    
+    /**
+     * Open the preview image in a zoomable/pannable window with proper close handling.
+     * @param previewPath Path to the preview image
+     * @param parentDialog Optional parent dialog to restore when preview is closed
+     */
+    private void openPreviewImage(String previewPath, JDialog parentDialog) {
+        // Run on EDT to ensure proper event handling
+        SwingUtilities.invokeLater(() -> {
+            try {
+                File previewFile = new File(previewPath);
+                if (previewFile.exists()) {
+                    // Try to open with ImageJ's Opener
+                    Opener opener = new Opener();
+                    ImagePlus previewImp = opener.openImage(previewPath);
+                    if (previewImp != null) {
+                        // Get the image as BufferedImage
+                        final BufferedImage originalImage = previewImp.getBufferedImage();
+                        final int imgWidth = originalImage.getWidth();
+                        final int imgHeight = originalImage.getHeight();
+                        
+                        // Use JFrame instead of JDialog to avoid modal blocking issues
+                        final JFrame previewFrame = new JFrame("DoG Detection Preview - First Frame");
+                        previewFrame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
+                        
+                        // Restore parent dialog when this window is closed
+                        if (parentDialog != null) {
+                            previewFrame.addWindowListener(new java.awt.event.WindowAdapter() {
+                                @Override
+                                public void windowClosed(java.awt.event.WindowEvent e) {
+                                    SwingUtilities.invokeLater(() -> parentDialog.setVisible(true));
+                                }
+                            });
+                        }
+                        
+                        // Zoomable/pannable image panel
+                        final double[] zoom = {1.0};
+                        final double[] panX = {0.0};
+                        final double[] panY = {0.0};
+                        final Point[] lastDragPoint = {null};
+                        
+                        JPanel imagePanel = new JPanel() {
+                            @Override
+                            protected void paintComponent(Graphics g) {
+                                super.paintComponent(g);
+                                Graphics2D g2d = (Graphics2D) g;
+                                g2d.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+                                g2d.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+                                
+                                // Calculate scaled dimensions
+                                int scaledWidth = (int) (imgWidth * zoom[0]);
+                                int scaledHeight = (int) (imgHeight * zoom[0]);
+                                
+                                // Center the image if smaller than panel, otherwise use pan offset
+                                int x = (getWidth() - scaledWidth) / 2 + (int) panX[0];
+                                int y = (getHeight() - scaledHeight) / 2 + (int) panY[0];
+                                
+                                g2d.drawImage(originalImage, x, y, scaledWidth, scaledHeight, null);
+                            }
+                            
+                            @Override
+                            public Dimension getPreferredSize() {
+                                return new Dimension((int)(imgWidth * zoom[0]), (int)(imgHeight * zoom[0]));
+                            }
+                        };
+                        imagePanel.setBackground(Color.BLACK);
+                        imagePanel.setFocusable(true);
+                        
+                        // Mouse wheel zoom
+                        imagePanel.addMouseWheelListener(e -> {
+                            double oldZoom = zoom[0];
+                            if (e.getWheelRotation() < 0) {
+                                zoom[0] = Math.min(zoom[0] * 1.1, 10.0);  // Zoom in, max 10x
+                            } else {
+                                zoom[0] = Math.max(zoom[0] / 1.1, 0.1);  // Zoom out, min 0.1x
+                            }
+                            // Adjust pan to zoom toward mouse position
+                            double zoomFactor = zoom[0] / oldZoom;
+                            int mouseX = e.getX() - imagePanel.getWidth() / 2;
+                            int mouseY = e.getY() - imagePanel.getHeight() / 2;
+                            panX[0] = (panX[0] - mouseX) * zoomFactor + mouseX;
+                            panY[0] = (panY[0] - mouseY) * zoomFactor + mouseY;
+                            imagePanel.repaint();
+                        });
+                        
+                        // Mouse drag for panning
+                        imagePanel.addMouseListener(new java.awt.event.MouseAdapter() {
+                            @Override
+                            public void mousePressed(java.awt.event.MouseEvent e) {
+                                lastDragPoint[0] = e.getPoint();
+                                imagePanel.setCursor(Cursor.getPredefinedCursor(Cursor.MOVE_CURSOR));
+                            }
+                            
+                            @Override
+                            public void mouseReleased(java.awt.event.MouseEvent e) {
+                                lastDragPoint[0] = null;
+                                imagePanel.setCursor(Cursor.getDefaultCursor());
+                            }
+                        });
+                        
+                        imagePanel.addMouseMotionListener(new java.awt.event.MouseMotionAdapter() {
+                            @Override
+                            public void mouseDragged(java.awt.event.MouseEvent e) {
+                                if (lastDragPoint[0] != null) {
+                                    int dx = e.getX() - lastDragPoint[0].x;
+                                    int dy = e.getY() - lastDragPoint[0].y;
+                                    panX[0] += dx;
+                                    panY[0] += dy;
+                                    lastDragPoint[0] = e.getPoint();
+                                    imagePanel.repaint();
+                                }
+                            }
+                        });
+                        
+                    JScrollPane scrollPane = new JScrollPane(imagePanel);
+                    scrollPane.setBackground(Color.BLACK);
+                    scrollPane.getViewport().setBackground(Color.BLACK);
+                    scrollPane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
+                    scrollPane.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_NEVER);
+                    
+                    // Control panel at bottom
+                    JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.CENTER, 10, 5));
+                    buttonPanel.setBackground(PANEL_DARK);
+                    
+                    // Zoom controls
+                    JButton zoomInBtn = createStyledButton("+");
+                    zoomInBtn.setPreferredSize(new Dimension(40, 28));
+                    zoomInBtn.setToolTipText("Zoom In");
+                    zoomInBtn.addActionListener(e -> {
+                        zoom[0] = Math.min(zoom[0] * 1.25, 10.0);
+                        imagePanel.repaint();
+                    });
+                    
+                    JButton zoomOutBtn = createStyledButton("-");
+                    zoomOutBtn.setPreferredSize(new Dimension(40, 28));
+                    zoomOutBtn.setToolTipText("Zoom Out");
+                    zoomOutBtn.addActionListener(e -> {
+                        zoom[0] = Math.max(zoom[0] / 1.25, 0.1);
+                        imagePanel.repaint();
+                    });
+                    
+                    JButton resetBtn = createStyledButton("Reset View");
+                    resetBtn.setToolTipText("Reset zoom and pan");
+                    resetBtn.addActionListener(e -> {
+                        zoom[0] = 1.0;
+                        panX[0] = 0.0;
+                        panY[0] = 0.0;
+                        imagePanel.repaint();
+                    });
+                    
+                    JButton fitBtn = createStyledButton("Fit");
+                    fitBtn.setToolTipText("Fit image to window");
+                    fitBtn.addActionListener(e -> {
+                        double scaleX = (double) scrollPane.getViewport().getWidth() / imgWidth;
+                        double scaleY = (double) scrollPane.getViewport().getHeight() / imgHeight;
+                        zoom[0] = Math.min(scaleX, scaleY) * 0.95;
+                        panX[0] = 0.0;
+                        panY[0] = 0.0;
+                        imagePanel.repaint();
+                    });
+                    
+                    JButton closeButton = createStyledButton("Close");
+                    closeButton.addActionListener(e -> previewFrame.dispose());
+                    
+                    // Info label
+                    JLabel infoLabel = new JLabel("Scroll=zoom | Drag=pan | Circles=detected spots (TrackMate-faithful DoG)");
+                    infoLabel.setForeground(TEXT_SECONDARY);
+                    infoLabel.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+                    
+                    buttonPanel.add(infoLabel);
+                    buttonPanel.add(Box.createHorizontalStrut(20));
+                    buttonPanel.add(zoomOutBtn);
+                    buttonPanel.add(zoomInBtn);
+                    buttonPanel.add(fitBtn);
+                    buttonPanel.add(resetBtn);
+                    buttonPanel.add(Box.createHorizontalStrut(20));
+                    buttonPanel.add(closeButton);
+                    
+                    previewFrame.setLayout(new BorderLayout());
+                    previewFrame.add(scrollPane, BorderLayout.CENTER);
+                    previewFrame.add(buttonPanel, BorderLayout.SOUTH);
+                    
+                    // Set initial size to fit image or screen
+                    int windowWidth = Math.min(imgWidth + 50, 1000);
+                    int windowHeight = Math.min(imgHeight + 80, 800);
+                    previewFrame.setSize(windowWidth, windowHeight);
+                    previewFrame.setLocationRelativeTo(frame);
+                    
+                    // Make window visible and bring to front
+                    previewFrame.setVisible(true);
+                    previewFrame.toFront();
+                    previewFrame.requestFocus();
+                    
+                    // Ensure the frame is actually focusable
+                    previewFrame.setFocusableWindowState(true);
+                    previewFrame.setAutoRequestFocus(true);
+                    
+                    // Request focus for image panel after a short delay
+                    Timer focusTimer = new Timer(100, e -> imagePanel.requestFocusInWindow());
+                    focusTimer.setRepeats(false);
+                    focusTimer.start();
+                    }
+                }
+            } catch (Exception e) {
+                System.err.println("Could not open preview image: " + e.getMessage());
+                e.printStackTrace();
+            }
+        });
+    }
+
+    private void generateFlowVisualization() {
+        // Note: We no longer require the flow file to exist on disk.
+        // The server can generate visualization from cached flow in memory.
+        // This is important for DIS flow which is computed and cached but may not be saved.
+        
+        if (blockIfServerBusy("Generate flow visualization")) {
+            return;
+        }
+        
+        final String flowMethod = config.getProperty("flow.method", getDefaultFlowMethod());
+        setStatus("Generating optical flow visualization (method: " + flowMethod + ")...");
+        
+        // Cancellation flag
+        final AtomicBoolean cancelled = new AtomicBoolean(false);
+        
+        // Create modal progress dialog
+        final JDialog progressDialog = new JDialog(frame, "Generating Flow Visualization", true);
+        progressDialog.setUndecorated(true);
+        progressDialog.setDefaultCloseOperation(JDialog.DO_NOTHING_ON_CLOSE);
+        progressDialog.setLayout(new BorderLayout(10, 10));
+        
+        JPanel contentPanel = new JPanel(new BorderLayout(12, 12));
+        contentPanel.setBackground(PANEL_DARK);
+        contentPanel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(ACCENT_BLUE, 2),
+            BorderFactory.createEmptyBorder(24, 28, 24, 28)
+        ));
+        
+        JLabel titleLabel = new JLabel("🎨 Generating Flow Visualization");
+        titleLabel.setFont(new Font("Segoe UI Semibold", Font.BOLD, 16));
+        titleLabel.setForeground(TEXT_PRIMARY);
+        titleLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        contentPanel.add(titleLabel, BorderLayout.NORTH);
+        
+        JLabel messageLabel = new JLabel("<html><center><span style='color: #E8EAED;'>Creating colorized motion field...</span><br>" +
+            "<span style='color: #9AA0A6; font-size: 11px;'>Method: " + flowMethod.toUpperCase() + "</span></center></html>");
+        messageLabel.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        messageLabel.setForeground(TEXT_SECONDARY);
+        messageLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        contentPanel.add(messageLabel, BorderLayout.CENTER);
+        
+        // Bottom panel with elapsed time and cancel button
+        JPanel bottomPanel = new JPanel(new BorderLayout(10, 5));
+        bottomPanel.setBackground(PANEL_DARK);
+        
+        final JLabel elapsedLabel = new JLabel("Elapsed: 0s");
+        elapsedLabel.setFont(new Font("Segoe UI", Font.BOLD, 14));
+        elapsedLabel.setForeground(ACCENT_BLUE);
+        elapsedLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        bottomPanel.add(elapsedLabel, BorderLayout.CENTER);
+        
+        JButton cancelButton = new JButton("Cancel");
+        cancelButton.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        cancelButton.setBackground(new Color(120, 40, 40));
+        cancelButton.setForeground(TEXT_PRIMARY);
+        cancelButton.setFocusPainted(false);
+        cancelButton.setBorder(BorderFactory.createEmptyBorder(8, 20, 8, 20));
+        cancelButton.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        JPanel cancelPanel = new JPanel(new FlowLayout(FlowLayout.CENTER));
+        cancelPanel.setBackground(PANEL_DARK);
+        cancelPanel.add(cancelButton);
+        bottomPanel.add(cancelPanel, BorderLayout.SOUTH);
+        
+        contentPanel.add(bottomPanel, BorderLayout.SOUTH);
+        
+        progressDialog.add(contentPanel);
+        progressDialog.setSize(480, 200);
+        progressDialog.setLocationRelativeTo(frame);
+        
+        // Timer to update elapsed time
+        final long startTime = System.currentTimeMillis();
+        final Timer elapsedTimer = new Timer(1000, e -> {
+            long elapsed = (System.currentTimeMillis() - startTime) / 1000;
+            elapsedLabel.setText(String.format("Elapsed: %ds", elapsed));
+        });
+        elapsedTimer.start();
+        
+        // Reference to worker for cancellation
+        final SwingWorker<Boolean, Void>[] workerRef = new SwingWorker[1];
+        
+        cancelButton.addActionListener(e -> {
+            cancelled.set(true);
+            beginCancellationAndWait(
+                "Flow visualization generation",
+                null,
+                workerRef[0],
+                elapsedTimer,
+                progressDialog
+            );
+            setStatus("Flow visualization generation cancelled");
+        });
+        
+        SwingWorker<Boolean, Void> worker = new SwingWorker<Boolean, Void>() {
+            private String generatedVizPath = null;
+            
+            @Override
+            protected Boolean doInBackground() throws Exception {
+                String outputDir = getOutputDirectory();
+                File scriptFile = getTrackingScript();
+                
+                if (!scriptFile.exists()) {
+                    throw new FileNotFoundException("Tracking script not found: " + scriptFile.getAbsolutePath());
+                }
+                
+                String videoBaseName = new File(currentVideoPath).getName().replaceFirst("\\.[^.]+$", "");
+                // Use forward slash for path separator to be consistent with WSL paths
+                String sep = outputDir.contains("/") ? "/" : File.separator;
+                // Initial expected path - may be updated based on server response
+                generatedVizPath = outputDir + sep + videoBaseName + "_" + flowMethod + "_flow_viz.tif";
+                
+                List<String> args = new ArrayList<>();
+                args.add("visualize_flow");
+                args.add("--tiff");
+                args.add(workingVideoPath);
+                args.add("--output-dir");
+                args.add(outputDir);
+                args.add("--video-name");
+                args.add(videoBaseName);
+                
+                List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
+                ProcessBuilder pb = new ProcessBuilder(command);
+                pb.redirectErrorStream(true);
+                Process process = pb.start();
+                
+                // Read output and look for the actual output path
+                String actualOutputPath = null;
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        System.out.println("[FlowViz] " + line);
+                        // Look for the output path in the server response
+                        // The bash script prints: "Output: <path>"
+                        if (line.contains("Output:")) {
+                            String[] parts = line.split("Output:");
+                            if (parts.length > 1) {
+                                actualOutputPath = parts[1].trim();
+                            }
+                        }
+                    }
+                }
+                
+                int exitCode = process.waitFor();
+                
+                // Use actual output path from server if available
+                if (actualOutputPath != null && !actualOutputPath.isEmpty()) {
+                    System.out.println("[FlowViz] Server reported output path: " + actualOutputPath);
+                    generatedVizPath = actualOutputPath;
+                }
+                
+                // Check if the file exists at the expected path
+                if (new File(generatedVizPath).exists()) {
+                    return exitCode == 0;
+                }
+                
+                // Fallback: search for any flow_viz file matching the video name
+                // This handles cases where the server uses a different method name
+                File dirFile = new File(outputDir);
+                if (dirFile.isDirectory()) {
+                    File[] vizFiles = dirFile.listFiles((dir, name) -> 
+                        name.startsWith(videoBaseName) && name.endsWith("_flow_viz.tif"));
+                    if (vizFiles != null && vizFiles.length > 0) {
+                        // Use the most recently modified visualization file
+                        File newest = vizFiles[0];
+                        for (File f : vizFiles) {
+                            if (f.lastModified() > newest.lastModified()) {
+                                newest = f;
+                            }
+                        }
+                        generatedVizPath = newest.getAbsolutePath();
+                        System.out.println("[FlowViz] Using found visualization file: " + generatedVizPath);
+                        return exitCode == 0;
+                    }
+                }
+                
+                return exitCode == 0 && new File(generatedVizPath).exists();
+            }
+            
+            @Override
+            protected void done() {
+                serverOperationInProgress = false;  // Operation complete
+                serverCancellationInProgress = false;
+                elapsedTimer.stop();
+                progressDialog.dispose();
+                
+                // If cancelled, don't process results
+                if (cancelled.get() || isCancelled()) {
+                    return;
+                }
+                
+                try {
+                    Boolean success = get();
+                    if (success && generatedVizPath != null) {
+                        // Load the visualization
+                        Opener opener = new Opener();
+                        flowVisualization = opener.openImage(generatedVizPath);
+                        
+                        if (flowVisualization != null) {
+                            setStatus("Flow visualization loaded successfully (method: " + flowMethod + ")");
+                            // Ensure the Flow Viz button is enabled
+                            if (flowVizToggle != null) {
+                                flowVizToggle.setEnabled(true);
+                            }
+                            
+                            // Delete the temp visualization file after loading
+                            try {
+                                File vizFile = new File(generatedVizPath);
+                                if (vizFile.exists() && vizFile.delete()) {
+                                    System.out.println("[FlowViz] Cleaned up temp file: " + generatedVizPath);
+                                }
+                            } catch (Exception cleanupEx) {
+                                System.err.println("[FlowViz] Failed to clean up temp file: " + cleanupEx.getMessage());
+                            }
+                        } else {
+                            setStatus("Failed to load flow visualization");
+                        }
+                    } else {
+                        setStatus("Failed to generate flow visualization");
+                        JOptionPane.showMessageDialog(frame,
+                            "Failed to generate flow visualization.\n" +
+                            "Check the console for details.",
+                            "Visualization Error",
+                            JOptionPane.ERROR_MESSAGE);
+                    }
+                } catch (Exception e) {
+                    if (cancelled.get() || isCancelled()) {
+                        return;
+                    }
+                    setStatus("Error generating flow visualization: " + e.getMessage());
+                    e.printStackTrace();
+                }
+            }
+        };
+        
+        workerRef[0] = worker;
+        serverCancellationInProgress = false;
+        serverOperationInProgress = true;  // Mark operation as in progress
+        worker.execute();
+        progressDialog.setVisible(true);
+    }
+
+    private void enableFlowVizButton(JPanel panel) {
+        // Use direct reference if available (preferred)
+        if (flowVizToggle != null) {
+            flowVizToggle.setEnabled(true);
+            return;
+        }
+        // Fallback to recursive search
+        for (Component comp : panel.getComponents()) {
+            if (comp instanceof JButton) {
+                JButton btn = (JButton) comp;
+                if (btn.getText().contains("Flow Viz") || btn.getText().contains("Video")) {
+                    btn.setEnabled(true);
+                    return;
+                }
+            } else if (comp instanceof JPanel) {
+                enableFlowVizButton((JPanel) comp);
+            } else if (comp instanceof JScrollPane) {
+                // Handle scroll panes (the control panel is wrapped in one)
+                JScrollPane scrollPane = (JScrollPane) comp;
+                Component view = scrollPane.getViewport().getView();
+                if (view instanceof JPanel) {
+                    enableFlowVizButton((JPanel) view);
+                }
+            }
+        }
+    }
+
+    private void recalculateOpticalFlow() {
+        if (currentVideoPath == null || imp == null) {
+            JOptionPane.showMessageDialog(frame,
+                "No video loaded.",
+                "Error",
+                JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        
+        String flowMethod = config.getProperty("flow.method", getDefaultFlowMethod());
+        java.util.List<File> allCachedFiles = findCachedFlowFiles(currentVideoPath, flowMethod);
+        
+        // CRITICAL: Filter by resolution to prevent using wrong-resolution flow data
+        java.util.List<File> cachedFiles = filterFlowFilesByResolution(allCachedFiles);
+        int incompatibleCount = allCachedFiles.size() - cachedFiles.size();
+        
+        if (!cachedFiles.isEmpty()) {
+            // Find if any file matches current settings
+            File matchingFile = null;
+            for (File f : cachedFiles) {
+                if (flowFileMatchesCurrentSettings(f, flowMethod)) {
+                    matchingFile = f;
+                    break;
+                }
+            }
+            
+            // Build informative message
+            StringBuilder message = new StringBuilder();
+            message.append("Optical flow files exist for this video.\n\n");
+            message.append("Current method: ").append(flowMethod.toUpperCase());
+            if (imp != null) {
+                message.append(" | Working resolution: ").append(imp.getWidth()).append("x").append(imp.getHeight());
+            }
+            message.append("\nFound ").append(cachedFiles.size()).append(" compatible cached file(s):\n\n");
+            
+            for (int i = 0; i < Math.min(cachedFiles.size(), 5); i++) {
+                File f = cachedFiles.get(i);
+                boolean isMatch = flowFileMatchesCurrentSettings(f, flowMethod);
+                message.append(isMatch ? "  ✓ " : "  • ");
+                message.append(describeFlowFile(f, flowMethod));
+                if (isMatch) {
+                    message.append(" ← matches current settings");
+                }
+                message.append("\n");
+            }
+            if (cachedFiles.size() > 5) {
+                message.append("  ... and ").append(cachedFiles.size() - 5).append(" more\n");
+            }
+            
+            if (incompatibleCount > 0) {
+                message.append("\n⚠ ").append(incompatibleCount).append(" cached file(s) ignored (different resolution)\n");
+            }
+            
+            message.append("\n");
+            if (matchingFile != null) {
+                message.append("A cached file matches your current settings.\n");
+            } else {
+                message.append("No cached file matches your current settings.\n");
+            }
+            message.append("\nLoad Existing: Use cached file (fast)\n");
+            message.append("Recalculate: Compute with current settings (creates new file)");
+            
+            String[] options = {"Load Existing", "Recalculate", "Cancel"};
+            int choice = JOptionPane.showOptionDialog(
+                frame,
+                message.toString(),
+                "Optical Flow Available",
+                JOptionPane.YES_NO_CANCEL_OPTION,
+                JOptionPane.QUESTION_MESSAGE,
+                null,
+                options,
+                matchingFile != null ? options[0] : options[1]
+            );
+            
+            if (choice == 0) { // Load Existing
+                File fileToLoad = (matchingFile != null) ? matchingFile : cachedFiles.get(0);
+                loadExistingOpticalFlow(fileToLoad);
+            } else if (choice == 1) { // Recalculate
+                int confirmResult = JOptionPane.showConfirmDialog(frame,
+                    "This will compute a new optical flow file with current settings.\n" +
+                    "Existing files will NOT be deleted (new file will have different name).\n\n" +
+                    "Continue?",
+                    "Confirm Computation",
+                    JOptionPane.YES_NO_OPTION,
+                    JOptionPane.WARNING_MESSAGE);
+                
+                if (confirmResult == JOptionPane.YES_OPTION) {
+                    opticalFlowComputed = false;
+                    computeOpticalFlowRemote(true);
+                }
+            }
+            // choice == 2 or CLOSED_OPTION: Cancel
+        } else {
+            // No existing optical flow file, just compute
+            int result = JOptionPane.showConfirmDialog(frame,
+                "This will compute the optical flow for this video.\n" +
+                "Current method: " + flowMethod.toUpperCase() + "\n\n" +
+                "This may take a few minutes depending on video size.\n\n" +
+                "Continue?",
+                "Compute Optical Flow",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.QUESTION_MESSAGE);
+            
+            if (result == JOptionPane.YES_OPTION) {
+                opticalFlowComputed = false;
+                computeOpticalFlowRemote();
+            }
+        }
+    }
+
+    private void switchFlowMethod() {
+        if (currentVideoPath == null || imp == null) {
+            JOptionPane.showMessageDialog(frame,
+                "No video loaded.",
+                "Error",
+                JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        
+        String outputDir = getOutputDirectory();
+        String videoName = new File(currentVideoPath).getName();
+        String baseName = videoName.replaceFirst("\\.[^.]+$", "");
+        String currentMethod = config.getProperty("flow.method", getDefaultFlowMethod());
+        
+        File dir = new File(outputDir);
+        int workingWidth = imp.getWidth();
+        int workingHeight = imp.getHeight();
+        boolean isCompressed = (scaleFactorX != 1.0 || scaleFactorY != 1.0);
+        
+        // Check which flow files exist using pattern matching
+        // CRITICAL: Filter by resolution to prevent using wrong-resolution flow data
+        String[] methods = {"raft", "locotrack", "trackpy", "dis"};
+        java.util.List<String> availableMethods = new java.util.ArrayList<>();
+        java.util.Map<String, java.util.List<File>> methodFiles = new java.util.HashMap<>();
+        int totalIncompatible = 0;
+        
+        for (String method : methods) {
+            java.util.List<File> allFiles = findCachedFlowFiles(currentVideoPath, method);
+            java.util.List<File> compatibleFiles = filterFlowFilesByResolution(allFiles);
+            totalIncompatible += (allFiles.size() - compatibleFiles.size());
+            
+            if (!compatibleFiles.isEmpty()) {
+                availableMethods.add(method);
+                methodFiles.put(method, compatibleFiles);
+            }
+        }
+        
+        if (availableMethods.isEmpty()) {
+            StringBuilder errorMsg = new StringBuilder();
+            errorMsg.append("No compatible optical flow files found for this video.\n\n");
+            errorMsg.append("Working resolution: ").append(workingWidth).append("x").append(workingHeight).append("\n");
+            if (totalIncompatible > 0) {
+                errorMsg.append("\n⚠ Found ").append(totalIncompatible).append(" cached file(s) at DIFFERENT resolution(s).\n");
+                errorMsg.append("These cannot be used - resolution must match exactly.");
+            }
+            errorMsg.append("\n\nUse 'Recalculate Optical Flow' to compute one at the current resolution.");
+            
+            JOptionPane.showMessageDialog(frame,
+                errorMsg.toString(),
+                "No Compatible Flow Files",
+                JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        
+        // Build selection dialog with file details
+        StringBuilder message = new StringBuilder();
+        message.append("Available optical flow files for this video:\n");
+        message.append("Working resolution: ").append(workingWidth).append("x").append(workingHeight).append("\n\n");
+        
+        for (String method : availableMethods) {
+            String marker = method.equals(currentMethod) ? " ← current" : "";
+            java.util.List<File> files = methodFiles.get(method);
+            message.append("  • ").append(method.toUpperCase()).append(marker);
+            if (files.size() == 1) {
+                message.append(" (").append(files.get(0).getName()).append(")");
+            } else {
+                message.append(" (").append(files.size()).append(" files)");
+            }
+            message.append("\n");
+        }
+        
+        if (totalIncompatible > 0) {
+            message.append("\n⚠ ").append(totalIncompatible).append(" cached file(s) ignored (different resolution)\n");
+        }
+        
+        message.append("\nCurrent method: ").append(currentMethod.toUpperCase());
+        message.append("\n\nSelect a method to switch to:");
+        
+        String[] options = availableMethods.toArray(new String[0]);
+        for (int i = 0; i < options.length; i++) {
+            options[i] = options[i].toUpperCase();
+        }
+        
+        String selected = (String) JOptionPane.showInputDialog(
+            frame,
+            message.toString(),
+            "Switch Flow Method",
+            JOptionPane.QUESTION_MESSAGE,
+            null,
+            options,
+            currentMethod.toUpperCase()
+        );
+        
+        if (selected == null) {
+            return; // User cancelled
+        }
+        
+        String selectedMethod = selected.toLowerCase();
+        
+        if (selectedMethod.equals(currentMethod)) {
+            setStatus("Already using " + selectedMethod.toUpperCase() + " flow method");
+            return;
+        }
+        
+        // CRITICAL: Clear flow visualization FIRST before any other operations
+        // This frees memory and switches user back to video view immediately
+        clearFlowVisualizationAndSwitchToVideo();
+        
+        // Update configuration
+        config.setProperty("flow.method", selectedMethod);
+        
+        // Save configuration
+        try {
+            String configPath = config.getProperty("config.path", "config.properties");
+            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(configPath)) {
+                config.store(fos, "Video Annotation Tool Configuration");
+            }
+        } catch (Exception e) {
+            System.err.println("Warning: Could not save config: " + e.getMessage());
+        }
+        
+        // Clear previous flow cache and GPU models before loading new flow
+        // This frees both RAM (flow arrays) and VRAM (GPU models)
+        clearMemoryBeforeSwitch();
+        
+        // CRITICAL: Actually load the new flow into the server's memory cache
+        // Without this, tracking would still use the old flow field
+        final String finalSelectedMethod = selectedMethod;
+        setStatus("Loading " + selectedMethod.toUpperCase() + " flow into server...");
+        
+        SwingWorker<Boolean, Void> loadWorker = new SwingWorker<Boolean, Void>() {
+            @Override
+            protected Boolean doInBackground() throws Exception {
+                return loadFlowIntoServer(finalSelectedMethod);
+            }
+            
+            @Override
+            protected void done() {
+                try {
+                    Boolean success = get();
+                    if (success) {
+                        opticalFlowComputed = true;
+                        setStatus("Switched to " + finalSelectedMethod.toUpperCase() + " flow method");
+                        
+                        // IMPORTANT: Clear cached data from the previous flow field
+                        // This ensures tracks created with the new flow are consistent
+                        // We do this AFTER successful load so cancel can revert without data loss
+                        clearFlowDependentCaches();
+                        
+                        // Notify user of successful switch (no auto-prompt for visualization)
+                        JOptionPane.showMessageDialog(frame,
+                            "Switched to " + finalSelectedMethod.toUpperCase() + " flow method.\n\n" +
+                            "The new flow field is now active for tracking.\n" +
+                            "Note: Existing tracks may not align perfectly with the new flow.\n\n" +
+                            "Click 'Flow Viz' to view the motion field visualization.",
+                            "Flow Method Changed",
+                            JOptionPane.INFORMATION_MESSAGE);
+                    } else {
+                        // Revert the config change on failure
+                        config.setProperty("flow.method", currentMethod);
+                        setStatus("Failed to load " + finalSelectedMethod.toUpperCase() + " flow");
+                        JOptionPane.showMessageDialog(frame,
+                            "Failed to load the selected flow into the server.\n" +
+                            "Reverting to previous flow method: " + currentMethod.toUpperCase() + "\n\n" +
+                            "Try reloading the video or restarting the server.",
+                            "Warning",
+                            JOptionPane.WARNING_MESSAGE);
+                    }
+                } catch (Exception ex) {
+                    // Revert on exception too
+                    config.setProperty("flow.method", currentMethod);
+                    setStatus("Error switching flow: " + ex.getMessage());
+                }
+            }
+        };
+        loadWorker.execute();
+    }
+    
+    /**
+     * Clear the flow visualization and switch back to video view if needed.
+     * This properly disposes the ImagePlus to free memory.
+     * 
+     * Called when:
+     * - Switching optical flow methods
+     * - Recalculating optical flow
+     * - Loading a different flow file
+     */
+    private void clearFlowVisualizationAndSwitchToVideo() {
+        // Properly dispose the flow visualization ImagePlus to free memory
+        if (flowVisualization != null) {
+            try {
+                flowVisualization.close();
+            } catch (Exception e) {
+                // Ignore close errors - may already be disposed
+            }
+            flowVisualization = null;
+            System.out.println("[FlowViz] Cleared flow visualization from memory");
+        }
+        
+        // If currently showing flow visualization, switch back to video view
+        if (showingFlowViz) {
+            showingFlowViz = false;
+            if (flowVizToggle != null) {
+                flowVizToggle.setText("Flow Viz");
+                flowVizToggle.setToolTipText("Toggle optical flow visualization");
+            }
+            // Refresh the display to show video instead
+            loadSliceImage();
+            imageLabel.repaint();
+            System.out.println("[FlowViz] Switched back to video view");
+        }
+    }
+    
+    /**
+     * Clear caches that depend on the currently loaded optical flow.
+     * Called when switching flow methods to ensure consistency.
+     */
+    private void clearFlowDependentCaches() {
+        // Clear the flow visualization and switch to video view
+        clearFlowVisualizationAndSwitchToVideo();
+        
+        // Note: We do NOT clear tracks as they may still be useful for reference
+        // The user can manually delete tracks if desired
+        
+        // Refresh the display (in case showingFlowViz was already false)
+        loadSliceImage();
+        imageLabel.repaint();
+        
+        System.out.println("[FlowSwitch] Cleared flow-dependent caches");
+    }
+    
+    /**
+     * Load a specific flow method's cached file into the server's memory.
+     * This is necessary when switching flow methods to ensure tracking uses the correct flow field.
+     */
+    private boolean loadFlowIntoServer(String flowMethod) {
+        try {
+            File scriptFile = getTrackingScript();
+            if (!scriptFile.exists()) {
+                System.err.println("Tracking script not found: " + scriptFile.getAbsolutePath());
+                return false;
+            }
+            
+            String outputDir = getOutputDirectory();
+            String videoBaseName = new File(currentVideoPath).getName().replaceFirst("\\.[^.]+$", "");
+            
+            List<String> args = new ArrayList<>();
+            args.add("load_flow");
+            args.add("--tiff");
+            args.add(workingVideoPath);
+            args.add("--output-dir");
+            args.add(outputDir);
+            args.add("--flow-method");
+            args.add(flowMethod);
+            args.add("--video-name");
+            args.add(videoBaseName);  // Pass original video name for pattern matching
+            
+            List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
+            ProcessBuilder pb = new ProcessBuilder(command);
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+            
+            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+            String line;
+            while ((line = reader.readLine()) != null) {
+                System.out.println("[SwitchFlow] " + line);
+            }
+            
+            int exitCode = process.waitFor();
+            return exitCode == 0;
+        } catch (Exception e) {
+            System.err.println("Error loading flow into server: " + e.getMessage());
+            return false;
+        }
+    }
+
+    private void editConfiguration() {
+        JDialog configDialog = new JDialog(frame, "Edit Configuration", true);
+        configDialog.setLayout(new BorderLayout(10, 10));
+        configDialog.getContentPane().setBackground(SECONDARY_DARK);
+        
+        JPanel mainPanel = new JPanel();
+        mainPanel.setLayout(new BoxLayout(mainPanel, BoxLayout.Y_AXIS));
+        mainPanel.setBackground(SECONDARY_DARK);
+        mainPanel.setBorder(BorderFactory.createEmptyBorder(15, 20, 15, 20));
+        
+        // =====================================================================
+        // SECTION 1: Environment Settings (Collapsible)
+        // =====================================================================
+        JPanel envSection = createCollapsibleSection("Environment Settings", true);
+        JPanel envContent = (JPanel) ((BorderLayout) envSection.getLayout()).getLayoutComponent(BorderLayout.CENTER);
+        GridBagConstraints egbc = new GridBagConstraints();
+        egbc.insets = new Insets(4, 4, 4, 4);
+        egbc.fill = GridBagConstraints.HORIZONTAL;
+        egbc.anchor = GridBagConstraints.WEST;
+        int erow = 0;
+        
+        // Bash script path
+        egbc.gridx = 0; egbc.gridy = erow; egbc.weightx = 0.3;
+        envContent.add(createConfigLabel("Bash Script Path:"), egbc);
+        egbc.gridx = 1; egbc.weightx = 0.7;
+        JTextField bashScriptField = createConfigTextField(config.getProperty("bash.script.path", ""), 25);
+        JPanel bashScriptPanel = createPathFieldWithBrowse(bashScriptField, configDialog, false, 
+            new String[]{"Shell Scripts", "sh", "bash"}, "Select Bash Script");
+        envContent.add(bashScriptPanel, egbc);
+        erow++;
+        
+        // Local Python script
+        egbc.gridx = 0; egbc.gridy = erow; egbc.weightx = 0.3;
+        envContent.add(createConfigLabel("Python Script Path:"), egbc);
+        egbc.gridx = 1; egbc.weightx = 0.7;
+        JTextField pythonScriptField = createConfigTextField(config.getProperty("local.python.script", ""), 25);
+        JPanel pythonScriptPanel = createPathFieldWithBrowse(pythonScriptField, configDialog, false, 
+            new String[]{"Python Scripts", "py"}, "Select Python Script");
+        envContent.add(pythonScriptPanel, egbc);
+        erow++;
+        
+        // Conda environment
+        egbc.gridx = 0; egbc.gridy = erow; egbc.weightx = 0.3;
+        envContent.add(createConfigLabel("Conda Environment:"), egbc);
+        egbc.gridx = 1; egbc.weightx = 0.7;
+        JTextField condaEnvField = createConfigTextField(config.getProperty("local.conda.env", "ripple-env"), 30);
+        envContent.add(condaEnvField, egbc);
+        erow++;
+        
+        // Socket path (Unix domain socket for IPC)
+        egbc.gridx = 0; egbc.gridy = erow; egbc.weightx = 0.3;
+        JLabel socketLabel = createConfigLabel("Socket Path:");
+        socketLabel.setToolTipText("<html>Unix domain socket path for internal communication.<br>" +
+            "Change this if you run multiple instances or have permission issues.</html>");
+        envContent.add(socketLabel, egbc);
+        egbc.gridx = 1; egbc.weightx = 0.7;
+        JTextField socketPathField = createConfigTextField(config.getProperty("local.socket.path", "/tmp/ripple-env.sock"), 25);
+        JPanel socketPathPanel = createPathFieldWithBrowse(socketPathField, configDialog, true, null, "Select Socket Location");
+        envContent.add(socketPathPanel, egbc);
+        erow++;
+        
+        // Local work dir (for caching)
+        egbc.gridx = 0; egbc.gridy = erow; egbc.weightx = 0.3;
+        envContent.add(createConfigLabel("Work Dir (cache):"), egbc);
+        egbc.gridx = 1; egbc.weightx = 0.7;
+        JTextField workDirField = createConfigTextField(config.getProperty("local.work.dir", "/tmp/tracking_temp"), 25);
+        JPanel workDirPanel = createPathFieldWithBrowse(workDirField, configDialog, true, null, "Select Work Directory");
+        envContent.add(workDirPanel, egbc);
+        erow++;
+        
+        // Timeout
+        egbc.gridx = 0; egbc.gridy = erow; egbc.weightx = 0.3;
+        envContent.add(createConfigLabel("Timeout (seconds):"), egbc);
+        egbc.gridx = 1; egbc.weightx = 0.7;
+        JSpinner timeoutSpinner = new JSpinner(new SpinnerNumberModel(
+            Integer.parseInt(config.getProperty("local.timeout", "300")), 60, 3600, 30));
+        timeoutSpinner.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        ((JSpinner.DefaultEditor) timeoutSpinner.getEditor()).getTextField().setBackground(PANEL_DARK);
+        ((JSpinner.DefaultEditor) timeoutSpinner.getEditor()).getTextField().setForeground(TEXT_PRIMARY);
+        envContent.add(timeoutSpinner, egbc);
+        erow++;
+        
+        // Output directory
+        egbc.gridx = 0; egbc.gridy = erow; egbc.weightx = 0.3;
+        JLabel outputLabel = createConfigLabel("Output Directory:");
+        outputLabel.setToolTipText("<html>Output directory for annotations and flow files.<br>" +
+            "Use {VIDEO_DIR} to save in the same folder as the video.<br>" +
+            "Use {VIDEO_NAME} to include the video name in the path.</html>");
+        envContent.add(outputLabel, egbc);
+        egbc.gridx = 1; egbc.weightx = 0.7;
+        JTextField outputField = createConfigTextField(config.getProperty("output.directory", "{VIDEO_DIR}"), 25);
+        JPanel outputPanel = createPathFieldWithBrowse(outputField, configDialog, true, null, "Select Output Directory");
+        envContent.add(outputPanel, egbc);
+        erow++;
+        
+        // Cache optical flow to disk checkbox
+        egbc.gridx = 0; egbc.gridy = erow; egbc.gridwidth = 2; egbc.weightx = 1.0;
+        JCheckBox cacheFlowCheckbox = new JCheckBox("Cache optical flow files to disk (.npz)");
+        cacheFlowCheckbox.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        cacheFlowCheckbox.setForeground(TEXT_PRIMARY);
+        cacheFlowCheckbox.setBackground(PANEL_DARK);
+        cacheFlowCheckbox.setSelected(Boolean.parseBoolean(config.getProperty("cache.flow.to.disk", "false")));
+        cacheFlowCheckbox.setToolTipText("<html>When enabled, computed optical flow fields will be saved to disk<br>" +
+            "as .npz files for faster loading on subsequent runs.<br>" +
+            "Disable to reduce disk writes if you don't need caching.</html>");
+        envContent.add(cacheFlowCheckbox, egbc);
+        egbc.gridwidth = 1;
+        erow++;
+        
+        // GPU Selection (GPU mode only)
+        JComboBox<String> gpuSelectorCombo = null;
+        if (!isCpuOnly) {
+            egbc.gridx = 0; egbc.gridy = erow; egbc.weightx = 0.3;
+            JLabel gpuLabel = createConfigLabel("GPU Device:");
+            gpuLabel.setToolTipText("<html>Select which GPU to use for computation.<br>" +
+                "<b>Auto (All GPUs):</b> Use all available GPUs (default)<br>" +
+                "Select a specific GPU if you have multiple and want to dedicate one to RIPPLE.<br>" +
+                "<i>Note:</i> Requires server restart to take effect.</html>");
+            envContent.add(gpuLabel, egbc);
+            egbc.gridx = 1; egbc.weightx = 0.7;
+            
+            // Build GPU options list
+            List<String> gpuOptions = new ArrayList<>();
+            gpuOptions.add("Auto (All GPUs)");
+            for (String[] gpu : availableGpus) {
+                gpuOptions.add("GPU " + gpu[0] + ": " + gpu[1] + " (" + gpu[2] + " GB)");
+            }
+            gpuSelectorCombo = createConfigComboBox(gpuOptions.toArray(new String[0]));
+            
+            // Set current selection from config
+            String savedGpu = config.getProperty("gpu.device", "auto");
+            if ("auto".equals(savedGpu)) {
+                gpuSelectorCombo.setSelectedIndex(0);
+            } else {
+                try {
+                    int gpuIndex = Integer.parseInt(savedGpu);
+                    if (gpuIndex >= 0 && gpuIndex < availableGpus.size()) {
+                        gpuSelectorCombo.setSelectedIndex(gpuIndex + 1);
+                    } else {
+                        gpuSelectorCombo.setSelectedIndex(0);
+                    }
+                } catch (NumberFormatException e) {
+                    gpuSelectorCombo.setSelectedIndex(0);
+                }
+            }
+            envContent.add(gpuSelectorCombo, egbc);
+            erow++;
+        }
+        final JComboBox<String> finalGpuSelectorCombo = gpuSelectorCombo;
+        
+        mainPanel.add(envSection);
+        mainPanel.add(Box.createVerticalStrut(10));
+        
+        // =====================================================================
+        // SECTION 2: Optical Flow Settings (Always visible, controls sub-panels)
+        // =====================================================================
+        JPanel flowSection = createCollapsibleSection("Optical Flow Settings", true);
+        JPanel flowContent = (JPanel) ((BorderLayout) flowSection.getLayout()).getLayoutComponent(BorderLayout.CENTER);
+        GridBagConstraints fgbc = new GridBagConstraints();
+        fgbc.insets = new Insets(4, 4, 4, 4);
+        fgbc.fill = GridBagConstraints.HORIZONTAL;
+        fgbc.anchor = GridBagConstraints.WEST;
+        int frow = 0;
+        
+        // Optical flow method selector
+        fgbc.gridx = 0; fgbc.gridy = frow; fgbc.weightx = 0.3;
+        JLabel flowMethodLabel = createConfigLabel("Flow Method:");
+        flowMethodLabel.setToolTipText("Method for computing optical flow. RAFT uses GPU, DIS is CPU-based and fast, LocoTrack/Trackpy are better for fluorescent microscopy.");
+        flowContent.add(flowMethodLabel, fgbc);
+        fgbc.gridx = 1; fgbc.weightx = 0.7;
+        // Only show available methods based on execution mode
+        String[] advFlowMethods = isCpuOnly ? new String[]{"dis", "trackpy"} : new String[]{"raft", "dis", "locotrack", "trackpy"};
+        String advDefaultMethod = isCpuOnly ? "dis" : "raft";
+        JComboBox<String> flowMethodCombo = createConfigComboBox(advFlowMethods);
+        flowMethodCombo.setSelectedItem(config.getProperty("flow.method", advDefaultMethod));
+        flowContent.add(flowMethodCombo, fgbc);
+        frow++;
+        
+        // Low-memory mode checkbox (applies to all flow methods)
+        fgbc.gridx = 0; fgbc.gridy = frow; fgbc.gridwidth = 2; fgbc.weightx = 1.0;
+        String flowIncrementalConfig = config.getProperty("flow.incremental.allocation", "auto");
+        boolean flowDefaultIncremental;
+        if ("auto".equalsIgnoreCase(flowIncrementalConfig)) {
+            flowDefaultIncremental = getSystemMemoryGB() < 32;
+        } else {
+            flowDefaultIncremental = Boolean.parseBoolean(flowIncrementalConfig);
+        }
+        JCheckBox flowIncrementalAllocCheckbox = new JCheckBox("Low-memory mode (incremental allocation)");
+        flowIncrementalAllocCheckbox.setSelected(flowDefaultIncremental);
+        flowIncrementalAllocCheckbox.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+        flowIncrementalAllocCheckbox.setBackground(PANEL_DARK);
+        flowIncrementalAllocCheckbox.setForeground(TEXT_PRIMARY);
+        flowIncrementalAllocCheckbox.setToolTipText("<html>Enable for systems with less than 32GB RAM.<br>" +
+            "Uses incremental allocation that allows the OS to swap older<br>" +
+            "flow data to disk, preventing out-of-memory errors.<br>" +
+            "<b>Pros:</b> Prevents OOM on low-memory systems<br>" +
+            "<b>Cons:</b> May run slightly slower due to memory management<br>" +
+            "<b>Auto:</b> Enabled by default if system has &lt; 32GB RAM</html>");
+        flowContent.add(flowIncrementalAllocCheckbox, fgbc);
+        frow++;
+        fgbc.gridwidth = 1;
+        
+        // --- RAFT Settings Panel (shown when raft is selected, only available in GPU mode) ---
+        JPanel raftPanel = null;
+        JComboBox<String> modelCombo = null;
+        if (!isCpuOnly) {
+            fgbc.gridx = 0; fgbc.gridy = frow; fgbc.gridwidth = 2;
+            raftPanel = new JPanel(new GridBagLayout());
+            raftPanel.setBackground(PANEL_DARK);
+            raftPanel.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createTitledBorder(
+                    BorderFactory.createLineBorder(BORDER_DARK),
+                    "RAFT Settings",
+                    javax.swing.border.TitledBorder.DEFAULT_JUSTIFICATION,
+                    javax.swing.border.TitledBorder.DEFAULT_POSITION,
+                    new Font("Segoe UI", Font.BOLD, 11),
+                    TEXT_SECONDARY
+                ),
+                BorderFactory.createEmptyBorder(6, 8, 6, 8)
+            ));
+            GridBagConstraints rgbc = new GridBagConstraints();
+            rgbc.insets = new Insets(4, 4, 4, 4);
+            rgbc.fill = GridBagConstraints.HORIZONTAL;
+            
+            // Model size
+            rgbc.gridx = 0; rgbc.gridy = 0; rgbc.weightx = 0.4;
+            JLabel modelLabel = createConfigLabel("Model Size:");
+            modelLabel.setToolTipText("RAFT model size: 'large' is more accurate, 'small' is faster");
+            raftPanel.add(modelLabel, rgbc);
+            rgbc.gridx = 1; rgbc.weightx = 0.6;
+            modelCombo = createConfigComboBox(new String[]{"large", "small"});
+            modelCombo.setSelectedItem(config.getProperty("raft.model.size", "large"));
+            raftPanel.add(modelCombo, rgbc);
+            
+            flowContent.add(raftPanel, fgbc);
+            frow++;
+            fgbc.gridwidth = 1;
+        }
+        final JComboBox<String> finalModelCombo = modelCombo;
+        
+        // --- DIS Settings Panel (shown when dis is selected) ---
+        fgbc.gridx = 0; fgbc.gridy = frow; fgbc.gridwidth = 2;
+        JPanel disPanel = new JPanel(new GridBagLayout());
+        disPanel.setBackground(PANEL_DARK);
+        disPanel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createTitledBorder(
+                BorderFactory.createLineBorder(BORDER_DARK),
+                "DIS Settings (OpenCV CPU-based)",
+                javax.swing.border.TitledBorder.DEFAULT_JUSTIFICATION,
+                javax.swing.border.TitledBorder.DEFAULT_POSITION,
+                new Font("Segoe UI", Font.BOLD, 11),
+                TEXT_SECONDARY
+            ),
+            BorderFactory.createEmptyBorder(6, 8, 6, 8)
+        ));
+        GridBagConstraints dgbc = new GridBagConstraints();
+        dgbc.insets = new Insets(4, 4, 4, 4);
+        dgbc.fill = GridBagConstraints.HORIZONTAL;
+        
+        // Downsample factor
+        dgbc.gridx = 0; dgbc.gridy = 0; dgbc.weightx = 0.4;
+        JLabel dsLabel = createConfigLabel("Downsample Factor:");
+        dsLabel.setToolTipText("<html>Factor to downsample the image before computing flow.<br>" +
+            "Higher values = faster computation but less accuracy.<br>" +
+            "<b>1:</b> Full resolution (slowest, most accurate)<br>" +
+            "<b>2:</b> Half resolution (recommended)<br>" +
+            "<b>4:</b> Quarter resolution (fastest)</html>");
+        disPanel.add(dsLabel, dgbc);
+        dgbc.gridx = 1; dgbc.weightx = 0.6;
+        JSpinner disDownsampleSpinner = new JSpinner(new SpinnerNumberModel(
+            Integer.parseInt(config.getProperty("dis.downsample.factor", "2")), 1, 8, 1));
+        disDownsampleSpinner.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        ((JSpinner.DefaultEditor) disDownsampleSpinner.getEditor()).getTextField().setBackground(PANEL_DARK);
+        ((JSpinner.DefaultEditor) disDownsampleSpinner.getEditor()).getTextField().setForeground(TEXT_PRIMARY);
+        disPanel.add(disDownsampleSpinner, dgbc);
+        
+        // Blob Detection Checkbox
+        dgbc.gridx = 0; dgbc.gridy = 1; dgbc.gridwidth = 2;
+        JCheckBox disBlobDetectionCheckbox = new JCheckBox("Use Blob Detection for Rough Track");
+        disBlobDetectionCheckbox.setSelected(Boolean.parseBoolean(config.getProperty("dis.use.blob.detection", "false")));
+        disBlobDetectionCheckbox.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        disBlobDetectionCheckbox.setBackground(PANEL_DARK);
+        disBlobDetectionCheckbox.setForeground(TEXT_PRIMARY);
+        disBlobDetectionCheckbox.setToolTipText("<html>When enabled, rough track propagation uses optical flow<br>" +
+            "+ blob detection for more accurate tracking of bright objects.<br>" +
+            "Combines flow prediction with local blob search.</html>");
+        disPanel.add(disBlobDetectionCheckbox, dgbc);
+        
+        // Blob Detection Parameters Panel (shown when checkbox is checked)
+        dgbc.gridx = 0; dgbc.gridy = 2; dgbc.gridwidth = 2;
+        JPanel blobParamsPanel = new JPanel(new GridBagLayout());
+        blobParamsPanel.setBackground(PANEL_DARK);
+        blobParamsPanel.setBorder(BorderFactory.createEmptyBorder(4, 20, 4, 4));
+        GridBagConstraints bgbc = new GridBagConstraints();
+        bgbc.insets = new Insets(2, 4, 2, 4);
+        bgbc.fill = GridBagConstraints.HORIZONTAL;
+        
+        // Search Radius
+        bgbc.gridx = 0; bgbc.gridy = 0; bgbc.weightx = 0.5;
+        JLabel searchRadiusLabel = createConfigLabel("Search Radius:");
+        searchRadiusLabel.setToolTipText("<html>Radius around flow-predicted position to search for blobs.<br>" +
+            "Larger values are more tolerant of flow errors but slower.</html>");
+        blobParamsPanel.add(searchRadiusLabel, bgbc);
+        bgbc.gridx = 1; bgbc.weightx = 0.5;
+        JSpinner disBlobSearchRadiusSpinner = new JSpinner(new SpinnerNumberModel(
+            Integer.parseInt(config.getProperty("dis.blob.search.radius", "15")), 5, 50, 1));
+        disBlobSearchRadiusSpinner.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        ((JSpinner.DefaultEditor) disBlobSearchRadiusSpinner.getEditor()).getTextField().setBackground(PANEL_DARK);
+        ((JSpinner.DefaultEditor) disBlobSearchRadiusSpinner.getEditor()).getTextField().setForeground(TEXT_PRIMARY);
+        blobParamsPanel.add(disBlobSearchRadiusSpinner, bgbc);
+        
+        // Blob Radius
+        bgbc.gridx = 0; bgbc.gridy = 1; bgbc.weightx = 0.5;
+        JLabel blobRadiusLabel = createConfigLabel("Blob Radius (px):");
+        blobRadiusLabel.setToolTipText("<html>Expected radius of the blob/object being tracked.<br>" +
+            "Should match the approximate size of the tracked object.</html>");
+        blobParamsPanel.add(blobRadiusLabel, bgbc);
+        bgbc.gridx = 1; bgbc.weightx = 0.5;
+        JSpinner disBlobRadiusSpinner = new JSpinner(new SpinnerNumberModel(
+            Double.parseDouble(config.getProperty("dis.blob.radius", "5.0")), 1.0, 50.0, 0.5));
+        disBlobRadiusSpinner.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        ((JSpinner.DefaultEditor) disBlobRadiusSpinner.getEditor()).getTextField().setBackground(PANEL_DARK);
+        ((JSpinner.DefaultEditor) disBlobRadiusSpinner.getEditor()).getTextField().setForeground(TEXT_PRIMARY);
+        blobParamsPanel.add(disBlobRadiusSpinner, bgbc);
+        
+        disPanel.add(blobParamsPanel, dgbc);
+        
+        // Show/hide blob params based on checkbox
+        blobParamsPanel.setVisible(disBlobDetectionCheckbox.isSelected());
+        disBlobDetectionCheckbox.addActionListener(e -> {
+            blobParamsPanel.setVisible(disBlobDetectionCheckbox.isSelected());
+            disPanel.revalidate();
+            disPanel.repaint();
+        });
+        
+        // Advanced section
+        dgbc.gridx = 0; dgbc.gridy = 3; dgbc.gridwidth = 2;
+        JPanel disAdvancedPanel = new JPanel(new GridBagLayout());
+        disAdvancedPanel.setBackground(PANEL_DARK);
+        disAdvancedPanel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createTitledBorder(
+                BorderFactory.createLineBorder(BORDER_DARK),
+                "Advanced",
+                javax.swing.border.TitledBorder.DEFAULT_JUSTIFICATION,
+                javax.swing.border.TitledBorder.DEFAULT_POSITION,
+                new Font("Segoe UI", Font.PLAIN, 10),
+                TEXT_SECONDARY
+            ),
+            BorderFactory.createEmptyBorder(2, 4, 2, 4)
+        ));
+        GridBagConstraints agbc = new GridBagConstraints();
+        agbc.insets = new Insets(2, 4, 2, 4);
+        agbc.fill = GridBagConstraints.HORIZONTAL;
+        agbc.gridx = 0; agbc.gridy = 0; agbc.gridwidth = 2;
+        
+        JCheckBox disCacheVideoCheckbox = new JCheckBox("Cache video in memory for blob detection");
+        disCacheVideoCheckbox.setSelected(Boolean.parseBoolean(config.getProperty("dis.cache.video", "false")));
+        disCacheVideoCheckbox.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+        disCacheVideoCheckbox.setBackground(PANEL_DARK);
+        disCacheVideoCheckbox.setForeground(TEXT_PRIMARY);
+        disCacheVideoCheckbox.setToolTipText("<html>When enabled, keeps the video in memory between blob detection calls.<br>" +
+            "<b>Pros:</b> Faster repeated operations (avoids reloading AVI/TIFF each time)<br>" +
+            "<b>Cons:</b> Uses more memory (up to ~1GB for large videos)<br>" +
+            "Recommended for intensive blob-assisted tracking sessions.</html>");
+        disAdvancedPanel.add(disCacheVideoCheckbox, agbc);
+        
+        disPanel.add(disAdvancedPanel, dgbc);
+        
+        // Info label
+        dgbc.gridx = 0; dgbc.gridy = 4; dgbc.gridwidth = 2;
+        JLabel disInfoLabel = createConfigLabel("<html><i>DIS uses OpenCV's Dense Inverse Search algorithm.<br>" +
+            "Fast CPU-based method, good for general motion tracking.</i></html>");
+        disInfoLabel.setForeground(TEXT_SECONDARY);
+        disPanel.add(disInfoLabel, dgbc);
+        dgbc.gridwidth = 1;
+        
+        flowContent.add(disPanel, fgbc);
+        frow++;
+        fgbc.gridwidth = 1;
+        
+        // --- LocoTrack/DoG Settings Panel (shown when locotrack is selected, only in GPU mode) ---
+        JPanel locotrackPanel = null;
+        if (!isCpuOnly) {
+            fgbc.gridx = 0; fgbc.gridy = frow; fgbc.gridwidth = 2;
+            locotrackPanel = new JPanel(new GridBagLayout());
+            locotrackPanel.setBackground(PANEL_DARK);
+            locotrackPanel.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createTitledBorder(
+                    BorderFactory.createLineBorder(BORDER_DARK),
+                    "LocoTrack/DoG Settings (TrackMate-style)",
+                    javax.swing.border.TitledBorder.DEFAULT_JUSTIFICATION,
+                    javax.swing.border.TitledBorder.DEFAULT_POSITION,
+                new Font("Segoe UI", Font.BOLD, 11),
+                TEXT_SECONDARY
+            ),
+            BorderFactory.createEmptyBorder(6, 8, 6, 8)
+        ));
+        GridBagConstraints tgbc = new GridBagConstraints();
+        tgbc.insets = new Insets(3, 4, 3, 4);
+        tgbc.fill = GridBagConstraints.HORIZONTAL;
+        
+        // Estimated Object Radius with unit label
+        tgbc.gridx = 0; tgbc.gridy = 0; tgbc.weightx = 0.3;
+        JLabel radiusLabel = createConfigLabel("Estimated Radius:");
+        radiusLabel.setToolTipText("<html>Estimated radius of objects to detect in pixels.<br>" +
+            "This determines the scale at which DoG filtering operates.<br>" +
+            "<b>Tip:</b> Measure object diameter in ImageJ/Fiji and divide by 2.</html>");
+        locotrackPanel.add(radiusLabel, tgbc);
+        tgbc.gridx = 1; tgbc.weightx = 0.4;
+        JSpinner radiusSpinner = new JSpinner(new SpinnerNumberModel(
+            Double.parseDouble(config.getProperty("locotrack.dog.radius", "2.5")), 0.5, 100.0, 0.5));
+        radiusSpinner.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        ((JSpinner.DefaultEditor) radiusSpinner.getEditor()).getTextField().setBackground(PANEL_DARK);
+        ((JSpinner.DefaultEditor) radiusSpinner.getEditor()).getTextField().setForeground(TEXT_PRIMARY);
+        locotrackPanel.add(radiusSpinner, tgbc);
+        tgbc.gridx = 2; tgbc.weightx = 0.3;
+        JLabel radiusUnitLabel = createConfigLabel("px");
+        radiusUnitLabel.setForeground(TEXT_SECONDARY);
+        locotrackPanel.add(radiusUnitLabel, tgbc);
+        
+        // Quality Threshold with unit hint
+        tgbc.gridx = 0; tgbc.gridy = 1; tgbc.weightx = 0.3;
+        JLabel dogThresholdLabel = createConfigLabel("Quality Threshold:");
+        dogThresholdLabel.setToolTipText("<html>Quality threshold for detected spots.<br>" +
+            "Higher values = fewer but higher quality detections.<br>" +
+            "Set to 0 to accept all detections.<br>" +
+            "<b>Typical range:</b> 0-100 depending on image intensity.</html>");
+        locotrackPanel.add(dogThresholdLabel, tgbc);
+        tgbc.gridx = 1; tgbc.weightx = 0.4;
+        JSpinner dogThresholdSpinner = new JSpinner(new SpinnerNumberModel(
+            Double.parseDouble(config.getProperty("locotrack.dog.threshold", "0.0")), 0.0, 1000.0, 1.0));
+        dogThresholdSpinner.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        ((JSpinner.DefaultEditor) dogThresholdSpinner.getEditor()).getTextField().setBackground(PANEL_DARK);
+        ((JSpinner.DefaultEditor) dogThresholdSpinner.getEditor()).getTextField().setForeground(TEXT_PRIMARY);
+        locotrackPanel.add(dogThresholdSpinner, tgbc);
+        tgbc.gridx = 2; tgbc.weightx = 0.3;
+        JLabel thresholdHintLabel = createConfigLabel("(intensity)");
+        thresholdHintLabel.setForeground(TEXT_SECONDARY);
+        locotrackPanel.add(thresholdHintLabel, tgbc);
+        
+        // Median Filter Checkbox
+        tgbc.gridx = 0; tgbc.gridy = 2; tgbc.gridwidth = 3;
+        JCheckBox medianFilterCheckbox = createStyledCheckbox("Pre-process with median filter");
+        medianFilterCheckbox.setSelected(Boolean.parseBoolean(config.getProperty("locotrack.dog.median.filter", "false")));
+        medianFilterCheckbox.setToolTipText("<html>Apply a 3x3 median filter before detection.<br>Helps reduce salt-and-pepper noise.</html>");
+        locotrackPanel.add(medianFilterCheckbox, tgbc);
+        tgbc.gridwidth = 1;
+        
+        // Sub-pixel Localization Checkbox
+        tgbc.gridx = 0; tgbc.gridy = 3; tgbc.gridwidth = 3;
+        JCheckBox subpixelCheckbox = createStyledCheckbox("Sub-pixel localization");
+        subpixelCheckbox.setSelected(Boolean.parseBoolean(config.getProperty("locotrack.dog.subpixel", "true")));
+        subpixelCheckbox.setToolTipText("<html>Refine spot positions to sub-pixel accuracy.<br>Uses quadratic fitting for more precise localization.</html>");
+        locotrackPanel.add(subpixelCheckbox, tgbc);
+        tgbc.gridwidth = 1;
+        
+        // Occlusion Threshold with unit
+        tgbc.gridx = 0; tgbc.gridy = 4; tgbc.weightx = 0.3;
+        JLabel occlusionLabel = createConfigLabel("Occlusion Threshold:");
+        occlusionLabel.setToolTipText("<html>Maximum occlusion fraction to keep a trajectory.<br>" +
+            "<b>Range:</b> 0-1 (higher = keep more occluded tracks)</html>");
+        locotrackPanel.add(occlusionLabel, tgbc);
+        tgbc.gridx = 1; tgbc.weightx = 0.4;
+        JSpinner occlusionSpinner = new JSpinner(new SpinnerNumberModel(
+            Double.parseDouble(config.getProperty("locotrack.occlusion.threshold", "0.5")), 0.0, 1.0, 0.05));
+        occlusionSpinner.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        ((JSpinner.DefaultEditor) occlusionSpinner.getEditor()).getTextField().setBackground(PANEL_DARK);
+        ((JSpinner.DefaultEditor) occlusionSpinner.getEditor()).getTextField().setForeground(TEXT_PRIMARY);
+        locotrackPanel.add(occlusionSpinner, tgbc);
+        tgbc.gridx = 2; tgbc.weightx = 0.3;
+        JLabel occlusionUnitLabel = createConfigLabel("(0-1)");
+        occlusionUnitLabel.setForeground(TEXT_SECONDARY);
+        locotrackPanel.add(occlusionUnitLabel, tgbc);
+        
+        // Interpolation Kernel
+        tgbc.gridx = 0; tgbc.gridy = 5; tgbc.weightx = 0.3;
+        JLabel locotrackKernelLabel = createConfigLabel("Interpolation Kernel:");
+        locotrackKernelLabel.setToolTipText("<html>Kernel for flow interpolation:<br>" +
+            "• gaussian_rbf: Gaussian RBF (GRBF) - accurate, recommended<br>" +
+            "• gaussian: GPU Gaussian kernel - fast<br>" +
+            "• thin_plate_spline: Thin-plate spline RBF<br>" +
+            "• idw: Inverse Distance Weighting<br>" +
+            "• wendland: Wendland kernel (compact support)</html>");
+        locotrackPanel.add(locotrackKernelLabel, tgbc);
+        tgbc.gridx = 1; tgbc.gridwidth = 2; tgbc.weightx = 0.7;
+        JComboBox<String> locotrackKernelCombo = createConfigComboBox(new String[]{"gaussian_rbf", "gaussian", "thin_plate_spline", "idw", "wendland", "multiquadric"});
+        locotrackKernelCombo.setSelectedItem(config.getProperty("locotrack.kernel", "gaussian_rbf"));
+        locotrackPanel.add(locotrackKernelCombo, tgbc);
+        tgbc.gridwidth = 1;
+        
+        // Preview button
+        tgbc.gridx = 0; tgbc.gridy = 7; tgbc.gridwidth = 3;
+        JButton previewButton = createAccentButton("Preview Detection", null);
+        previewButton.setToolTipText("Preview detected spots overlaid on the main view (current frame)");
+        previewButton.addActionListener(e -> {
+            if (currentVideoPath == null) {
+                JOptionPane.showMessageDialog(configDialog, 
+                    "Please load a video first to preview spot detection.",
+                    "No Video Loaded", JOptionPane.WARNING_MESSAGE);
+                return;
+            }
+            previewButton.setEnabled(false);
+            // Capture parameters
+            final double capturedRadius = (Double) radiusSpinner.getValue();
+            final Double capturedViewMin = viewMin;
+            final Double capturedViewMax = viewMax;
+            final int capturedFrame = currentSlice - 1;  // 0-indexed frame for detection
+            
+            // Start elapsed time counter
+            final long detectionStartTime = System.currentTimeMillis();
+            final Timer elapsedTimer = new Timer(1000, evt -> {
+                long elapsed = (System.currentTimeMillis() - detectionStartTime) / 1000;
+                previewButton.setText(String.format("Detecting... (%ds)", elapsed));
+            });
+            previewButton.setText("Detecting... (0s)");
+            elapsedTimer.start();
+            
+            new SwingWorker<List<double[]>, Void>() {
+                @Override
+                protected List<double[]> doInBackground() throws Exception {
+                    return generateDogPreview(
+                        capturedRadius,
+                        (Double) dogThresholdSpinner.getValue(),
+                        medianFilterCheckbox.isSelected(),
+                        subpixelCheckbox.isSelected(),
+                        capturedFrame,
+                        capturedViewMin,
+                        capturedViewMax
+                    );
+                }
+                @Override
+                protected void done() {
+                    elapsedTimer.stop();
+                    previewButton.setEnabled(true);
+                    previewButton.setText("Preview Detection");
+                    try {
+                        List<double[]> spots = get();
+                        if (spots != null && !spots.isEmpty()) {
+                            // Hide config dialog and enter preview mode
+                            configDialog.setVisible(false);
+                            enterPreviewMode("dog", spots, capturedRadius, configDialog);
+                        } else {
+                            JOptionPane.showMessageDialog(configDialog,
+                                "No spots detected with current settings.\nTry lowering the threshold.",
+                                "No Spots Detected", JOptionPane.WARNING_MESSAGE);
+                        }
+                    } catch (Exception ex) {
+                        JOptionPane.showMessageDialog(configDialog,
+                            "Error generating preview:\n" + ex.getMessage(),
+                            "Preview Error", JOptionPane.ERROR_MESSAGE);
+                    }
+                }
+            }.execute();
+        });
+        locotrackPanel.add(previewButton, tgbc);
+        
+        flowContent.add(locotrackPanel, fgbc);
+        frow++;
+        fgbc.gridwidth = 1;
+        } // End of isCpuOnly conditional for LocoTrack panel
+        
+        // --- Trackpy Settings Panel (shown when trackpy is selected) ---
+        // Uses native trackpy detection (tp.locate/tp.batch) for particle detection
+        fgbc.gridx = 0; fgbc.gridy = frow; fgbc.gridwidth = 2;
+        JPanel trackpyPanel = new JPanel(new GridBagLayout());
+        trackpyPanel.setBackground(PANEL_DARK);
+        trackpyPanel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createTitledBorder(
+                BorderFactory.createLineBorder(BORDER_DARK),
+                "Trackpy Settings (Native Detection + Trajectory Linking)",
+                javax.swing.border.TitledBorder.DEFAULT_JUSTIFICATION,
+                javax.swing.border.TitledBorder.DEFAULT_POSITION,
+                new Font("Segoe UI", Font.BOLD, 11),
+                TEXT_SECONDARY
+            ),
+            BorderFactory.createEmptyBorder(6, 8, 6, 8)
+        ));
+        GridBagConstraints tpgbc = new GridBagConstraints();
+        tpgbc.insets = new Insets(3, 4, 3, 4);
+        tpgbc.fill = GridBagConstraints.HORIZONTAL;
+        
+        // === Native Trackpy Detection Parameters ===
+        // Diameter (characteristic feature size, should be odd integer)
+        tpgbc.gridx = 0; tpgbc.gridy = 0; tpgbc.weightx = 0.3;
+        JLabel tpDiameterLabel = createConfigLabel("Diameter:");
+        tpDiameterLabel.setToolTipText("<html>Characteristic feature diameter in pixels.<br>" +
+            "Should be an odd integer roughly matching your particle size.<br>" +
+            "Larger values detect larger particles.</html>");
+        trackpyPanel.add(tpDiameterLabel, tpgbc);
+        tpgbc.gridx = 1; tpgbc.weightx = 0.4;
+        JSpinner tpDiameterSpinner = new JSpinner(new SpinnerNumberModel(
+            Integer.parseInt(config.getProperty("trackpy.diameter", "11")), 3, 101, 2));
+        tpDiameterSpinner.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        ((JSpinner.DefaultEditor) tpDiameterSpinner.getEditor()).getTextField().setBackground(PANEL_DARK);
+        ((JSpinner.DefaultEditor) tpDiameterSpinner.getEditor()).getTextField().setForeground(TEXT_PRIMARY);
+        trackpyPanel.add(tpDiameterSpinner, tpgbc);
+        tpgbc.gridx = 2; tpgbc.weightx = 0.3;
+        JLabel tpDiameterUnitLabel = createConfigLabel("px (odd)");
+        tpDiameterUnitLabel.setForeground(TEXT_SECONDARY);
+        trackpyPanel.add(tpDiameterUnitLabel, tpgbc);
+        
+        // Minmass (minimum integrated brightness)
+        tpgbc.gridx = 0; tpgbc.gridy = 1; tpgbc.weightx = 0.3;
+        JLabel tpMinmassLabel = createConfigLabel("Min Mass:");
+        tpMinmassLabel.setToolTipText("<html>Minimum integrated brightness threshold.<br>" +
+            "Particles with total intensity below this are rejected.<br>" +
+            "Set to 0 to accept all detections, increase to filter dim spots.</html>");
+        trackpyPanel.add(tpMinmassLabel, tpgbc);
+        tpgbc.gridx = 1; tpgbc.weightx = 0.4;
+        JSpinner tpMinmassSpinner = new JSpinner(new SpinnerNumberModel(
+            Double.parseDouble(config.getProperty("trackpy.minmass", "0")), 0.0, 100000.0, 100.0));
+        tpMinmassSpinner.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        ((JSpinner.DefaultEditor) tpMinmassSpinner.getEditor()).getTextField().setBackground(PANEL_DARK);
+        ((JSpinner.DefaultEditor) tpMinmassSpinner.getEditor()).getTextField().setForeground(TEXT_PRIMARY);
+        trackpyPanel.add(tpMinmassSpinner, tpgbc);
+        tpgbc.gridx = 2; tpgbc.weightx = 0.3;
+        JLabel tpMinmassHintLabel = createConfigLabel("(brightness)");
+        tpMinmassHintLabel.setForeground(TEXT_SECONDARY);
+        trackpyPanel.add(tpMinmassHintLabel, tpgbc);
+        // === Trackpy Linking Parameters ===
+        // Search Range
+        tpgbc.gridx = 0; tpgbc.gridy = 2; tpgbc.weightx = 0.3;
+        JLabel searchRangeLabel = createConfigLabel("Search Range:");
+        searchRangeLabel.setToolTipText("Maximum distance particles can move between frames (for linking)");
+        trackpyPanel.add(searchRangeLabel, tpgbc);
+        tpgbc.gridx = 1; tpgbc.weightx = 0.4;
+        JSpinner searchRangeSpinner = new JSpinner(new SpinnerNumberModel(
+            Double.parseDouble(config.getProperty("trackpy.search.range", "15")), 1, 100, 1));
+        searchRangeSpinner.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        ((JSpinner.DefaultEditor) searchRangeSpinner.getEditor()).getTextField().setBackground(PANEL_DARK);
+        ((JSpinner.DefaultEditor) searchRangeSpinner.getEditor()).getTextField().setForeground(TEXT_PRIMARY);
+        trackpyPanel.add(searchRangeSpinner, tpgbc);
+        tpgbc.gridx = 2; tpgbc.weightx = 0.3;
+        JLabel searchRangeUnitLabel = createConfigLabel("px");
+        searchRangeUnitLabel.setForeground(TEXT_SECONDARY);
+        trackpyPanel.add(searchRangeUnitLabel, tpgbc);
+        
+        // Memory
+        tpgbc.gridx = 0; tpgbc.gridy = 3;
+        JLabel memoryLabel = createConfigLabel("Memory:");
+        memoryLabel.setToolTipText("Number of frames a particle can disappear and still be linked");
+        trackpyPanel.add(memoryLabel, tpgbc);
+        tpgbc.gridx = 1;
+        JSpinner memorySpinner = new JSpinner(new SpinnerNumberModel(
+            Integer.parseInt(config.getProperty("trackpy.memory", "5")), 0, 50, 1));
+        memorySpinner.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        ((JSpinner.DefaultEditor) memorySpinner.getEditor()).getTextField().setBackground(PANEL_DARK);
+        ((JSpinner.DefaultEditor) memorySpinner.getEditor()).getTextField().setForeground(TEXT_PRIMARY);
+        trackpyPanel.add(memorySpinner, tpgbc);
+        tpgbc.gridx = 2;
+        JLabel memoryUnitLabel = createConfigLabel("frames");
+        memoryUnitLabel.setForeground(TEXT_SECONDARY);
+        trackpyPanel.add(memoryUnitLabel, tpgbc);
+        
+        // Require Persistent
+        tpgbc.gridx = 0; tpgbc.gridy = 4; tpgbc.gridwidth = 3;
+        JCheckBox requirePersistentCheck = createStyledCheckbox("Require Persistent Trajectories");
+        requirePersistentCheck.setSelected(Boolean.parseBoolean(config.getProperty("trackpy.require.persistent", "false")));
+        requirePersistentCheck.setToolTipText("<html>Only use trajectories that appear in all frames.<br>Unchecked allows partial trajectories for denser flow.</html>");
+        trackpyPanel.add(requirePersistentCheck, tpgbc);
+        tpgbc.gridwidth = 1;
+        
+        // === Spectral Smoothing ===
+        // Smooth Factor
+        tpgbc.gridx = 0; tpgbc.gridy = 5;
+        JLabel smoothFactorLabel = createConfigLabel("Smooth Factor:");
+        smoothFactorLabel.setToolTipText("Spectral smoothing factor (0-1, higher = smoother trajectories)");
+        trackpyPanel.add(smoothFactorLabel, tpgbc);
+        tpgbc.gridx = 1;
+        JSpinner smoothFactorSpinner = new JSpinner(new SpinnerNumberModel(
+            Double.parseDouble(config.getProperty("trackpy.smooth.factor", "0.1")), 0.0, 1.0, 0.05));
+        smoothFactorSpinner.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        ((JSpinner.DefaultEditor) smoothFactorSpinner.getEditor()).getTextField().setBackground(PANEL_DARK);
+        ((JSpinner.DefaultEditor) smoothFactorSpinner.getEditor()).getTextField().setForeground(TEXT_PRIMARY);
+        trackpyPanel.add(smoothFactorSpinner, tpgbc);
+        tpgbc.gridx = 2;
+        JLabel smoothFactorUnitLabel = createConfigLabel("(0-1)");
+        smoothFactorUnitLabel.setForeground(TEXT_SECONDARY);
+        trackpyPanel.add(smoothFactorUnitLabel, tpgbc);
+        
+        // === Flow Field Generation ===
+        // Flow Smoothing
+        tpgbc.gridx = 0; tpgbc.gridy = 6;
+        JLabel flowSmoothingLabel = createConfigLabel("Flow Smoothing:");
+        flowSmoothingLabel.setToolTipText("Interpolation bandwidth for flow field generation");
+        trackpyPanel.add(flowSmoothingLabel, tpgbc);
+        tpgbc.gridx = 1;
+        JSpinner flowSmoothingSpinner = new JSpinner(new SpinnerNumberModel(
+            Double.parseDouble(config.getProperty("trackpy.flow.smoothing", "15")), 1, 100, 1));
+        flowSmoothingSpinner.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        ((JSpinner.DefaultEditor) flowSmoothingSpinner.getEditor()).getTextField().setBackground(PANEL_DARK);
+        ((JSpinner.DefaultEditor) flowSmoothingSpinner.getEditor()).getTextField().setForeground(TEXT_PRIMARY);
+        trackpyPanel.add(flowSmoothingSpinner, tpgbc);
+        
+        // Kernel
+        tpgbc.gridx = 0; tpgbc.gridy = 7;
+        JLabel kernelLabel = createConfigLabel("Interpolation Kernel:");
+        kernelLabel.setToolTipText("<html>Kernel for flow interpolation:<br>" +
+            "• gaussian_rbf: Gaussian RBF (GRBF) - accurate, recommended<br>" +
+            (isCpuOnly ? "" : "• gaussian: GPU Gaussian kernel - fast<br>") +
+            "• thin_plate_spline: Thin-plate spline RBF<br>" +
+            (isCpuOnly ? "" : "• idw: Inverse Distance Weighting<br>") +
+            (isCpuOnly ? "" : "• wendland: Wendland kernel (compact support)<br>") +
+            "• multiquadric: Multiquadric RBF</html>");
+        trackpyPanel.add(kernelLabel, tpgbc);
+        tpgbc.gridx = 1; tpgbc.gridwidth = 2;
+        // In CPU mode, hide GPU-only kernels
+        String[] advKernels = isCpuOnly 
+            ? new String[]{"gaussian_rbf", "thin_plate_spline", "multiquadric"}
+            : new String[]{"gaussian_rbf", "gaussian", "thin_plate_spline", "idw", "wendland", "multiquadric"};
+        JComboBox<String> kernelCombo = createConfigComboBox(advKernels);
+        String savedAdvKernel = config.getProperty("trackpy.kernel", "gaussian_rbf");
+        if (isCpuOnly && isGpuOnlyKernel(savedAdvKernel)) {
+            savedAdvKernel = "gaussian_rbf";
+        }
+        kernelCombo.setSelectedItem(savedAdvKernel);
+        trackpyPanel.add(kernelCombo, tpgbc);
+        tpgbc.gridwidth = 1;
+        
+        // Preview button for trackpy (uses native trackpy detection with trajectory linking)
+        tpgbc.gridx = 0; tpgbc.gridy = 8; tpgbc.gridwidth = 3;
+        JButton trackpyPreviewButton = createAccentButton("Preview Trajectories", null);
+        trackpyPreviewButton.setToolTipText("<html>Preview trackpy particle tracking with full trajectories.<br>" +
+            "Trajectories will be overlaid on the video and you can freely navigate frames.</html>");
+        trackpyPreviewButton.addActionListener(e -> {
+            if (currentVideoPath == null) {
+                JOptionPane.showMessageDialog(configDialog, 
+                    "Please load a video first to preview particle tracking.",
+                    "No Video Loaded", JOptionPane.WARNING_MESSAGE);
+                return;
+            }
+            trackpyPreviewButton.setEnabled(false);
+            trackpyPreviewButton.setText("Tracking...");
+            // Capture parameters (native trackpy)
+            final int capturedDiameter = (Integer) tpDiameterSpinner.getValue();
+            final double capturedMinmass = (Double) tpMinmassSpinner.getValue();
+            final double capturedSearchRange = (Double) searchRangeSpinner.getValue();
+            final int capturedMemory = (Integer) memorySpinner.getValue();
+            final boolean capturedRequirePersistent = requirePersistentCheck.isSelected();
+            new SwingWorker<Map<String, Object>, Void>() {
+                @Override
+                protected Map<String, Object> doInBackground() throws Exception {
+                    // Use native trackpy trajectory preview
+                    return generateTrackpyTrajectoryPreview(
+                        capturedDiameter,
+                        capturedMinmass,
+                        capturedSearchRange,
+                        capturedMemory,
+                        0,  // Start from frame 0
+                        -1,  // Process all frames
+                        capturedRequirePersistent  // Filter persistent trajectories only
+                    );
+                }
+                @SuppressWarnings("unchecked")
+                @Override
+                protected void done() {
+                    trackpyPreviewButton.setEnabled(true);
+                    trackpyPreviewButton.setText("Preview Trajectories");
+                    try {
+                        Map<String, Object> result = get();
+                        if (result != null) {
+                            List<Map<String, Object>> trajectories = (List<Map<String, Object>>) result.get("trajectories");
+                            Map<Integer, List<double[]>> detectionsPerFrame = (Map<Integer, List<double[]>>) result.get("detections_per_frame");
+                            if (trajectories != null && !trajectories.isEmpty()) {
+                                // Hide config dialog and enter trajectory preview mode
+                                configDialog.setVisible(false);
+                                enterTrajectoryPreviewMode(trajectories, detectionsPerFrame, 
+                                    trajectories.size(), capturedDiameter / 2.0, 0, -1, configDialog);
+                            } else {
+                                JOptionPane.showMessageDialog(configDialog,
+                                    "No trajectories detected with current settings.\nTry adjusting diameter or minmass.",
+                                    "No Trajectories Detected", JOptionPane.WARNING_MESSAGE);
+                            }
+                        } else {
+                            JOptionPane.showMessageDialog(configDialog,
+                                "Failed to generate trajectory preview.\nCheck console for errors.",
+                                "Preview Error", JOptionPane.ERROR_MESSAGE);
+                        }
+                    } catch (Exception ex) {
+                        JOptionPane.showMessageDialog(configDialog,
+                            "Error generating preview:\n" + ex.getMessage(),
+                            "Preview Error", JOptionPane.ERROR_MESSAGE);
+                    }
+                }
+            }.execute();
+        });
+        trackpyPanel.add(trackpyPreviewButton, tpgbc);
+        
+        flowContent.add(trackpyPanel, fgbc);
+        frow++;
+        fgbc.gridwidth = 1;
+        
+        // Capture final references for lambda
+        final JPanel finalRaftPanel = raftPanel;
+        final JPanel finalLocotrackPanel = locotrackPanel;
+        
+        // Show/hide panels based on flow method selection
+        Runnable updateFlowPanelVisibility = () -> {
+            String method = (String) flowMethodCombo.getSelectedItem();
+            boolean showRaft = "raft".equals(method);
+            boolean showDis = "dis".equals(method);
+            boolean showLocotrack = "locotrack".equals(method);
+            boolean showTrackpy = "trackpy".equals(method);
+            
+            // Only show panels if they exist (GPU-only panels are null in CPU mode)
+            if (finalRaftPanel != null) finalRaftPanel.setVisible(showRaft);
+            disPanel.setVisible(showDis);
+            if (finalLocotrackPanel != null) finalLocotrackPanel.setVisible(showLocotrack);
+            trackpyPanel.setVisible(showTrackpy);
+            
+            configDialog.pack();
+        };
+        flowMethodCombo.addActionListener(e -> updateFlowPanelVisibility.run());
+        updateFlowPanelVisibility.run();
+        
+        // Auto compute checkbox
+        fgbc.gridx = 0; fgbc.gridy = frow; fgbc.gridwidth = 2;
+        JCheckBox autoComputeCheck = createStyledCheckbox("Auto-prompt to compute optical flow on video load");
+        autoComputeCheck.setSelected(Boolean.parseBoolean(config.getProperty("auto.compute.optical.flow", "true")));
+        flowContent.add(autoComputeCheck, fgbc);
+        
+        mainPanel.add(flowSection);
+        mainPanel.add(Box.createVerticalStrut(10));
+        
+        // =====================================================================
+        // SECTION 3: Tracking Settings (Collapsible)
+        // =====================================================================
+        JPanel trackSection = createCollapsibleSection("Tracking Settings", true);
+        JPanel trackContent = (JPanel) ((BorderLayout) trackSection.getLayout()).getLayoutComponent(BorderLayout.CENTER);
+        GridBagConstraints trgbc = new GridBagConstraints();
+        trgbc.insets = new Insets(4, 4, 4, 4);
+        trgbc.fill = GridBagConstraints.HORIZONTAL;
+        trgbc.anchor = GridBagConstraints.WEST;
+        int trow = 0;
+        
+        // Tracking mode
+        trgbc.gridx = 0; trgbc.gridy = trow; trgbc.weightx = 0.3;
+        trackContent.add(createConfigLabel("Tracking Mode:"), trgbc);
+        trgbc.gridx = 1; trgbc.weightx = 0.7;
+        JComboBox<String> trackingModeCombo = createConfigComboBox(new String[]{"single-seed", "multi-seed"});
+        trackingModeCombo.setSelectedItem(config.getProperty("tracking.mode", "single-seed"));
+        trackContent.add(trackingModeCombo, trgbc);
+        trow++;
+        
+        // Local Correction Mode
+        trgbc.gridx = 0; trgbc.gridy = trow; trgbc.gridwidth = 2;
+        JCheckBox localCorrectionCheckbox = new JCheckBox("Use Local Correction Mode");
+        localCorrectionCheckbox.setSelected(Boolean.parseBoolean(config.getProperty("correction.local.mode", "false")));
+        localCorrectionCheckbox.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        localCorrectionCheckbox.setBackground(PANEL_DARK);
+        localCorrectionCheckbox.setForeground(TEXT_PRIMARY);
+        localCorrectionCheckbox.setToolTipText("<html>When enabled, corrections only affect a local window around the correction point.<br>" +
+            "Existing track positions at window boundaries act as virtual anchors.<br>" +
+            "This preserves the rest of the track and is useful for minor fixes.</html>");
+        trackContent.add(localCorrectionCheckbox, trgbc);
+        trgbc.gridwidth = 1;
+        trow++;
+        
+        // Local Correction Window Size
+        trgbc.gridx = 0; trgbc.gridy = trow; trgbc.weightx = 0.3;
+        JLabel windowLabel = createConfigLabel("Correction Window:");
+        windowLabel.setToolTipText("<html>Total number of frames affected by a local correction.<br>" +
+            "A window of 11 means ±5 frames around the correction point.<br>" +
+            "Must be an odd number (will be adjusted if even).</html>");
+        trackContent.add(windowLabel, trgbc);
+        trgbc.gridx = 1; trgbc.weightx = 0.7;
+        JPanel windowPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+        windowPanel.setBackground(PANEL_DARK);
+        JSpinner localWindowSpinner = new JSpinner(new SpinnerNumberModel(
+            Integer.parseInt(config.getProperty("correction.local.window", "11")), 5, 51, 2));
+        localWindowSpinner.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        ((JSpinner.DefaultEditor) localWindowSpinner.getEditor()).getTextField().setBackground(PANEL_DARK);
+        ((JSpinner.DefaultEditor) localWindowSpinner.getEditor()).getTextField().setForeground(TEXT_PRIMARY);
+        windowPanel.add(localWindowSpinner);
+        JLabel framesLabel = createConfigLabel("frames");
+        framesLabel.setForeground(TEXT_SECONDARY);
+        windowPanel.add(framesLabel);
+        trackContent.add(windowPanel, trgbc);
+        trow++;
+        
+        // Show/hide window spinner based on checkbox
+        windowLabel.setEnabled(localCorrectionCheckbox.isSelected());
+        localWindowSpinner.setEnabled(localCorrectionCheckbox.isSelected());
+        localCorrectionCheckbox.addActionListener(e -> {
+            windowLabel.setEnabled(localCorrectionCheckbox.isSelected());
+            localWindowSpinner.setEnabled(localCorrectionCheckbox.isSelected());
+        });
+        
+        mainPanel.add(trackSection);
+        mainPanel.add(Box.createVerticalStrut(10));
+        
+        // =====================================================================
+        // SECTION 4: Fine-Tuning Settings (GPU only, Collapsible)
+        // =====================================================================
+        if (!isCpuOnly) {
+            JPanel finetuneSection = createCollapsibleSection("Fine-Tuning Settings", true);
+            JPanel finetuneContent = (JPanel) ((BorderLayout) finetuneSection.getLayout()).getLayoutComponent(BorderLayout.CENTER);
+            GridBagConstraints ftgbc = new GridBagConstraints();
+            ftgbc.insets = new Insets(4, 4, 4, 4);
+            ftgbc.fill = GridBagConstraints.HORIZONTAL;
+            ftgbc.anchor = GridBagConstraints.WEST;
+            int ftrow = 0;
+            
+            // Training Resolution
+            ftgbc.gridx = 0; ftgbc.gridy = ftrow; ftgbc.weightx = 0.3;
+            JLabel resolutionLabel = createConfigLabel("Training Resolution:");
+            resolutionLabel.setToolTipText("<html>Resolution used for fine-tuning LocoTrack:<br>" +
+                "<b>Native (256×256):</b> LocoTrack's original training resolution.<br>" +
+                "  Recommended for best compatibility with pre-trained weights.<br>" +
+                "<b>Original:</b> Use the video's original resolution.<br>" +
+                "  May work better for very high-resolution microscopy images,<br>" +
+                "  but requires more GPU memory and may be less stable.</html>");
+            finetuneContent.add(resolutionLabel, ftgbc);
+            ftgbc.gridx = 1; ftgbc.weightx = 0.7;
+            JComboBox<String> finetuneResolutionCombo = createConfigComboBox(new String[]{"native", "original"});
+            finetuneResolutionCombo.setSelectedItem(config.getProperty("finetune.resolution", "native"));
+            finetuneContent.add(finetuneResolutionCombo, ftgbc);
+            ftrow++;
+            
+            // Epochs
+            ftgbc.gridx = 0; ftgbc.gridy = ftrow; ftgbc.weightx = 0.3;
+            JLabel epochsLabel = createConfigLabel("Training Epochs:");
+            epochsLabel.setToolTipText("<html>Maximum number of training epochs.<br>" +
+                "Training may stop earlier due to early stopping if validation loss stops improving.</html>");
+            finetuneContent.add(epochsLabel, ftgbc);
+            ftgbc.gridx = 1; ftgbc.weightx = 0.7;
+            JSpinner finetuneEpochsSpinner = new JSpinner(new SpinnerNumberModel(
+                Integer.parseInt(config.getProperty("finetune.epochs", String.valueOf(Constants.DEFAULT_FINETUNE_EPOCHS))), 
+                10, 500, 10));
+            finetuneEpochsSpinner.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+            ((JSpinner.DefaultEditor) finetuneEpochsSpinner.getEditor()).getTextField().setBackground(PANEL_DARK);
+            ((JSpinner.DefaultEditor) finetuneEpochsSpinner.getEditor()).getTextField().setForeground(TEXT_PRIMARY);
+            finetuneContent.add(finetuneEpochsSpinner, ftgbc);
+            ftrow++;
+            
+            // Learning Rate
+            ftgbc.gridx = 0; ftgbc.gridy = ftrow; ftgbc.weightx = 0.3;
+            JLabel lrLabel = createConfigLabel("Learning Rate:");
+            lrLabel.setToolTipText("<html>Learning rate for fine-tuning.<br>" +
+                "Lower values (1e-5) for subtle adjustments, higher values (1e-3) for faster adaptation.</html>");
+            finetuneContent.add(lrLabel, ftgbc);
+            ftgbc.gridx = 1; ftgbc.weightx = 0.7;
+            JComboBox<String> fineLRCombo = createConfigComboBox(new String[]{"1e-5", "5e-5", "1e-4", "5e-4", "1e-3"});
+            fineLRCombo.setSelectedItem(config.getProperty("finetune.learning.rate", "1e-4"));
+            finetuneContent.add(fineLRCombo, ftgbc);
+            ftrow++;
+            
+            // Train/Test Split
+            ftgbc.gridx = 0; ftgbc.gridy = ftrow; ftgbc.weightx = 0.3;
+            JLabel splitLabel = createConfigLabel("Train/Test Split:");
+            splitLabel.setToolTipText("<html>Fraction of tracks used for training.<br>" +
+                "The remaining tracks are used for validation/testing.<br>" +
+                "0.85 means 85% training, 15% testing.</html>");
+            finetuneContent.add(splitLabel, ftgbc);
+            ftgbc.gridx = 1; ftgbc.weightx = 0.7;
+            JSpinner fineSplitSpinner = new JSpinner(new SpinnerNumberModel(
+                Double.parseDouble(config.getProperty("finetune.train.split", String.valueOf(Constants.DEFAULT_TRAIN_TEST_SPLIT))), 
+                0.5, 0.95, 0.05));
+            fineSplitSpinner.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+            ((JSpinner.DefaultEditor) fineSplitSpinner.getEditor()).getTextField().setBackground(PANEL_DARK);
+            ((JSpinner.DefaultEditor) fineSplitSpinner.getEditor()).getTextField().setForeground(TEXT_PRIMARY);
+            finetuneContent.add(fineSplitSpinner, ftgbc);
+            ftrow++;
+            
+            mainPanel.add(finetuneSection);
+            
+            // Store references in client properties for the save action
+            finetuneSection.putClientProperty("resolutionCombo", finetuneResolutionCombo);
+            finetuneSection.putClientProperty("epochsSpinner", finetuneEpochsSpinner);
+            finetuneSection.putClientProperty("lrCombo", fineLRCombo);
+            finetuneSection.putClientProperty("splitSpinner", fineSplitSpinner);
+        }
+        
+        // Capture fine-tuning controls for save action (need to be final for lambda)
+        // Since they're in a conditional block, we use a holder pattern
+        final JComboBox<String>[] finetuneResolutionHolder = new JComboBox[1];
+        final JSpinner[] finetuneEpochsHolder = new JSpinner[1];
+        final JComboBox<String>[] fineLRHolder = new JComboBox[1];
+        final JSpinner[] fineSplitHolder = new JSpinner[1];
+        
+        // Search for fine-tuning section and extract controls via client properties
+        for (java.awt.Component c : mainPanel.getComponents()) {
+            if (c instanceof JPanel) {
+                JPanel section = (JPanel) c;
+                Object resCombo = section.getClientProperty("resolutionCombo");
+                if (resCombo != null) {
+                    finetuneResolutionHolder[0] = (JComboBox<String>) resCombo;
+                    finetuneEpochsHolder[0] = (JSpinner) section.getClientProperty("epochsSpinner");
+                    fineLRHolder[0] = (JComboBox<String>) section.getClientProperty("lrCombo");
+                    fineSplitHolder[0] = (JSpinner) section.getClientProperty("splitSpinner");
+                    break;
+                }
+            }
+        }
+        
+        // =====================================================================
+        // SCROLL PANE AND BUTTONS
+        // =====================================================================
+        JScrollPane scrollPane = new JScrollPane(mainPanel);
+        scrollPane.setBorder(null);
+        scrollPane.getViewport().setBackground(SECONDARY_DARK);
+        scrollPane.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
+        scrollPane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
+        configDialog.add(scrollPane, BorderLayout.CENTER);
+        
+        JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 12, 12));
+        buttonPanel.setBackground(PANEL_DARK);
+        buttonPanel.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, BORDER_DARK));
+        
+        JButton saveButton = createAccentButton("Save", null);
+        JButton cancelButton = createStyledButton("Cancel");
+        
+        saveButton.addActionListener(e -> {
+            String oldTrackingMode = config.getProperty("tracking.mode", "single-seed");
+            String newTrackingMode = (String) trackingModeCombo.getSelectedItem();
+            
+            // Environment settings
+            config.setProperty("bash.script.path", bashScriptField.getText().trim());
+            config.setProperty("local.python.script", pythonScriptField.getText().trim());
+            config.setProperty("local.conda.env", condaEnvField.getText().trim());
+            config.setProperty("local.socket.path", socketPathField.getText().trim());
+            config.setProperty("local.work.dir", workDirField.getText().trim());
+            config.setProperty("local.timeout", timeoutSpinner.getValue().toString());
+            config.setProperty("output.directory", outputField.getText().trim());
+            config.setProperty("cache.flow.to.disk", String.valueOf(cacheFlowCheckbox.isSelected()));
+            
+            // GPU selection (GPU mode only)
+            if (finalGpuSelectorCombo != null) {
+                int selectedGpuIdx = finalGpuSelectorCombo.getSelectedIndex();
+                String oldGpuSetting = config.getProperty("gpu.device", "auto");
+                String newGpuSetting;
+                if (selectedGpuIdx == 0) {
+                    newGpuSetting = "auto";
+                } else {
+                    newGpuSetting = String.valueOf(selectedGpuIdx - 1);  // Convert to 0-based GPU index
+                }
+                config.setProperty("gpu.device", newGpuSetting);
+                
+                // Warn user if GPU selection changed (requires restart)
+                if (!oldGpuSetting.equals(newGpuSetting)) {
+                    SwingUtilities.invokeLater(() -> {
+                        JOptionPane.showMessageDialog(configDialog,
+                            "GPU selection has changed.\n\n" +
+                            "Please restart the application for this change to take effect.",
+                            "GPU Change - Restart Required",
+                            JOptionPane.INFORMATION_MESSAGE);
+                    });
+                }
+            }
+            
+            // Optical flow settings
+            config.setProperty("flow.method", (String) flowMethodCombo.getSelectedItem());
+            config.setProperty("flow.incremental.allocation", String.valueOf(flowIncrementalAllocCheckbox.isSelected()));
+            if (finalModelCombo != null) config.setProperty("raft.model.size", (String) finalModelCombo.getSelectedItem());
+            // DIS parameters
+            config.setProperty("dis.downsample.factor", disDownsampleSpinner.getValue().toString());
+            config.setProperty("dis.use.blob.detection", String.valueOf(disBlobDetectionCheckbox.isSelected()));
+            config.setProperty("dis.blob.search.radius", disBlobSearchRadiusSpinner.getValue().toString());
+            config.setProperty("dis.blob.radius", disBlobRadiusSpinner.getValue().toString());
+            config.setProperty("dis.cache.video", String.valueOf(disCacheVideoCheckbox.isSelected()));
+            // LocoTrack DoG parameters (only saved if components exist - GPU mode only)
+            // These are read from config at runtime, so no need to save them in CPU mode
+            // Trackpy settings - native trackpy detection
+            config.setProperty("trackpy.diameter", tpDiameterSpinner.getValue().toString());
+            config.setProperty("trackpy.minmass", tpMinmassSpinner.getValue().toString());
+            config.setProperty("trackpy.search.range", searchRangeSpinner.getValue().toString());
+            config.setProperty("trackpy.memory", memorySpinner.getValue().toString());
+            config.setProperty("trackpy.require.persistent", String.valueOf(requirePersistentCheck.isSelected()));
+            config.setProperty("trackpy.smooth.factor", smoothFactorSpinner.getValue().toString());
+            config.setProperty("trackpy.flow.smoothing", flowSmoothingSpinner.getValue().toString());
+            config.setProperty("trackpy.kernel", (String) kernelCombo.getSelectedItem());
+            config.setProperty("auto.compute.optical.flow", String.valueOf(autoComputeCheck.isSelected()));
+            
+            // Tracking settings
+            config.setProperty("tracking.mode", newTrackingMode);
+            config.setProperty("correction.local.mode", String.valueOf(localCorrectionCheckbox.isSelected()));
+            // Ensure window is odd
+            int windowVal = (Integer) localWindowSpinner.getValue();
+            if (windowVal % 2 == 0) windowVal++;
+            config.setProperty("correction.local.window", String.valueOf(windowVal));
+            
+            // Fine-tuning settings (GPU mode only)
+            if (finetuneResolutionHolder[0] != null) {
+                config.setProperty("finetune.resolution", (String) finetuneResolutionHolder[0].getSelectedItem());
+                config.setProperty("finetune.epochs", finetuneEpochsHolder[0].getValue().toString());
+                config.setProperty("finetune.learning.rate", (String) fineLRHolder[0].getSelectedItem());
+                config.setProperty("finetune.train.split", fineSplitHolder[0].getValue().toString());
+            }
+            
+            saveConfig();
+            handleTrackingModeChange(oldTrackingMode, newTrackingMode);
+            
+            // Sync left panel with updated config
+            reloadConfigurationPanel();
+            
+            setStatus("Configuration saved");
+            JOptionPane.showMessageDialog(configDialog, "Configuration saved successfully!", "Success", JOptionPane.INFORMATION_MESSAGE);
+            configDialog.dispose();
+        });
+        
+        cancelButton.addActionListener(e -> configDialog.dispose());
+        
+        buttonPanel.add(saveButton);
+        buttonPanel.add(cancelButton);
+        configDialog.add(buttonPanel, BorderLayout.SOUTH);
+        
+        // Let the dialog size itself to fit content, then apply reasonable constraints
+        configDialog.pack();
+        
+        // Get screen size for maximum bounds
+        Dimension screenSize = Toolkit.getDefaultToolkit().getScreenSize();
+        int maxWidth = (int)(screenSize.width * 0.8);
+        int maxHeight = (int)(screenSize.height * 0.85);
+        
+        // Ensure minimum size and cap at screen bounds
+        int dialogWidth = Math.max(550, Math.min(configDialog.getWidth() + 40, maxWidth));
+        int dialogHeight = Math.max(500, Math.min(configDialog.getHeight() + 20, maxHeight));
+        
+        configDialog.setSize(dialogWidth, dialogHeight);
+        configDialog.setMinimumSize(new Dimension(500, 400));
+        configDialog.setLocationRelativeTo(frame);
+        configDialog.setVisible(true);
+    }
+    
+    /**
+     * Creates a simple section panel with a header (non-collapsible).
+     */
+    private JPanel createCollapsibleSection(String title, boolean initiallyExpanded) {
+        JPanel section = new JPanel(new BorderLayout());
+        section.setBackground(SECONDARY_DARK);
+        section.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(BORDER_DARK),
+            BorderFactory.createEmptyBorder(0, 0, 0, 0)
+        ));
+        
+        // Header (no toggle functionality)
+        JPanel header = new JPanel(new BorderLayout());
+        header.setBackground(PANEL_DARK);
+        header.setBorder(BorderFactory.createEmptyBorder(8, 12, 8, 12));
+        
+        JLabel titleLabel = new JLabel(title);
+        titleLabel.setFont(new Font("Segoe UI", Font.BOLD, 12));
+        titleLabel.setForeground(TEXT_PRIMARY);
+        
+        header.add(titleLabel, BorderLayout.CENTER);
+        
+        // Content panel (always visible)
+        JPanel content = new JPanel(new GridBagLayout());
+        content.setBackground(PANEL_DARK);
+        content.setBorder(BorderFactory.createEmptyBorder(10, 12, 10, 12));
+        
+        section.add(header, BorderLayout.NORTH);
+        section.add(content, BorderLayout.CENTER);
+        
+        return section;
+    }
+    
+    /**
+     * Creates the left-side configuration panel with all settings.
+     * This panel is collapsible and contains all options previously in the Options menu.
+     */
+    private JPanel createConfigurationPanel() {
+        // Main container panel
+        configurationSection = new JPanel(new BorderLayout());
+        configurationSection.setBackground(SECONDARY_DARK);
+        configurationSection.setBorder(BorderFactory.createMatteBorder(0, 0, 0, 1, BORDER_DARK));
+        configurationSection.setPreferredSize(new Dimension(configPanelWidth, 0));
+        configurationSection.setMinimumSize(new Dimension(40, 0)); // Allow collapse to 40px
+        
+        // Header panel with title
+        JPanel headerPanel = new JPanel(new BorderLayout()) {
+            @Override
+            protected void paintComponent(Graphics g) {
+                super.paintComponent(g);
+                Graphics2D g2d = (Graphics2D) g;
+                g2d.setColor(PANEL_DARK);
+                g2d.fillRect(0, 0, getWidth(), getHeight());
+            }
+        };
+        headerPanel.setOpaque(false);
+        headerPanel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createMatteBorder(0, 0, 1, 0, BORDER_DARK),
+            BorderFactory.createEmptyBorder(12, 18, 12, 18)
+        ));
+        
+        JLabel configTitle = new JLabel("Configuration", SwingConstants.LEFT);
+        configTitle.setFont(new Font("Segoe UI Semibold", Font.BOLD, 16));
+        configTitle.setForeground(TEXT_PRIMARY);
+        
+        headerPanel.add(configTitle, BorderLayout.CENTER);
+        
+        // Scrollable content area
+        JPanel mainPanel = new JPanel();
+        mainPanel.setLayout(new BoxLayout(mainPanel, BoxLayout.Y_AXIS));
+        mainPanel.setBackground(SECONDARY_DARK);
+        mainPanel.setBorder(BorderFactory.createEmptyBorder(10, 12, 10, 12));
+        
+        // =====================================================================
+        // SECTION: Optical Flow Actions
+        // =====================================================================
+        JPanel actionsSection = createCollapsibleSection("Optical Flow Actions", true);
+        JPanel actionsContent = (JPanel) ((BorderLayout) actionsSection.getLayout()).getLayoutComponent(BorderLayout.CENTER);
+        actionsContent.setLayout(new BoxLayout(actionsContent, BoxLayout.Y_AXIS));
+        
+        JButton recalculateFlowBtn = createStyledButton("Recalculate Optical Flow", null);
+        recalculateFlowBtn.setMaximumSize(new Dimension(Integer.MAX_VALUE, 32));
+        recalculateFlowBtn.setAlignmentX(Component.LEFT_ALIGNMENT);
+        recalculateFlowBtn.addActionListener(e -> recalculateOpticalFlow());
+        actionsContent.add(recalculateFlowBtn);
+        actionsContent.add(Box.createVerticalStrut(6));
+        
+        JButton switchFlowBtn = createStyledButton("Switch Flow Method", null);
+        switchFlowBtn.setMaximumSize(new Dimension(Integer.MAX_VALUE, 32));
+        switchFlowBtn.setAlignmentX(Component.LEFT_ALIGNMENT);
+        switchFlowBtn.addActionListener(e -> switchFlowMethod());
+        actionsContent.add(switchFlowBtn);
+        
+        mainPanel.add(actionsSection);
+        mainPanel.add(Box.createVerticalStrut(8));
+        
+        // =====================================================================
+        // SECTION: Optical Flow Settings
+        // =====================================================================
+        JPanel flowSection = createCollapsibleSection("Optical Flow Settings", true);
+        JPanel flowContent = (JPanel) ((BorderLayout) flowSection.getLayout()).getLayoutComponent(BorderLayout.CENTER);
+        GridBagConstraints fgbc = new GridBagConstraints();
+        fgbc.insets = new Insets(3, 3, 3, 3);
+        fgbc.fill = GridBagConstraints.HORIZONTAL;
+        fgbc.anchor = GridBagConstraints.WEST;
+        int frow = 0;
+        
+        fgbc.gridx = 0; fgbc.gridy = frow; fgbc.weightx = 0.3;
+        JLabel flowMethodLabel = createConfigLabel("Flow Method:");
+        flowMethodLabel.setToolTipText("Method for computing optical flow");
+        flowContent.add(flowMethodLabel, fgbc);
+        fgbc.gridx = 1; fgbc.weightx = 0.7;
+        
+        // Build flow method list based on execution mode
+        // GPU mode: all methods available
+        // CPU mode: only DIS and TrackPy available
+        String[] availableFlowMethods;
+        String defaultFlowMethod;
+        if (isCpuOnly) {
+            availableFlowMethods = new String[]{"dis", "trackpy"};
+            defaultFlowMethod = "dis";
+        } else {
+            availableFlowMethods = new String[]{"raft", "dis", "locotrack", "trackpy"};
+            defaultFlowMethod = "raft";
+        }
+        cfgFlowMethodCombo = createModernComboBox(availableFlowMethods);
+        String savedMethod = config.getProperty("flow.method", defaultFlowMethod);
+        // Ensure saved method is available in current mode
+        if (isCpuOnly && isGpuOnlyFlowMethod(savedMethod)) {
+            savedMethod = defaultFlowMethod;
+        }
+        cfgFlowMethodCombo.setSelectedItem(savedMethod);
+        flowContent.add(cfgFlowMethodCombo, fgbc);
+        frow++;
+        
+        // Low-memory mode checkbox (applies to all flow methods)
+        fgbc.gridx = 0; fgbc.gridy = frow; fgbc.gridwidth = 2; fgbc.weightx = 1.0;
+        String cfgFlowIncrementalConfig = config.getProperty("flow.incremental.allocation", "auto");
+        boolean cfgFlowDefaultIncremental;
+        if ("auto".equalsIgnoreCase(cfgFlowIncrementalConfig)) {
+            cfgFlowDefaultIncremental = getSystemMemoryGB() < 32;
+        } else {
+            cfgFlowDefaultIncremental = Boolean.parseBoolean(cfgFlowIncrementalConfig);
+        }
+        cfgFlowIncrementalAllocCheckbox = createStyledCheckbox("Low-memory mode (incremental allocation)");
+        cfgFlowIncrementalAllocCheckbox.setSelected(cfgFlowDefaultIncremental);
+        cfgFlowIncrementalAllocCheckbox.setToolTipText("<html>Enable for systems with less than 32GB RAM.<br>" +
+            "Uses incremental allocation that allows the OS to swap older<br>" +
+            "flow data to disk, preventing out-of-memory errors.<br>" +
+            "<b>Pros:</b> Prevents OOM on low-memory systems<br>" +
+            "<b>Cons:</b> May run slightly slower due to memory management<br>" +
+            "<b>Auto:</b> Enabled by default if system has &lt; 32GB RAM</html>");
+        flowContent.add(cfgFlowIncrementalAllocCheckbox, fgbc);
+        frow++;
+        fgbc.gridwidth = 1;
+        
+        // --- RAFT Settings Panel (only shown in GPU mode) ---
+        JPanel raftPanel = null;
+        if (!isCpuOnly) {
+            fgbc.gridx = 0; fgbc.gridy = frow; fgbc.gridwidth = 2;
+            raftPanel = createMethodSettingsPanel("RAFT Settings");
+            GridBagConstraints rgbc = new GridBagConstraints();
+            rgbc.insets = new Insets(3, 3, 3, 3);
+            rgbc.fill = GridBagConstraints.HORIZONTAL;
+            
+            rgbc.gridx = 0; rgbc.gridy = 0; rgbc.weightx = 0.4;
+            raftPanel.add(createConfigLabel("Model Size:"), rgbc);
+            rgbc.gridx = 1; rgbc.weightx = 0.6;
+            cfgRaftModelCombo = createModernComboBox(new String[]{"large", "small"});
+            cfgRaftModelCombo.setSelectedItem(config.getProperty("raft.model.size", "large"));
+            raftPanel.add(cfgRaftModelCombo, rgbc);
+            
+            flowContent.add(raftPanel, fgbc);
+            frow++;
+            fgbc.gridwidth = 1;
+        }
+        
+        // --- DIS Settings Panel ---
+        fgbc.gridx = 0; fgbc.gridy = frow; fgbc.gridwidth = 2;
+        JPanel disPanel = createMethodSettingsPanel("DIS Settings (CPU)");
+        GridBagConstraints dgbc = new GridBagConstraints();
+        dgbc.insets = new Insets(3, 3, 3, 3);
+        dgbc.fill = GridBagConstraints.HORIZONTAL;
+        
+        dgbc.gridx = 0; dgbc.gridy = 0; dgbc.weightx = 0.4;
+        disPanel.add(createConfigLabel("Downsample:"), dgbc);
+        dgbc.gridx = 1; dgbc.weightx = 0.6;
+        cfgDisDownsampleSpinner = new JSpinner(new SpinnerNumberModel(
+            Integer.parseInt(config.getProperty("dis.downsample.factor", "2")), 1, 8, 1));
+        styleSpinner(cfgDisDownsampleSpinner);
+        disPanel.add(cfgDisDownsampleSpinner, dgbc);
+        
+        flowContent.add(disPanel, fgbc);
+        frow++;
+        fgbc.gridwidth = 1;
+        
+        // --- LocoTrack/DoG Settings Panel (only shown in GPU mode) ---
+        JPanel locotrackPanel = null;
+        if (!isCpuOnly) {
+            fgbc.gridx = 0; fgbc.gridy = frow; fgbc.gridwidth = 2;
+            locotrackPanel = createMethodSettingsPanel("LocoTrack/DoG Settings");
+            GridBagConstraints tgbc = new GridBagConstraints();
+            tgbc.insets = new Insets(2, 3, 2, 3);
+            tgbc.fill = GridBagConstraints.HORIZONTAL;
+            
+            tgbc.gridx = 0; tgbc.gridy = 0; tgbc.weightx = 0.4;
+            locotrackPanel.add(createConfigLabel("Radius (px):"), tgbc);
+            tgbc.gridx = 1; tgbc.weightx = 0.6;
+            cfgRadiusSpinner = new JSpinner(new SpinnerNumberModel(
+                Double.parseDouble(config.getProperty("locotrack.dog.radius", "2.5")), 0.5, 100.0, 0.5));
+            styleSpinner(cfgRadiusSpinner);
+            locotrackPanel.add(cfgRadiusSpinner, tgbc);
+            
+            tgbc.gridx = 0; tgbc.gridy = 1;
+            locotrackPanel.add(createConfigLabel("Threshold:"), tgbc);
+            tgbc.gridx = 1;
+            cfgDogThresholdSpinner = new JSpinner(new SpinnerNumberModel(
+                Double.parseDouble(config.getProperty("locotrack.dog.threshold", "0.0")), 0.0, 1000.0, 1.0));
+            styleSpinner(cfgDogThresholdSpinner);
+            locotrackPanel.add(cfgDogThresholdSpinner, tgbc);
+            
+            tgbc.gridx = 0; tgbc.gridy = 2; tgbc.gridwidth = 2;
+            cfgMedianFilterCheckbox = createStyledCheckbox("Median filter");
+            cfgMedianFilterCheckbox.setSelected(Boolean.parseBoolean(config.getProperty("locotrack.dog.median.filter", "false")));
+            locotrackPanel.add(cfgMedianFilterCheckbox, tgbc);
+            
+            tgbc.gridy = 3;
+            cfgSubpixelCheckbox = createStyledCheckbox("Sub-pixel localization");
+            cfgSubpixelCheckbox.setSelected(Boolean.parseBoolean(config.getProperty("locotrack.dog.subpixel", "true")));
+            locotrackPanel.add(cfgSubpixelCheckbox, tgbc);
+            tgbc.gridwidth = 1;
+            
+            tgbc.gridx = 0; tgbc.gridy = 4;
+            locotrackPanel.add(createConfigLabel("Occlusion:"), tgbc);
+            tgbc.gridx = 1;
+            cfgOcclusionSpinner = new JSpinner(new SpinnerNumberModel(
+                Double.parseDouble(config.getProperty("locotrack.occlusion.threshold", "0.5")), 0.0, 1.0, 0.05));
+            styleSpinner(cfgOcclusionSpinner);
+            locotrackPanel.add(cfgOcclusionSpinner, tgbc);
+            
+            tgbc.gridx = 0; tgbc.gridy = 5;
+            locotrackPanel.add(createConfigLabel("Kernel:"), tgbc);
+            tgbc.gridx = 1;
+            cfgLocotrackKernelCombo = createModernComboBox(new String[]{"gaussian_rbf", "gaussian", "thin_plate_spline", "idw", "wendland", "multiquadric"});
+            cfgLocotrackKernelCombo.setSelectedItem(config.getProperty("locotrack.kernel", "gaussian_rbf"));
+            locotrackPanel.add(cfgLocotrackKernelCombo, tgbc);
+            
+            // Preview Detection button for LocoTrack/DoG
+            tgbc.gridx = 0; tgbc.gridy = 6; tgbc.gridwidth = 2;
+            JButton cfgLocoPreviewBtn = createAccentButton("Preview Detection", null);
+            cfgLocoPreviewBtn.setToolTipText("Preview detected spots on current frame");
+            cfgLocoPreviewBtn.addActionListener(e -> {
+                if (currentVideoPath == null) {
+                    JOptionPane.showMessageDialog(frame, "Please load a video first.", "No Video", JOptionPane.WARNING_MESSAGE);
+                    return;
+                }
+                cfgLocoPreviewBtn.setEnabled(false);
+                cfgLocoPreviewBtn.setText("Detecting...");
+                final double capturedRadius = (Double) cfgRadiusSpinner.getValue();
+                final int capturedFrame = currentSlice - 1;
+                new SwingWorker<List<double[]>, Void>() {
+                    @Override
+                    protected List<double[]> doInBackground() throws Exception {
+                        return generateDogPreview(capturedRadius, (Double) cfgDogThresholdSpinner.getValue(),
+                            cfgMedianFilterCheckbox.isSelected(), cfgSubpixelCheckbox.isSelected(),
+                            capturedFrame, viewMin, viewMax);
+                    }
+                    @Override
+                    protected void done() {
+                        cfgLocoPreviewBtn.setEnabled(true);
+                        cfgLocoPreviewBtn.setText("Preview Detection");
+                        try {
+                            List<double[]> spots = get();
+                            if (spots != null && !spots.isEmpty()) {
+                                enterPreviewMode("dog", spots, capturedRadius, null);
+                            } else {
+                                JOptionPane.showMessageDialog(frame, "No spots detected. Try adjusting parameters.", "No Spots", JOptionPane.WARNING_MESSAGE);
+                            }
+                        } catch (Exception ex) {
+                            JOptionPane.showMessageDialog(frame, "Preview error: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+                        }
+                    }
+                }.execute();
+            });
+            locotrackPanel.add(cfgLocoPreviewBtn, tgbc);
+            tgbc.gridwidth = 1;
+            
+            flowContent.add(locotrackPanel, fgbc);
+            frow++;
+            fgbc.gridwidth = 1;
+        } // end if (!isCpuOnly) for LocoTrack panel
+        
+        // --- Trackpy Settings Panel ---
+        fgbc.gridx = 0; fgbc.gridy = frow; fgbc.gridwidth = 2;
+        JPanel trackpyPanel = createMethodSettingsPanel("Trackpy Settings");
+        GridBagConstraints tpgbc = new GridBagConstraints();
+        tpgbc.insets = new Insets(2, 3, 2, 3);
+        tpgbc.fill = GridBagConstraints.HORIZONTAL;
+        
+        tpgbc.gridx = 0; tpgbc.gridy = 0; tpgbc.weightx = 0.4;
+        trackpyPanel.add(createConfigLabel("Diameter:"), tpgbc);
+        tpgbc.gridx = 1; tpgbc.weightx = 0.6;
+        cfgTpDiameterSpinner = new JSpinner(new SpinnerNumberModel(
+            Integer.parseInt(config.getProperty("trackpy.diameter", "11")), 3, 101, 2));
+        styleSpinner(cfgTpDiameterSpinner);
+        trackpyPanel.add(cfgTpDiameterSpinner, tpgbc);
+        
+        tpgbc.gridx = 0; tpgbc.gridy = 1;
+        trackpyPanel.add(createConfigLabel("Min Mass:"), tpgbc);
+        tpgbc.gridx = 1;
+        cfgTpMinmassSpinner = new JSpinner(new SpinnerNumberModel(
+            Double.parseDouble(config.getProperty("trackpy.minmass", "0")), 0.0, 100000.0, 100.0));
+        styleSpinner(cfgTpMinmassSpinner);
+        trackpyPanel.add(cfgTpMinmassSpinner, tpgbc);
+        
+        tpgbc.gridx = 0; tpgbc.gridy = 2;
+        trackpyPanel.add(createConfigLabel("Search Range:"), tpgbc);
+        tpgbc.gridx = 1;
+        cfgSearchRangeSpinner = new JSpinner(new SpinnerNumberModel(
+            Double.parseDouble(config.getProperty("trackpy.search.range", "15")), 1, 100, 1));
+        styleSpinner(cfgSearchRangeSpinner);
+        trackpyPanel.add(cfgSearchRangeSpinner, tpgbc);
+        
+        tpgbc.gridx = 0; tpgbc.gridy = 3;
+        trackpyPanel.add(createConfigLabel("Memory:"), tpgbc);
+        tpgbc.gridx = 1;
+        cfgMemorySpinner = new JSpinner(new SpinnerNumberModel(
+            Integer.parseInt(config.getProperty("trackpy.memory", "5")), 0, 50, 1));
+        styleSpinner(cfgMemorySpinner);
+        trackpyPanel.add(cfgMemorySpinner, tpgbc);
+        
+        tpgbc.gridx = 0; tpgbc.gridy = 4; tpgbc.gridwidth = 2;
+        cfgRequirePersistentCheck = createStyledCheckbox("Require persistent");
+        cfgRequirePersistentCheck.setSelected(Boolean.parseBoolean(config.getProperty("trackpy.require.persistent", "false")));
+        trackpyPanel.add(cfgRequirePersistentCheck, tpgbc);
+        tpgbc.gridwidth = 1;
+        
+        tpgbc.gridx = 0; tpgbc.gridy = 5;
+        trackpyPanel.add(createConfigLabel("Smooth Factor:"), tpgbc);
+        tpgbc.gridx = 1;
+        cfgSmoothFactorSpinner = new JSpinner(new SpinnerNumberModel(
+            Double.parseDouble(config.getProperty("trackpy.smooth.factor", "0.1")), 0.0, 1.0, 0.05));
+        styleSpinner(cfgSmoothFactorSpinner);
+        trackpyPanel.add(cfgSmoothFactorSpinner, tpgbc);
+        
+        tpgbc.gridx = 0; tpgbc.gridy = 6;
+        trackpyPanel.add(createConfigLabel("Flow Smooth:"), tpgbc);
+        tpgbc.gridx = 1;
+        cfgFlowSmoothingSpinner = new JSpinner(new SpinnerNumberModel(
+            Double.parseDouble(config.getProperty("trackpy.flow.smoothing", "15")), 1, 100, 1));
+        styleSpinner(cfgFlowSmoothingSpinner);
+        trackpyPanel.add(cfgFlowSmoothingSpinner, tpgbc);
+        
+        tpgbc.gridx = 0; tpgbc.gridy = 7;
+        trackpyPanel.add(createConfigLabel("Kernel:"), tpgbc);
+        tpgbc.gridx = 1;
+        // In CPU mode, hide GPU-only kernels (gaussian, idw, wendland use PyTorch GPU)
+        String[] availableKernels = isCpuOnly 
+            ? new String[]{"gaussian_rbf", "thin_plate_spline", "multiquadric"}
+            : new String[]{"gaussian_rbf", "gaussian", "thin_plate_spline", "idw", "wendland", "multiquadric"};
+        cfgKernelCombo = createModernComboBox(availableKernels);
+        String savedKernel = config.getProperty("trackpy.kernel", "gaussian_rbf");
+        // Ensure saved kernel is available in current mode
+        if (isCpuOnly && isGpuOnlyKernel(savedKernel)) {
+            savedKernel = "gaussian_rbf";
+        }
+        cfgKernelCombo.setSelectedItem(savedKernel);
+        trackpyPanel.add(cfgKernelCombo, tpgbc);
+        
+        // Preview Trajectories button for Trackpy
+        tpgbc.gridx = 0; tpgbc.gridy = 8; tpgbc.gridwidth = 2;
+        JButton cfgTrackpyPreviewBtn = createAccentButton("Preview Trajectories", null);
+        cfgTrackpyPreviewBtn.setToolTipText("Preview trackpy trajectories with free frame navigation");
+        cfgTrackpyPreviewBtn.addActionListener(e -> {
+            if (currentVideoPath == null) {
+                JOptionPane.showMessageDialog(frame, "Please load a video first.", "No Video", JOptionPane.WARNING_MESSAGE);
+                return;
+            }
+            cfgTrackpyPreviewBtn.setEnabled(false);
+            cfgTrackpyPreviewBtn.setText("Tracking...");
+            final int capturedDiameter = (Integer) cfgTpDiameterSpinner.getValue();
+            final double capturedMinmass = (Double) cfgTpMinmassSpinner.getValue();
+            final double capturedSearchRange = (Double) cfgSearchRangeSpinner.getValue();
+            final int capturedMemory = (Integer) cfgMemorySpinner.getValue();
+            final boolean capturedRequirePersistent = cfgRequirePersistentCheck.isSelected();
+            new SwingWorker<Map<String, Object>, Void>() {
+                @Override
+                protected Map<String, Object> doInBackground() throws Exception {
+                    return generateTrackpyTrajectoryPreview(capturedDiameter, capturedMinmass,
+                        capturedSearchRange, capturedMemory, 0, -1, capturedRequirePersistent);
+                }
+                @SuppressWarnings("unchecked")
+                @Override
+                protected void done() {
+                    cfgTrackpyPreviewBtn.setEnabled(true);
+                    cfgTrackpyPreviewBtn.setText("Preview Trajectories");
+                    try {
+                        Map<String, Object> result = get();
+                        if (result != null) {
+                            List<Map<String, Object>> trajectories = (List<Map<String, Object>>) result.get("trajectories");
+                            Map<Integer, List<double[]>> detectionsPerFrame = (Map<Integer, List<double[]>>) result.get("detections_per_frame");
+                            if (trajectories != null && !trajectories.isEmpty()) {
+                                enterTrajectoryPreviewMode(trajectories, detectionsPerFrame,
+                                    trajectories.size(), capturedDiameter / 2.0, 0, -1, null);
+                            } else {
+                                JOptionPane.showMessageDialog(frame, "No trajectories detected. Try adjusting parameters.", "No Trajectories", JOptionPane.WARNING_MESSAGE);
+                            }
+                        }
+                    } catch (Exception ex) {
+                        JOptionPane.showMessageDialog(frame, "Preview error: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+                    }
+                }
+            }.execute();
+        });
+        trackpyPanel.add(cfgTrackpyPreviewBtn, tpgbc);
+        tpgbc.gridwidth = 1;
+        
+        flowContent.add(trackpyPanel, fgbc);
+        frow++;
+        fgbc.gridwidth = 1;
+        
+        // Capture final references for lambda (needed for CPU mode where some panels may be null)
+        final JPanel finalRaftPanel = raftPanel;
+        final JPanel finalLocotrackPanel = locotrackPanel;
+        
+        // Show/hide panels based on flow method selection
+        Runnable updateFlowPanels = () -> {
+            String method = (String) cfgFlowMethodCombo.getSelectedItem();
+            // Only show panels if they exist (GPU-only panels are null in CPU mode)
+            if (finalRaftPanel != null) finalRaftPanel.setVisible("raft".equals(method));
+            disPanel.setVisible("dis".equals(method));
+            if (finalLocotrackPanel != null) finalLocotrackPanel.setVisible("locotrack".equals(method));
+            trackpyPanel.setVisible("trackpy".equals(method));
+            flowSection.revalidate();
+            flowSection.repaint();
+        };
+        cfgFlowMethodCombo.addActionListener(e -> updateFlowPanels.run());
+        updateFlowPanels.run();
+        
+        // Auto compute checkbox
+        fgbc.gridx = 0; fgbc.gridy = frow; fgbc.gridwidth = 2;
+        cfgAutoComputeCheck = createStyledCheckbox("Auto-prompt optical flow on load");
+        cfgAutoComputeCheck.setSelected(Boolean.parseBoolean(config.getProperty("auto.compute.optical.flow", "true")));
+        flowContent.add(cfgAutoComputeCheck, fgbc);
+        
+        mainPanel.add(flowSection);
+        mainPanel.add(Box.createVerticalStrut(8));
+        
+        // =====================================================================
+        // SECTION: Track Optimization Settings
+        // =====================================================================
+        JPanel blobSection = createCollapsibleSection("Track Optimization", false);
+        JPanel blobContent = (JPanel) ((BorderLayout) blobSection.getLayout()).getLayoutComponent(BorderLayout.CENTER);
+        GridBagConstraints bgbc = new GridBagConstraints();
+        bgbc.insets = new Insets(3, 3, 3, 3);
+        bgbc.fill = GridBagConstraints.HORIZONTAL;
+        bgbc.anchor = GridBagConstraints.WEST;
+        
+        bgbc.gridx = 0; bgbc.gridy = 0; bgbc.gridwidth = 2;
+        cfgBlobDetectionCheckbox = createStyledCheckbox("Use Blob Detection for Rough Track");
+        cfgBlobDetectionCheckbox.setSelected(Boolean.parseBoolean(config.getProperty("dis.use.blob.detection", "false")));
+        cfgBlobDetectionCheckbox.setToolTipText("<html>Use blob detection to refine rough track propagation.<br>Combines flow prediction with local blob search.</html>");
+        blobContent.add(cfgBlobDetectionCheckbox, bgbc);
+        bgbc.gridwidth = 1;
+        
+        // Blob parameters panel
+        cfgBlobParamsPanel = new JPanel(new GridBagLayout());
+        cfgBlobParamsPanel.setBackground(PANEL_DARK);
+        cfgBlobParamsPanel.setBorder(BorderFactory.createEmptyBorder(4, 16, 4, 4));
+        GridBagConstraints bpgbc = new GridBagConstraints();
+        bpgbc.insets = new Insets(2, 3, 2, 3);
+        bpgbc.fill = GridBagConstraints.HORIZONTAL;
+        
+        bpgbc.gridx = 0; bpgbc.gridy = 0; bpgbc.weightx = 0.5;
+        cfgBlobParamsPanel.add(createConfigLabel("Search Radius:"), bpgbc);
+        bpgbc.gridx = 1; bpgbc.weightx = 0.5;
+        cfgBlobSearchRadiusSpinner = new JSpinner(new SpinnerNumberModel(
+            Integer.parseInt(config.getProperty("dis.blob.search.radius", "15")), 5, 50, 1));
+        styleSpinner(cfgBlobSearchRadiusSpinner);
+        cfgBlobParamsPanel.add(cfgBlobSearchRadiusSpinner, bpgbc);
+        
+        bpgbc.gridx = 0; bpgbc.gridy = 1;
+        cfgBlobParamsPanel.add(createConfigLabel("Blob Radius (px):"), bpgbc);
+        bpgbc.gridx = 1;
+        cfgBlobRadiusSpinner = new JSpinner(new SpinnerNumberModel(
+            Double.parseDouble(config.getProperty("dis.blob.radius", "5.0")), 1.0, 50.0, 0.5));
+        styleSpinner(cfgBlobRadiusSpinner);
+        cfgBlobParamsPanel.add(cfgBlobRadiusSpinner, bpgbc);
+        
+        bgbc.gridx = 0; bgbc.gridy = 1; bgbc.gridwidth = 2;
+        blobContent.add(cfgBlobParamsPanel, bgbc);
+        
+        cfgBlobParamsPanel.setVisible(cfgBlobDetectionCheckbox.isSelected());
+        cfgBlobDetectionCheckbox.addActionListener(e -> {
+            cfgBlobParamsPanel.setVisible(cfgBlobDetectionCheckbox.isSelected());
+            blobSection.revalidate();
+        });
+        
+        // Correction Method dropdown (first item in section)
+        bgbc.gridx = 0; bgbc.gridy = 2; bgbc.gridwidth = 1; bgbc.weightx = 0.4;
+        blobContent.add(createConfigLabel("Correction Method:"), bgbc);
+        bgbc.gridx = 1; bgbc.weightx = 0.6;
+        // All correction methods are CPU-based (Corridor-DP uses dynamic programming on CPU)
+        cfgCorrectionMethodCombo = createModernComboBox(new String[]{"Full-Blend", "Corridor-DP", "Blob-Assisted"});
+        String savedCorrectionMethod = config.getProperty("correction.method", "full_blend");
+        if (savedCorrectionMethod.equals("blob_assisted")) {
+            cfgCorrectionMethodCombo.setSelectedItem("Blob-Assisted");
+        } else if (savedCorrectionMethod.equals("corridor_dp")) {
+            cfgCorrectionMethodCombo.setSelectedItem("Corridor-DP");
+        } else {
+            cfgCorrectionMethodCombo.setSelectedItem("Full-Blend");
+        }
+        cfgCorrectionMethodCombo.setToolTipText("<html><b>Full-Blend:</b> Pure optical flow with bidirectional blending.<br>" +
+            "<b>Corridor-DP:</b> Dynamic programming with adaptive corridor search (original RAFT_v4).<br>" +
+            "<b>Blob-Assisted:</b> Flow + blob detection for particle-like objects.</html>");
+        blobContent.add(cfgCorrectionMethodCombo, bgbc);
+        
+        // Linear Interpolation Threshold (applies to Full-Blend and Corridor-DP)
+        // If two anchors are within N frames, use linear interpolation instead of optical flow
+        bgbc.gridx = 0; bgbc.gridy = 3; bgbc.gridwidth = 1; bgbc.weightx = 0.4;
+        JLabel linearInterpLabel = createConfigLabel("Lin. Interp. Threshold:");
+        blobContent.add(linearInterpLabel, bgbc);
+        bgbc.gridx = 1; bgbc.weightx = 0.6;
+        cfgLinearInterpThresholdSpinner = new JSpinner(new SpinnerNumberModel(
+            Integer.parseInt(config.getProperty("correction.linear.interp.threshold", "0")), 0, 100, 1));
+        styleSpinner(cfgLinearInterpThresholdSpinner);
+        cfgLinearInterpThresholdSpinner.setToolTipText("<html>If two anchors are within N frames, use linear interpolation<br>" +
+            "instead of optical flow. Helps avoid jitter from unreliable flow.<br>" +
+            "<b>0:</b> Disabled (always use optical flow)<br>" +
+            "<b>5-10:</b> Recommended for noisy/jittery flow conditions</html>");
+        blobContent.add(cfgLinearInterpThresholdSpinner, bgbc);
+        bgbc.gridwidth = 2;
+        
+        // Corridor-DP parameters panel (shows when Corridor-DP is selected)
+        JPanel corridorParamsPanel = new JPanel(new GridBagLayout());
+        corridorParamsPanel.setBackground(PANEL_DARK);
+        corridorParamsPanel.setBorder(BorderFactory.createEmptyBorder(4, 16, 4, 4));
+        GridBagConstraints cpgbc = new GridBagConstraints();
+        cpgbc.insets = new Insets(2, 3, 2, 3);
+        cpgbc.fill = GridBagConstraints.HORIZONTAL;
+        
+        // Row 0: Label and dropdown
+        cpgbc.gridx = 0; cpgbc.gridy = 0; cpgbc.weightx = 0.35;
+        corridorParamsPanel.add(createConfigLabel("Corridor:"), cpgbc);
+        cpgbc.gridx = 1; cpgbc.weightx = 0.65;
+        String[] corridorOptions = {"Adaptive", "Full Frame", "Custom"};
+        JComboBox<String> corridorWidthCombo = createModernComboBox(corridorOptions);
+        corridorParamsPanel.add(corridorWidthCombo, cpgbc);
+        
+        // Row 1: Custom input panel (hidden by default) - contains text field + size label
+        JPanel customInputPanel = new JPanel(new GridBagLayout());
+        customInputPanel.setBackground(PANEL_DARK);
+        customInputPanel.setVisible(false);
+        GridBagConstraints cipgbc = new GridBagConstraints();
+        cipgbc.insets = new Insets(2, 3, 2, 3);
+        cipgbc.fill = GridBagConstraints.HORIZONTAL;
+        
+        cipgbc.gridx = 0; cipgbc.gridy = 0; cipgbc.weightx = 0.35;
+        customInputPanel.add(createConfigLabel("Size (px):"), cipgbc);
+        
+        cipgbc.gridx = 1; cipgbc.weightx = 0.35;
+        JTextField corridorCustomField = new JTextField("50", 5);
+        corridorCustomField.setBackground(SECONDARY_BG);
+        corridorCustomField.setForeground(ACCENT_BLUE);
+        corridorCustomField.setCaretColor(ACCENT_BLUE);
+        corridorCustomField.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(BORDER_COLOR, 1),
+            BorderFactory.createEmptyBorder(2, 4, 2, 4)));
+        customInputPanel.add(corridorCustomField, cipgbc);
+        
+        cipgbc.gridx = 2; cipgbc.weightx = 0.3;
+        JLabel corridorSizeLabel = new JLabel("");
+        corridorSizeLabel.setForeground(TEXT_SECONDARY_COLOR);
+        corridorSizeLabel.setFont(corridorSizeLabel.getFont().deriveFont(Font.ITALIC, 11f));
+        customInputPanel.add(corridorSizeLabel, cipgbc);
+        
+        cpgbc.gridx = 0; cpgbc.gridy = 1; cpgbc.gridwidth = 2; cpgbc.weightx = 1.0;
+        corridorParamsPanel.add(customInputPanel, cpgbc);
+        cpgbc.gridwidth = 1;
+        
+        // Helper to update the size display
+        Runnable updateCorridorSizeDisplay = () -> {
+            String selected = (String) corridorWidthCombo.getSelectedItem();
+            if ("Adaptive".equals(selected)) {
+                // Show estimated size based on current video (1/10 of resolution)
+                if (imp != null) {
+                    int w = imp.getWidth();
+                    int h = imp.getHeight();
+                    int adaptiveSize = Math.max(w, h) / 10;
+                    corridorSizeLabel.setText("≈ " + adaptiveSize + " px");
+                } else {
+                    corridorSizeLabel.setText("(1/10 res)");
+                }
+            } else if ("Full Frame".equals(selected)) {
+                if (imp != null) {
+                    int w = imp.getWidth();
+                    int h = imp.getHeight();
+                    corridorSizeLabel.setText(w + "×" + h);
+                } else {
+                    corridorSizeLabel.setText("(full)");
+                }
+            } else if ("Custom".equals(selected)) {
+                try {
+                    int customVal = Integer.parseInt(corridorCustomField.getText().trim());
+                    corridorSizeLabel.setText(customVal + "×" + customVal);
+                } catch (NumberFormatException ex) {
+                    corridorSizeLabel.setText("?");
+                }
+            }
+        };
+        
+        // Load saved value
+        String savedCorridorWidth = config.getProperty("corridor.width", "adaptive");
+        if (savedCorridorWidth.equals("0") || savedCorridorWidth.equals("full")) {
+            corridorWidthCombo.setSelectedItem("Full Frame");
+            customInputPanel.setVisible(false);
+        } else if (savedCorridorWidth.equals("adaptive")) {
+            corridorWidthCombo.setSelectedItem("Adaptive");
+            customInputPanel.setVisible(false);
+        } else {
+            // It's a custom number
+            corridorWidthCombo.setSelectedItem("Custom");
+            corridorCustomField.setText(savedCorridorWidth);
+            customInputPanel.setVisible(true);
+        }
+        updateCorridorSizeDisplay.run();
+        
+        corridorWidthCombo.setToolTipText("<html><b>Adaptive:</b> Uses 1/10 of video resolution as corridor width.<br>" +
+            "<b>Full Frame:</b> Searches entire frame (slower but more accurate).<br>" +
+            "<b>Custom:</b> Specify your own corridor width in pixels.</html>");
+        
+        // Handle dropdown changes
+        corridorWidthCombo.addActionListener(e -> {
+            if (isUpdatingConfigPanel) return;
+            String selected = (String) corridorWidthCombo.getSelectedItem();
+            if ("Full Frame".equals(selected)) {
+                config.setProperty("corridor.width", "0");
+                customInputPanel.setVisible(false);
+            } else if ("Custom".equals(selected)) {
+                customInputPanel.setVisible(true);
+                String customVal = corridorCustomField.getText().trim();
+                if (!customVal.isEmpty()) {
+                    config.setProperty("corridor.width", customVal);
+                }
+            } else {
+                config.setProperty("corridor.width", "adaptive");
+                customInputPanel.setVisible(false);
+            }
+            updateCorridorSizeDisplay.run();
+            corridorParamsPanel.revalidate();
+            saveConfig();
+        });
+        
+        // Handle custom field changes
+        corridorCustomField.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
+            private void update() {
+                if (isUpdatingConfigPanel) return;
+                if ("Custom".equals(corridorWidthCombo.getSelectedItem())) {
+                    String val = corridorCustomField.getText().trim();
+                    try {
+                        int intVal = Integer.parseInt(val);
+                        if (intVal > 0) {
+                            config.setProperty("corridor.width", val);
+                            saveConfig();
+                        }
+                    } catch (NumberFormatException ex) {
+                        // Ignore invalid input
+                    }
+                    updateCorridorSizeDisplay.run();
+                }
+            }
+            public void insertUpdate(javax.swing.event.DocumentEvent e) { update(); }
+            public void removeUpdate(javax.swing.event.DocumentEvent e) { update(); }
+            public void changedUpdate(javax.swing.event.DocumentEvent e) { update(); }
+        });
+        
+        bgbc.gridx = 0; bgbc.gridy = 4; bgbc.gridwidth = 2;
+        blobContent.add(corridorParamsPanel, bgbc);
+        
+        // Show/hide corridor params based on correction method
+        corridorParamsPanel.setVisible("Corridor-DP".equals(cfgCorrectionMethodCombo.getSelectedItem()));
+        cfgCorrectionMethodCombo.addActionListener(e -> {
+            String selectedMethod = (String) cfgCorrectionMethodCombo.getSelectedItem();
+            corridorParamsPanel.setVisible("Corridor-DP".equals(selectedMethod));
+            blobSection.revalidate();
+        });
+        
+        mainPanel.add(blobSection);
+        mainPanel.add(Box.createVerticalStrut(8));
+        
+        // =====================================================================
+        // SECTION: Tracking Settings
+        // =====================================================================
+        JPanel trackSection = createCollapsibleSection("Tracking Settings", true);
+        JPanel trackContent = (JPanel) ((BorderLayout) trackSection.getLayout()).getLayoutComponent(BorderLayout.CENTER);
+        GridBagConstraints trgbc = new GridBagConstraints();
+        trgbc.insets = new Insets(3, 3, 3, 3);
+        trgbc.fill = GridBagConstraints.HORIZONTAL;
+        trgbc.anchor = GridBagConstraints.WEST;
+        int trow = 0;
+        
+        trgbc.gridx = 0; trgbc.gridy = trow; trgbc.weightx = 0.3;
+        trackContent.add(createConfigLabel("Tracking Mode:"), trgbc);
+        trgbc.gridx = 1; trgbc.weightx = 0.7;
+        cfgTrackingModeCombo = createModernComboBox(new String[]{"single-seed", "multi-seed"});
+        cfgTrackingModeCombo.setSelectedItem(config.getProperty("tracking.mode", "single-seed"));
+        trackContent.add(cfgTrackingModeCombo, trgbc);
+        trow++;
+        
+        trgbc.gridx = 0; trgbc.gridy = trow; trgbc.gridwidth = 2;
+        cfgLocalCorrectionCheckbox = createStyledCheckbox("Use Local Correction Mode");
+        cfgLocalCorrectionCheckbox.setSelected(Boolean.parseBoolean(config.getProperty("correction.local.mode", "false")));
+        cfgLocalCorrectionCheckbox.setToolTipText("<html>Corrections only affect a local window around the correction point.</html>");
+        trackContent.add(cfgLocalCorrectionCheckbox, trgbc);
+        trgbc.gridwidth = 1;
+        trow++;
+        
+        trgbc.gridx = 0; trgbc.gridy = trow; trgbc.weightx = 0.3;
+        JLabel windowLabel = createConfigLabel("Correction Window:");
+        trackContent.add(windowLabel, trgbc);
+        trgbc.gridx = 1; trgbc.weightx = 0.7;
+        cfgLocalWindowSpinner = new JSpinner(new SpinnerNumberModel(
+            Integer.parseInt(config.getProperty("correction.local.window", "11")), 5, 51, 2));
+        styleSpinner(cfgLocalWindowSpinner);
+        trackContent.add(cfgLocalWindowSpinner, trgbc);
+        
+        windowLabel.setEnabled(cfgLocalCorrectionCheckbox.isSelected());
+        cfgLocalWindowSpinner.setEnabled(cfgLocalCorrectionCheckbox.isSelected());
+        cfgLocalCorrectionCheckbox.addActionListener(e -> {
+            windowLabel.setEnabled(cfgLocalCorrectionCheckbox.isSelected());
+            cfgLocalWindowSpinner.setEnabled(cfgLocalCorrectionCheckbox.isSelected());
+        });
+        
+        mainPanel.add(trackSection);
+        mainPanel.add(Box.createVerticalStrut(8));
+        
+        // =====================================================================
+        // SECTION: Segmentation-Assisted Tracking (SAT)
+        // =====================================================================
+        JPanel satSection = createCollapsibleSection("Segmentation-Assisted Tracking", true);
+        JPanel satContent = (JPanel) ((BorderLayout) satSection.getLayout()).getLayoutComponent(BorderLayout.CENTER);
+        satContent.setLayout(new BoxLayout(satContent, BoxLayout.Y_AXIS));
+        
+        // SAT Enable checkbox
+        JPanel satEnablePanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+        satEnablePanel.setOpaque(false);
+        satEnablePanel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        satEnablePanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 30));
+        satCheckbox.setAlignmentX(Component.LEFT_ALIGNMENT);
+        satEnablePanel.add(satCheckbox);
+        satEnablePanel.add(Box.createHorizontalStrut(10));
+        satAdjustButton.setAlignmentX(Component.LEFT_ALIGNMENT);
+        satEnablePanel.add(satAdjustButton);
+        satContent.add(satEnablePanel);
+        satContent.add(Box.createVerticalStrut(6));
+        
+        // Show Mask checkbox
+        showMaskCheckbox.setAlignmentX(Component.LEFT_ALIGNMENT);
+        satContent.add(showMaskCheckbox);
+        satContent.add(Box.createVerticalStrut(4));
+        
+        // Show Regions checkbox
+        showRegionsCheckbox.setAlignmentX(Component.LEFT_ALIGNMENT);
+        satContent.add(showRegionsCheckbox);
+        
+        mainPanel.add(satSection);
+        mainPanel.add(Box.createVerticalStrut(8));
+        
+        // Add change listeners to auto-save configuration when any setting changes
+        addConfigPanelChangeListeners();
+        
+        // Scroll pane for content
+        JScrollPane scrollPane = new JScrollPane(mainPanel);
+        scrollPane.setBorder(null);
+        scrollPane.getViewport().setBackground(SECONDARY_DARK);
+        scrollPane.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
+        scrollPane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_AS_NEEDED);
+        scrollPane.getVerticalScrollBar().setUnitIncrement(16);
+        scrollPane.getHorizontalScrollBar().setUnitIncrement(16);
+        
+        configurationContent = mainPanel;
+        configurationSection.add(headerPanel, BorderLayout.NORTH);
+        configurationSection.add(scrollPane, BorderLayout.CENTER);
+        
+        return configurationSection;
+    }
+    
+    /**
+     * Toggle the configuration panel collapsed/expanded state.
+     */
+    private void toggleConfigPanel() {
+        configPanelCollapsed = !configPanelCollapsed;
+        if (configPanelCollapsed) {
+            configurationSection.setPreferredSize(new Dimension(40, 0));
+            // Hide content
+            for (Component c : configurationSection.getComponents()) {
+                if (c instanceof JScrollPane) {
+                    c.setVisible(false);
+                }
+            }
+            // Update split pane divider to collapsed position
+            if (leftSplitPane != null) {
+                leftSplitPane.setDividerLocation(40);
+            }
+        } else {
+            configurationSection.setPreferredSize(new Dimension(configPanelWidth, 0));
+            // Show content
+            for (Component c : configurationSection.getComponents()) {
+                if (c instanceof JScrollPane) {
+                    c.setVisible(true);
+                }
+            }
+            // Update split pane divider to expanded position
+            if (leftSplitPane != null) {
+                leftSplitPane.setDividerLocation(configPanelWidth);
+            }
+        }
+        configurationSection.revalidate();
+        if (leftSplitPane != null) {
+            leftSplitPane.revalidate();
+        }
+        frame.revalidate();
+    }
+    
+    /**
+     * Creates the right-side annotation panel with tracks list.
+     * This panel is collapsible and resizable.
+     */
+    private JPanel createAnnotationPanel() {
+        // Main container panel
+        annotationSection = new JPanel(new BorderLayout());
+        annotationSection.setBackground(SECONDARY_DARK);
+        annotationSection.setBorder(BorderFactory.createMatteBorder(0, 1, 0, 0, BORDER_DARK));
+        annotationSection.setPreferredSize(new Dimension(annotationPanelWidth, 0));
+        annotationSection.setMinimumSize(new Dimension(40, 0)); // Allow collapse to 40px
+        
+        // Header panel with title
+        JPanel headerPanel = new JPanel(new BorderLayout()) {
+            @Override
+            protected void paintComponent(Graphics g) {
+                super.paintComponent(g);
+                Graphics2D g2d = (Graphics2D) g;
+                g2d.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+                g2d.setColor(PANEL_DARK);
+                g2d.fillRect(0, 0, getWidth(), getHeight());
+            }
+        };
+        headerPanel.setOpaque(false);
+        headerPanel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createMatteBorder(0, 0, 1, 0, BORDER_DARK),
+            BorderFactory.createEmptyBorder(12, 18, 12, 18)
+        ));
+        
+        JLabel annotationTitle = new JLabel("Tracks", SwingConstants.LEFT);
+        annotationTitle.setFont(new Font("Segoe UI Semibold", Font.BOLD, 16));
+        annotationTitle.setForeground(TEXT_PRIMARY);
+        
+        // Batch operations toolbar
+        JPanel batchToolbar = new JPanel(new FlowLayout(FlowLayout.RIGHT, 2, 0));
+        batchToolbar.setOpaque(false);
+        
+        JButton selectAllBtn = new JButton("All");
+        selectAllBtn.setFont(new Font("SansSerif", Font.PLAIN, 9));
+        selectAllBtn.setMargin(new Insets(2, 4, 2, 4));
+        selectAllBtn.setToolTipText("Select all tracks");
+        selectAllBtn.addActionListener(e -> selectAllTracks());
+        
+        JButton deselectAllBtn = new JButton("None");
+        deselectAllBtn.setFont(new Font("SansSerif", Font.PLAIN, 9));
+        deselectAllBtn.setMargin(new Insets(2, 4, 2, 4));
+        deselectAllBtn.setToolTipText("Deselect all tracks");
+        deselectAllBtn.addActionListener(e -> deselectAllTracks());
+        
+        JButton completeBtn = new JButton("Done");
+        completeBtn.setFont(new Font("SansSerif", Font.PLAIN, 9));
+        completeBtn.setMargin(new Insets(2, 4, 2, 4));
+        completeBtn.setForeground(new Color(76, 175, 80));
+        completeBtn.setToolTipText("Mark selected tracks as complete");
+        completeBtn.addActionListener(e -> markSelectedTracksComplete());
+        
+        JButton removeSelBtn = new JButton("Del");
+        removeSelBtn.setFont(new Font("SansSerif", Font.PLAIN, 9));
+        removeSelBtn.setMargin(new Insets(2, 4, 2, 4));
+        removeSelBtn.setForeground(new Color(244, 67, 54));
+        removeSelBtn.setToolTipText("Remove selected tracks");
+        removeSelBtn.addActionListener(e -> removeSelectedTracks());
+        
+        JButton removeAllBtn = new JButton("Clear");
+        removeAllBtn.setFont(new Font("SansSerif", Font.PLAIN, 9));
+        removeAllBtn.setMargin(new Insets(2, 4, 2, 4));
+        removeAllBtn.setForeground(new Color(244, 67, 54));
+        removeAllBtn.setToolTipText("Remove ALL tracks");
+        removeAllBtn.addActionListener(e -> removeAllTracks());
+        
+        batchToolbar.add(selectAllBtn);
+        batchToolbar.add(deselectAllBtn);
+        batchToolbar.add(completeBtn);
+        batchToolbar.add(removeSelBtn);
+        batchToolbar.add(removeAllBtn);
+        
+        headerPanel.add(annotationTitle, BorderLayout.CENTER);
+        headerPanel.add(batchToolbar, BorderLayout.WEST);
+        
+        annotationPanel = new JPanel();
+        annotationPanel.setLayout(new BoxLayout(annotationPanel, BoxLayout.Y_AXIS));
+        annotationPanel.setBackground(SECONDARY_DARK);
+        annotationScrollPane = new JScrollPane(annotationPanel);  // Store in class field for programmatic scrolling
+        annotationScrollPane.setPreferredSize(new Dimension(annotationPanelWidth, 0));
+        annotationScrollPane.setBorder(null);
+        annotationScrollPane.setBackground(SECONDARY_DARK);
+        annotationScrollPane.getViewport().setBackground(SECONDARY_DARK);
+        annotationScrollPane.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
+        annotationScrollPane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_AS_NEEDED);
+        annotationScrollPane.getVerticalScrollBar().setUnitIncrement(16);
+        annotationScrollPane.getHorizontalScrollBar().setUnitIncrement(16);
+        
+        annotationSection.add(headerPanel, BorderLayout.NORTH);
+        annotationSection.add(annotationScrollPane, BorderLayout.CENTER);;
+        
+        // Multi-seed mode: Add "Run Track Optimization" button at the bottom
+        JPanel optimizationButtonPanel = new JPanel(new FlowLayout(FlowLayout.CENTER, 10, 12));
+        optimizationButtonPanel.setBackground(PANEL_DARK);
+        optimizationButtonPanel.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, BORDER_DARK));
+        
+        JButton runOptimizationButton = createAccentButton("Run Track Optimization", "play");
+        runOptimizationButton.setToolTipText("Optimize all selected tracks using optical flow");
+        runOptimizationButton.addActionListener(e -> runBatchTrackOptimization());
+        optimizationButtonPanel.add(runOptimizationButton);
+        
+        optimizationButtonPanel.setVisible(isMultiSeedMode());
+        annotationSection.add(optimizationButtonPanel, BorderLayout.SOUTH);
+        
+        return annotationSection;
+    }
+    
+    /**
+     * Toggle the annotation panel collapsed/expanded state.
+     */
+    private void toggleAnnotationPanel() {
+        annotationPanelCollapsed = !annotationPanelCollapsed;
+        if (annotationPanelCollapsed) {
+            annotationSection.setPreferredSize(new Dimension(40, 0));
+            // Hide content (skip header which is first component)
+            for (int i = 1; i < annotationSection.getComponentCount(); i++) {
+                Component c = annotationSection.getComponent(i);
+                if (c instanceof JScrollPane || c instanceof JPanel) {
+                    c.setVisible(false);
+                }
+            }
+            // Update split pane divider - move to show only collapsed panel
+            if (rightSplitPane != null) {
+                rightSplitPane.setDividerLocation(rightSplitPane.getWidth() - 40 - rightSplitPane.getDividerSize());
+            }
+        } else {
+            annotationSection.setPreferredSize(new Dimension(annotationPanelWidth, 0));
+            // Show content
+            for (Component c : annotationSection.getComponents()) {
+                c.setVisible(true);
+            }
+            // Update split pane divider - move to show expanded panel
+            if (rightSplitPane != null) {
+                rightSplitPane.setDividerLocation(rightSplitPane.getWidth() - annotationPanelWidth - rightSplitPane.getDividerSize());
+            }
+        }
+        annotationSection.revalidate();
+        if (rightSplitPane != null) {
+            rightSplitPane.revalidate();
+        }
+        frame.revalidate();
+    }
+    
+    /**
+     * Creates a styled panel for method-specific settings.
+     */
+    private JPanel createMethodSettingsPanel(String title) {
+        JPanel panel = new JPanel(new GridBagLayout());
+        panel.setBackground(PANEL_DARK);
+        panel.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createTitledBorder(
+                BorderFactory.createLineBorder(BORDER_DARK),
+                title,
+                javax.swing.border.TitledBorder.DEFAULT_JUSTIFICATION,
+                javax.swing.border.TitledBorder.DEFAULT_POSITION,
+                new Font("Segoe UI", Font.BOLD, 10),
+                TEXT_SECONDARY
+            ),
+            BorderFactory.createEmptyBorder(4, 6, 4, 6)
+        ));
+        return panel;
+    }
+    
+    /**
+     * Creates a modern-styled combo box with improved appearance.
+     */
+    private JComboBox<String> createModernComboBox(String[] items) {
+        JComboBox<String> combo = new JComboBox<>(items);
+        combo.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        combo.setBackground(SECONDARY_DARK);
+        combo.setForeground(TEXT_PRIMARY);
+        combo.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(BORDER_DARK, 1),
+            BorderFactory.createEmptyBorder(2, 6, 2, 6)
+        ));
+        combo.setFocusable(false);
+        
+        // Modern flat renderer
+        combo.setRenderer(new DefaultListCellRenderer() {
+            @Override
+            public Component getListCellRendererComponent(JList<?> list, Object value,
+                    int index, boolean isSelected, boolean cellHasFocus) {
+                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+                setFont(new Font("Segoe UI", Font.PLAIN, 12));
+                if (isSelected) {
+                    setBackground(ACCENT_BLUE);
+                    setForeground(Color.WHITE);
+                } else {
+                    setBackground(SECONDARY_DARK);
+                    setForeground(TEXT_PRIMARY);
+                }
+                setBorder(BorderFactory.createEmptyBorder(6, 10, 6, 10));
+                return this;
+            }
+        });
+        
+        // Style popup
+        forceStyleComboPopup(combo);
+        combo.addPopupMenuListener(new PopupMenuListener() {
+            @Override
+            public void popupMenuWillBecomeVisible(PopupMenuEvent e) {
+                SwingUtilities.invokeLater(() -> forceStyleComboPopup(combo));
+            }
+            @Override
+            public void popupMenuWillBecomeInvisible(PopupMenuEvent e) {}
+            @Override
+            public void popupMenuCanceled(PopupMenuEvent e) {}
+        });
+        
+        return combo;
+    }
+    
+    /**
+     * Save configuration from the left panel fields.
+     * Note: Environment settings are only in Advanced Configuration dialog.
+     */
+    private void saveConfigurationFromPanel() {
+        String oldTrackingMode = config.getProperty("tracking.mode", "single-seed");
+        String newTrackingMode = (String) cfgTrackingModeCombo.getSelectedItem();
+        
+        // Environment settings are NOT in the left panel - they remain in Advanced Configuration only
+        // So we don't modify them here
+        
+        // Optical flow settings
+        config.setProperty("flow.method", (String) cfgFlowMethodCombo.getSelectedItem());
+        config.setProperty("flow.incremental.allocation", String.valueOf(cfgFlowIncrementalAllocCheckbox.isSelected()));
+        if (cfgRaftModelCombo != null) config.setProperty("raft.model.size", (String) cfgRaftModelCombo.getSelectedItem());
+        config.setProperty("dis.downsample.factor", cfgDisDownsampleSpinner.getValue().toString());
+        
+        // LocoTrack DoG parameters (only if components exist - GPU mode only)
+        if (cfgRadiusSpinner != null) {
+            config.setProperty("locotrack.dog.radius", String.valueOf((Double) cfgRadiusSpinner.getValue()));
+            config.setProperty("locotrack.dog.threshold", cfgDogThresholdSpinner.getValue().toString());
+            config.setProperty("locotrack.dog.median.filter", String.valueOf(cfgMedianFilterCheckbox.isSelected()));
+            config.setProperty("locotrack.dog.subpixel", String.valueOf(cfgSubpixelCheckbox.isSelected()));
+            config.setProperty("locotrack.occlusion.threshold", cfgOcclusionSpinner.getValue().toString());
+            config.setProperty("locotrack.kernel", (String) cfgLocotrackKernelCombo.getSelectedItem());
+        }
+        
+        // Trackpy settings
+        config.setProperty("trackpy.diameter", cfgTpDiameterSpinner.getValue().toString());
+        config.setProperty("trackpy.minmass", cfgTpMinmassSpinner.getValue().toString());
+        config.setProperty("trackpy.search.range", cfgSearchRangeSpinner.getValue().toString());
+        config.setProperty("trackpy.memory", cfgMemorySpinner.getValue().toString());
+        config.setProperty("trackpy.require.persistent", String.valueOf(cfgRequirePersistentCheck.isSelected()));
+        config.setProperty("trackpy.smooth.factor", cfgSmoothFactorSpinner.getValue().toString());
+        config.setProperty("trackpy.flow.smoothing", cfgFlowSmoothingSpinner.getValue().toString());
+        config.setProperty("trackpy.kernel", (String) cfgKernelCombo.getSelectedItem());
+        config.setProperty("auto.compute.optical.flow", String.valueOf(cfgAutoComputeCheck.isSelected()));
+        
+        // Blob detection settings (now separate)
+        config.setProperty("dis.use.blob.detection", String.valueOf(cfgBlobDetectionCheckbox.isSelected()));
+        config.setProperty("dis.blob.search.radius", cfgBlobSearchRadiusSpinner.getValue().toString());
+        config.setProperty("dis.blob.radius", cfgBlobRadiusSpinner.getValue().toString());
+        
+        // Correction method setting
+        String selectedCorrectionMethod = (String) cfgCorrectionMethodCombo.getSelectedItem();
+        if (selectedCorrectionMethod.equals("Blob-Assisted")) {
+            config.setProperty("correction.method", "blob_assisted");
+        } else if (selectedCorrectionMethod.equals("Corridor-DP")) {
+            config.setProperty("correction.method", "corridor_dp");
+        } else {
+            config.setProperty("correction.method", "full_blend");
+        }
+        
+        // Linear interpolation threshold (for short anchor segments)
+        config.setProperty("correction.linear.interp.threshold", cfgLinearInterpThresholdSpinner.getValue().toString());
+        
+        // Tracking settings
+        config.setProperty("tracking.mode", newTrackingMode);
+        config.setProperty("correction.local.mode", String.valueOf(cfgLocalCorrectionCheckbox.isSelected()));
+        int windowVal = (Integer) cfgLocalWindowSpinner.getValue();
+        if (windowVal % 2 == 0) windowVal++;
+        config.setProperty("correction.local.window", String.valueOf(windowVal));
+        
+        saveConfig();
+        handleTrackingModeChange(oldTrackingMode, newTrackingMode);
+        
+        // No status message for auto-save (would be too noisy)
+    }
+    
+    /**
+     * Reload configuration panel values from config properties.
+     * Called when config file is reloaded or settings change externally.
+     */
+    private void reloadConfigurationPanel() {
+        if (cfgFlowMethodCombo == null) return; // Panel not created yet
+        
+        isUpdatingConfigPanel = true; // Prevent auto-save during reload
+        
+        // Environment settings are only in Advanced Configuration dialog
+        // Not reloaded here
+        
+        cfgFlowMethodCombo.setSelectedItem(config.getProperty("flow.method", isCpuOnly ? "dis" : "raft"));
+        if (cfgRaftModelCombo != null) cfgRaftModelCombo.setSelectedItem(config.getProperty("raft.model.size", "large"));
+        cfgDisDownsampleSpinner.setValue(Integer.parseInt(config.getProperty("dis.downsample.factor", "2")));
+        
+        // LocoTrack DoG parameters (only if components exist - GPU mode only)
+        if (cfgRadiusSpinner != null) {
+            cfgRadiusSpinner.setValue(Double.parseDouble(config.getProperty("locotrack.dog.radius", "2.5")));
+            cfgDogThresholdSpinner.setValue(Double.parseDouble(config.getProperty("locotrack.dog.threshold", "0.0")));
+            cfgMedianFilterCheckbox.setSelected(Boolean.parseBoolean(config.getProperty("locotrack.dog.median.filter", "false")));
+            cfgSubpixelCheckbox.setSelected(Boolean.parseBoolean(config.getProperty("locotrack.dog.subpixel", "true")));
+            cfgOcclusionSpinner.setValue(Double.parseDouble(config.getProperty("locotrack.occlusion.threshold", "0.5")));
+            cfgLocotrackKernelCombo.setSelectedItem(config.getProperty("locotrack.kernel", "gaussian_rbf"));
+        }
+        
+        cfgTpDiameterSpinner.setValue(Integer.parseInt(config.getProperty("trackpy.diameter", "11")));
+        cfgTpMinmassSpinner.setValue(Double.parseDouble(config.getProperty("trackpy.minmass", "0")));
+        cfgSearchRangeSpinner.setValue(Double.parseDouble(config.getProperty("trackpy.search.range", "15")));
+        cfgMemorySpinner.setValue(Integer.parseInt(config.getProperty("trackpy.memory", "5")));
+        cfgRequirePersistentCheck.setSelected(Boolean.parseBoolean(config.getProperty("trackpy.require.persistent", "false")));
+        cfgSmoothFactorSpinner.setValue(Double.parseDouble(config.getProperty("trackpy.smooth.factor", "0.1")));
+        cfgFlowSmoothingSpinner.setValue(Double.parseDouble(config.getProperty("trackpy.flow.smoothing", "15")));
+        // Ensure saved kernel is available in current mode
+        String savedKernel = config.getProperty("trackpy.kernel", "gaussian_rbf");
+        if (isCpuOnly && isGpuOnlyKernel(savedKernel)) {
+            savedKernel = "gaussian_rbf";
+        }
+        cfgKernelCombo.setSelectedItem(savedKernel);
+        cfgAutoComputeCheck.setSelected(Boolean.parseBoolean(config.getProperty("auto.compute.optical.flow", "true")));
+        
+        cfgBlobDetectionCheckbox.setSelected(Boolean.parseBoolean(config.getProperty("dis.use.blob.detection", "false")));
+        cfgBlobSearchRadiusSpinner.setValue(Integer.parseInt(config.getProperty("dis.blob.search.radius", "15")));
+        cfgBlobRadiusSpinner.setValue(Double.parseDouble(config.getProperty("dis.blob.radius", "5.0")));
+        cfgBlobParamsPanel.setVisible(cfgBlobDetectionCheckbox.isSelected());
+        
+        // Correction method - all methods are CPU-based
+        String savedCorrMethod = config.getProperty("correction.method", "full_blend");
+        if (savedCorrMethod.equals("blob_assisted")) {
+            cfgCorrectionMethodCombo.setSelectedItem("Blob-Assisted");
+        } else if (savedCorrMethod.equals("corridor_dp")) {
+            cfgCorrectionMethodCombo.setSelectedItem("Corridor-DP");
+        } else {
+            cfgCorrectionMethodCombo.setSelectedItem("Full-Blend");
+        }
+        
+        // Linear interpolation threshold
+        cfgLinearInterpThresholdSpinner.setValue(Integer.parseInt(
+            config.getProperty("correction.linear.interp.threshold", "0")));
+        
+        cfgTrackingModeCombo.setSelectedItem(config.getProperty("tracking.mode", "single-seed"));
+        cfgLocalCorrectionCheckbox.setSelected(Boolean.parseBoolean(config.getProperty("correction.local.mode", "false")));
+        cfgLocalWindowSpinner.setValue(Integer.parseInt(config.getProperty("correction.local.window", "11")));
+        
+        isUpdatingConfigPanel = false;
+    }
+    
+    /**
+     * Add change listeners to all config panel components for auto-save functionality.
+     * When any setting changes in the left panel, it automatically saves and syncs.
+     */
+    private void addConfigPanelChangeListeners() {
+        // Helper to create an action listener that auto-saves
+        java.awt.event.ActionListener autoSaveAction = e -> {
+            if (!isUpdatingConfigPanel) {
+                saveConfigurationFromPanel();
+            }
+        };
+        
+        // Helper for spinner change listener
+        javax.swing.event.ChangeListener autoSaveChange = e -> {
+            if (!isUpdatingConfigPanel) {
+                saveConfigurationFromPanel();
+            }
+        };
+        
+        // Combo boxes
+        cfgFlowMethodCombo.addActionListener(autoSaveAction);
+        if (cfgRaftModelCombo != null) cfgRaftModelCombo.addActionListener(autoSaveAction);
+        if (cfgLocotrackKernelCombo != null) cfgLocotrackKernelCombo.addActionListener(autoSaveAction);
+        cfgKernelCombo.addActionListener(autoSaveAction);
+        cfgTrackingModeCombo.addActionListener(autoSaveAction);
+        
+        // Spinners
+        cfgDisDownsampleSpinner.addChangeListener(autoSaveChange);
+        if (cfgRadiusSpinner != null) cfgRadiusSpinner.addChangeListener(autoSaveChange);
+        if (cfgDogThresholdSpinner != null) cfgDogThresholdSpinner.addChangeListener(autoSaveChange);
+        if (cfgOcclusionSpinner != null) cfgOcclusionSpinner.addChangeListener(autoSaveChange);
+        cfgTpDiameterSpinner.addChangeListener(autoSaveChange);
+        cfgTpMinmassSpinner.addChangeListener(autoSaveChange);
+        cfgSearchRangeSpinner.addChangeListener(autoSaveChange);
+        cfgMemorySpinner.addChangeListener(autoSaveChange);
+        cfgSmoothFactorSpinner.addChangeListener(autoSaveChange);
+        cfgFlowSmoothingSpinner.addChangeListener(autoSaveChange);
+        cfgLocalWindowSpinner.addChangeListener(autoSaveChange);
+        cfgBlobSearchRadiusSpinner.addChangeListener(autoSaveChange);
+        cfgBlobRadiusSpinner.addChangeListener(autoSaveChange);
+        cfgLinearInterpThresholdSpinner.addChangeListener(autoSaveChange);
+        
+        // Checkboxes
+        if (cfgMedianFilterCheckbox != null) cfgMedianFilterCheckbox.addActionListener(autoSaveAction);
+        if (cfgSubpixelCheckbox != null) cfgSubpixelCheckbox.addActionListener(autoSaveAction);
+        cfgRequirePersistentCheck.addActionListener(autoSaveAction);
+        cfgAutoComputeCheck.addActionListener(autoSaveAction);
+        cfgLocalCorrectionCheckbox.addActionListener(autoSaveAction);
+        cfgBlobDetectionCheckbox.addActionListener(autoSaveAction);
+        
+        // Correction method combo
+        cfgCorrectionMethodCombo.addActionListener(autoSaveAction);
+    }
+
+    // KEEP ALL REMAINING METHODS FROM ORIGINAL (deleteSelectedPoint, deleteSelectedTrack, refreshAnnotationList, etc.)
+    private void deleteSelectedPoint() {
+        if (selectedTrackId == null) {
+            JOptionPane.showMessageDialog(frame, "No track selected.", "Info", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        
+        Map<Integer, Point> frameMap = trackAnnotations.get(selectedTrackId);
+        // Convert currentSlice (1-indexed UI) to 0-indexed frame
+        int frameIndex = currentSlice - 1;
+        if (frameMap == null || !frameMap.containsKey(frameIndex)) {
+            JOptionPane.showMessageDialog(frame, "No point on current frame for selected track.", "Info", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        
+        saveState();
+        frameMap.remove(frameIndex);
+        imageLabel.repaint();
+        refreshAnnotationList();
+    }
+
+    private void deleteSelectedTrack() {
+        if (selectedTrackId == null) {
+            JOptionPane.showMessageDialog(frame, "No track selected.", "Info", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        
+        int confirm = JOptionPane.showConfirmDialog(frame, "Delete entire track \"" + selectedTrackId + "\"?",
+            "Confirm Delete", JOptionPane.YES_NO_OPTION);
+        
+        if (confirm == JOptionPane.YES_OPTION) {
+            saveState();
+            // Exit comparison mode if deleting the comparison track
+            if (smoothingComparisonMode && selectedTrackId.equals(smoothingComparisonTrackId)) {
+                exitSmoothingComparisonMode();
+            }
+            trackAnnotations.remove(selectedTrackId);
+            trackColors.remove(selectedTrackId);
+            trackAnchors.remove(selectedTrackId);
+            trackOptimized.remove(selectedTrackId);
+            trackSelected.remove(selectedTrackId);
+            // Clean up time tracking data
+            trackTotalTime.remove(selectedTrackId);
+            trackStartTime.remove(selectedTrackId);
+            trackCompleted.remove(selectedTrackId);
+            // Clean up trim data
+            trackUntrimmedAnnotations.remove(selectedTrackId);
+            trackUntrimmedAnchors.remove(selectedTrackId);
+            trackTrimRange.remove(selectedTrackId);
+            // Clean up smoothing data
+            trackSmoothing.remove(selectedTrackId);
+            trackOriginalAnnotations.remove(selectedTrackId);
+            // Clean up occlusion data
+            trackOcclusionSegments.remove(selectedTrackId);
+            selectedTrackId = null;
+            
+            // Ensure first track is selected after deletion
+            ensureFirstTrackSelected();
+            
+            imageLabel.repaint();
+            refreshAnnotationList();
+        }
+    }
+    
+    /**
+     * Find the lowest available track number.
+     * This allows reusing track numbers after deletion.
+     * E.g., if Track1, Track2, Track3 exist and Track2 is deleted,
+     * the next new track will be Track2.
+     */
+    private int findNextAvailableTrackNumber() {
+        java.util.Set<Integer> usedNumbers = new java.util.HashSet<>();
+        for (String trackId : trackAnnotations.keySet()) {
+            if (trackId.startsWith("Track")) {
+                try {
+                    int num = Integer.parseInt(trackId.substring(5));
+                    usedNumbers.add(num);
+                } catch (NumberFormatException e) {
+                    // Ignore non-numeric track IDs
+                }
+            }
+        }
+        
+        // Find the lowest available number starting from 1
+        int nextNum = 1;
+        while (usedNumbers.contains(nextNum)) {
+            nextNum++;
+        }
+        return nextNum;
+    }
+    
+    /**
+     * Get a sorted list of track IDs, sorted numerically by track number.
+     * E.g., Track1, Track2, Track10 (not Track1, Track10, Track2)
+     */
+    private java.util.List<String> getSortedTrackIds() {
+        java.util.List<String> trackIds = new java.util.ArrayList<>(trackAnnotations.keySet());
+        trackIds.sort((a, b) -> {
+            // Extract numeric parts for proper sorting
+            int numA = 0, numB = 0;
+            try {
+                if (a.startsWith("Track")) numA = Integer.parseInt(a.substring(5));
+            } catch (NumberFormatException e) { /* use 0 */ }
+            try {
+                if (b.startsWith("Track")) numB = Integer.parseInt(b.substring(5));
+            } catch (NumberFormatException e) { /* use 0 */ }
+            return Integer.compare(numA, numB);
+        });
+        return trackIds;
+    }
+
+    private void refreshAnnotationList() {
+        annotationPanel.removeAll();
+        
+        boolean multiSeedMode = isMultiSeedMode();
+        
+        // Iterate over tracks in sorted order (Track1, Track2, Track3, ...)
+        for (String trackId : getSortedTrackIds()) {
+            Map<Integer, Point> frameMap = trackAnnotations.get(trackId);
+            // Convert currentSlice (1-indexed UI) to 0-indexed frame
+            Point p = frameMap.get(currentSlice - 1);
+            
+            JPanel row = new JPanel(new BorderLayout(10, 0));
+            row.setMaximumSize(new Dimension(Integer.MAX_VALUE, rowHeight + 12));
+            row.setPreferredSize(new Dimension(280, rowHeight + 12));
+            row.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createMatteBorder(0, 0, 1, 0, BORDER_DARK),
+                BorderFactory.createEmptyBorder(10, 15, 10, 15)
+            ));
+            row.setBackground(SECONDARY_DARK);
+            
+            // Check if track is completed
+            boolean isCompleted = trackCompleted.getOrDefault(trackId, false);
+            
+            // Set background color based on completion status and optimization status
+            if (isCompleted) {
+                // Completed tracks get a gray tint
+                row.setBackground(new Color(60, 60, 65));
+            } else if (multiSeedMode) {
+                boolean isOptimized = trackOptimized.getOrDefault(trackId, false);
+                if (isOptimized) {
+                    row.setBackground(new Color(35, 65, 45)); // Dark green tint
+                } else {
+                    row.setBackground(new Color(70, 40, 40)); // Dark red tint
+                }
+            }
+            
+            // Add accent border for selected track
+            if (trackId.equals(selectedTrackId)) {
+                row.setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(ACCENT_BLUE, 2),
+                    BorderFactory.createEmptyBorder(9, 14, 9, 14)
+                ));
+                row.setBackground(new Color(40, 55, 80)); // Dark blue tint
+            }
+            row.setOpaque(true);
+            
+            // Add checkbox for track selection (works in both modes for batch operations)
+            {
+                JCheckBox checkbox = new JCheckBox();
+                checkbox.setSelected(trackSelected.getOrDefault(trackId, false));
+                checkbox.setOpaque(false);
+                checkbox.setFocusPainted(false);
+                
+                // Enlarge checkbox and color it
+                Color trackColor = getTrackColor(trackId);
+                checkbox.setPreferredSize(new Dimension(28, 28));
+                
+                // Custom checkbox icon with track color
+                checkbox.setIcon(new javax.swing.Icon() {
+                    @Override
+                    public void paintIcon(Component c, Graphics g, int x, int y) {
+                        Graphics2D g2 = (Graphics2D) g.create();
+                        g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                        
+                        // Draw checkbox border
+                        g2.setColor(new Color(150, 150, 150));
+                        g2.setStroke(new BasicStroke(2));
+                        g2.drawRoundRect(x + 2, y + 2, 20, 20, 4, 4);
+                        
+                        g2.dispose();
+                    }
+                    
+                    @Override
+                    public int getIconWidth() { return 24; }
+                    
+                    @Override
+                    public int getIconHeight() { return 24; }
+                });
+                
+                checkbox.setSelectedIcon(new javax.swing.Icon() {
+                    @Override
+                    public void paintIcon(Component c, Graphics g, int x, int y) {
+                        Graphics2D g2 = (Graphics2D) g.create();
+                        g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                        
+                        // Draw filled checkbox with track color
+                        g2.setColor(trackColor);
+                        g2.fillRoundRect(x + 2, y + 2, 20, 20, 4, 4);
+                        
+                        // Draw border
+                        g2.setColor(trackColor.darker());
+                        g2.setStroke(new BasicStroke(2));
+                        g2.drawRoundRect(x + 2, y + 2, 20, 20, 4, 4);
+                        
+                        // Draw checkmark
+                        g2.setColor(Color.WHITE);
+                        g2.setStroke(new BasicStroke(3, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                        int[] xPoints = {x + 6, x + 10, x + 18};
+                        int[] yPoints = {y + 12, y + 17, y + 8};
+                        for (int i = 0; i < xPoints.length - 1; i++) {
+                            g2.drawLine(xPoints[i], yPoints[i], xPoints[i + 1], yPoints[i + 1]);
+                        }
+                        
+                        g2.dispose();
+                    }
+                    
+                    @Override
+                    public int getIconWidth() { return 24; }
+                    
+                    @Override
+                    public int getIconHeight() { return 24; }
+                });
+                
+                checkbox.setToolTipText("Select for batch operations (Ctrl+click on video to toggle)");
+                checkbox.addActionListener(e -> {
+                    trackSelected.put(trackId, checkbox.isSelected());
+                    // Repaint to update visual highlight ring on video
+                    imageLabel.repaint();
+                    // Update status with selection count
+                    int selectedCount = (int) trackSelected.values().stream().filter(v -> v).count();
+                    setStatus(selectedCount + " track(s) selected");
+                });
+                row.add(checkbox, BorderLayout.WEST);
+            }
+            
+            JPanel colorBox = new JPanel();
+            colorBox.setPreferredSize(new Dimension(24, 24));
+            Color trackColor = getTrackColor(trackId);
+            colorBox.setBackground(new Color(trackColor.getRed(), trackColor.getGreen(), trackColor.getBlue()));
+            colorBox.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(new Color(150, 150, 150), 1),
+                BorderFactory.createEmptyBorder(2, 2, 2, 2)
+            ));
+            
+            JLabel trackLabel = new JLabel();
+            trackLabel.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+            trackLabel.setForeground(TEXT_PRIMARY);
+            
+            // Check if current frame (0-indexed) has an anchor point
+            int currentFrameIndex = currentSlice - 1;
+            boolean hasAnchor = false;
+            List<Anchor> anchors = trackAnchors.get(trackId);
+            int anchorCount = 0;
+            if (anchors != null) {
+                anchorCount = anchors.size();
+                for (Anchor anchor : anchors) {
+                    if (anchor.frame == currentFrameIndex) {
+                        hasAnchor = true;
+                        break;
+                    }
+                }
+            }
+            
+            // Check completion status for this track (captured for use in lambdas)
+            final boolean trackIsCompleted = trackCompleted.getOrDefault(trackId, false);
+            
+            // Show optimization status in multi-seed mode
+            String labelText;
+            if (p != null) {
+                labelText = trackId + " (" + p.x + ", " + p.y + ")";
+            } else {
+                labelText = trackId + " (not on this frame)";
+            }
+            
+            // Add anchor count
+            if (anchorCount > 0) {
+                labelText += " [" + anchorCount + " anchor" + (anchorCount != 1 ? "s" : "") + "]";
+            }
+            
+            if (multiSeedMode && trackOptimized.getOrDefault(trackId, false)) {
+                labelText += " ✓";
+            }
+            
+            // Add occlusion indicator if track has occlusion segments
+            int occludedFrames = calculateOccludedFrames(trackId);
+            if (occludedFrames > 0) {
+                labelText += " 👁" + occludedFrames;  // Eye icon with occluded frame count
+            }
+            
+            // Add smoothing indicator if smoothing is enabled
+            if (trackSmoothing.getOrDefault(trackId, false)) {
+                labelText += " ∿";  // Wave icon to indicate smoothed
+            }
+            
+            // Add timing info for completed tracks
+            if (trackIsCompleted) {
+                long totalTime = trackTotalTime.getOrDefault(trackId, 0L);
+                labelText += " • " + formatTime(totalTime);
+            }
+            
+            trackLabel.setText(labelText);
+            
+            // Add anchor icon if this point is an anchor
+            if (hasAnchor) {
+                Icon anchorIcon = createAnchorIcon(8, trackColor);
+                trackLabel.setIcon(anchorIcon);
+                trackLabel.setIconTextGap(5);
+            } else {
+                trackLabel.setIcon(null);
+            }
+            
+            // Gray out completed tracks
+            if (trackIsCompleted) {
+                trackLabel.setForeground(TEXT_DISABLED);
+            } else if (p == null) {
+                trackLabel.setForeground(TEXT_DISABLED);
+            }
+            
+            row.addMouseListener(new MouseAdapter() {
+                @Override
+                public void mouseClicked(MouseEvent e) {
+                    // Block track switching during trim mode
+                    if (trimModeActive) {
+                        setStatus("Complete or cancel trim mode before switching tracks");
+                        return;
+                    }
+                    
+                    // Double-click: Focus view on the track's point
+                    if (e.getClickCount() == 2) {
+                        // First select the track if not already selected
+                        if (!trackId.equals(selectedTrackId)) {
+                            if (selectedTrackId != null) {
+                                pauseTrackTimer(selectedTrackId);
+                            }
+                            selectedTrackId = trackId;
+                            for (String tid : trackSelected.keySet()) {
+                                trackSelected.put(tid, false);
+                            }
+                            trackSelected.put(trackId, true);
+                            if (!trackCompleted.getOrDefault(trackId, false)) {
+                                startTrackTimer(trackId);
+                            }
+                            refreshAnnotationList();
+                        }
+                        // Focus the view on this track
+                        focusOnTrack(trackId);
+                        imageLabel.repaint();
+                        frameSlider.repaint();
+                        setStatus("Focused on " + trackId);
+                        return;
+                    }
+                    
+                    // Single click: Select the track
+                    // Pause timer for the previously selected track
+                    if (selectedTrackId != null && !selectedTrackId.equals(trackId)) {
+                        pauseTrackTimer(selectedTrackId);
+                    }
+                    selectedTrackId = trackId;
+                    // Only the current track should be selected - deselect all others
+                    for (String tid : trackSelected.keySet()) {
+                        trackSelected.put(tid, false);
+                    }
+                    trackSelected.put(trackId, true);
+                    // Start timer for the newly selected track if it's not completed
+                    if (!trackCompleted.getOrDefault(trackId, false)) {
+                        startTrackTimer(trackId);
+                    }
+                    refreshAnnotationList();
+                    imageLabel.repaint();
+                    frameSlider.repaint(); // Immediately refresh slider to show selected track's anchors
+                }
+                
+                @Override
+                public void mouseEntered(MouseEvent e) {
+                    // Don't change hover appearance for selected track
+                    if (!trackId.equals(selectedTrackId)) {
+                        row.setBackground(SURFACE_HOVER);
+                    }
+                }
+                
+                @Override
+                public void mouseExited(MouseEvent e) {
+                    // Don't change appearance for selected track
+                    if (!trackId.equals(selectedTrackId)) {
+                        if (trackIsCompleted) {
+                            row.setBackground(new Color(60, 60, 65)); // Gray for completed
+                        } else if (multiSeedMode) {
+                            boolean isOptimized = trackOptimized.getOrDefault(trackId, false);
+                            if (isOptimized) {
+                                row.setBackground(new Color(35, 65, 45)); // Dark green tint
+                            } else {
+                                row.setBackground(new Color(70, 40, 40)); // Dark red tint
+                            }
+                        } else {
+                            row.setBackground(SECONDARY_DARK);
+                        }
+                    }
+                }
+            });
+            row.setCursor(new Cursor(Cursor.HAND_CURSOR));
+            
+            JPanel leftPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
+            leftPanel.setOpaque(false);
+            leftPanel.add(colorBox);
+            
+            // Create Complete/Resume button for time tracking
+            JButton actionButton = new JButton();
+            actionButton.setPreferredSize(new Dimension(24, 24));
+            actionButton.setBorderPainted(false);
+            actionButton.setContentAreaFilled(false);
+            actionButton.setFocusPainted(false);
+            actionButton.setCursor(new Cursor(Cursor.HAND_CURSOR));
+            
+            final String currentTrackId = trackId;
+            final boolean trackHasOcclusions = trackOcclusionSegments.containsKey(trackId) && 
+                                               !trackOcclusionSegments.get(trackId).isEmpty();
+            if (trackIsCompleted) {
+                // Show edit/resume icon for completed tracks
+                String tooltip = trackHasOcclusions 
+                    ? "Resume editing (will clear occlusion markings)"
+                    : "Resume editing this track";
+                actionButton.setToolTipText(tooltip);
+                actionButton.setIcon(new javax.swing.Icon() {
+                    @Override
+                    public void paintIcon(Component c, Graphics g, int x, int y) {
+                        Graphics2D g2 = (Graphics2D) g.create();
+                        g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                        // Draw pencil/edit icon
+                        g2.setColor(ACCENT_YELLOW);
+                        g2.setStroke(new BasicStroke(2, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                        // Pencil body
+                        g2.drawLine(x + 4, y + 18, x + 18, y + 4);
+                        // Pencil tip
+                        g2.drawLine(x + 18, y + 4, x + 20, y + 6);
+                        // Eraser
+                        g2.fillOval(x + 2, y + 16, 5, 5);
+                        g2.dispose();
+                    }
+                    @Override public int getIconWidth() { return 24; }
+                    @Override public int getIconHeight() { return 24; }
+                });
+                actionButton.addActionListener(ev -> {
+                    resumeTrackEditing(currentTrackId);
+                });
+            } else {
+                // Show checkmark icon for incomplete tracks
+                actionButton.setToolTipText("Mark this track as complete");
+                actionButton.setIcon(new javax.swing.Icon() {
+                    @Override
+                    public void paintIcon(Component c, Graphics g, int x, int y) {
+                        Graphics2D g2 = (Graphics2D) g.create();
+                        g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                        // Draw circle outline
+                        g2.setColor(ACCENT_GREEN);
+                        g2.setStroke(new BasicStroke(2));
+                        g2.drawOval(x + 2, y + 2, 18, 18);
+                        // Draw checkmark inside
+                        g2.setStroke(new BasicStroke(2, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                        int[] xPoints = {x + 6, x + 10, x + 17};
+                        int[] yPoints = {y + 11, y + 15, y + 7};
+                        for (int i = 0; i < xPoints.length - 1; i++) {
+                            g2.drawLine(xPoints[i], yPoints[i], xPoints[i + 1], yPoints[i + 1]);
+                        }
+                        g2.dispose();
+                    }
+                    @Override public int getIconWidth() { return 24; }
+                    @Override public int getIconHeight() { return 24; }
+                });
+                actionButton.addActionListener(ev -> {
+                    markTrackComplete(currentTrackId);
+                });
+            }
+            
+            // Smoothing toggle button
+            JButton smoothButton = new JButton();
+            smoothButton.setPreferredSize(new Dimension(24, 24));
+            smoothButton.setBorderPainted(false);
+            smoothButton.setContentAreaFilled(false);
+            smoothButton.setFocusPainted(false);
+            smoothButton.setCursor(new Cursor(Cursor.HAND_CURSOR));
+            
+            final boolean isSmoothingEnabled = trackSmoothing.getOrDefault(trackId, false);
+            final int trackPointCount = frameMap.size();
+            final boolean canSmooth = trackPointCount >= 3;  // Need at least 3 points to smooth
+            
+            // Add right-click handler for comparison view
+            if (canSmooth) {
+                smoothButton.addMouseListener(new MouseAdapter() {
+                    @Override
+                    public void mousePressed(MouseEvent e) {
+                        if (e.isPopupTrigger() || SwingUtilities.isRightMouseButton(e)) {
+                            toggleSmoothingComparisonMode(currentTrackId);
+                        }
+                    }
+                    @Override
+                    public void mouseReleased(MouseEvent e) {
+                        if (e.isPopupTrigger()) {
+                            toggleSmoothingComparisonMode(currentTrackId);
+                        }
+                    }
+                });
+            }
+            
+            if (!canSmooth) {
+                // Track too short to smooth - show disabled icon
+                smoothButton.setToolTipText("Smoothing unavailable (need at least 3 points)");
+                smoothButton.setEnabled(false);
+                smoothButton.setIcon(new javax.swing.Icon() {
+                    @Override
+                    public void paintIcon(Component c, Graphics g, int x, int y) {
+                        Graphics2D g2 = (Graphics2D) g.create();
+                        g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                        // Draw wave icon (grayed out)
+                        g2.setColor(new Color(100, 100, 100));
+                        g2.setStroke(new BasicStroke(2, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                        // Simple sine wave
+                        int[] xPoints = {x + 3, x + 8, x + 12, x + 17, x + 21};
+                        int[] yPoints = {y + 12, y + 6, y + 12, y + 18, y + 12};
+                        for (int i = 0; i < xPoints.length - 1; i++) {
+                            g2.drawLine(xPoints[i], yPoints[i], xPoints[i + 1], yPoints[i + 1]);
+                        }
+                        g2.dispose();
+                    }
+                    @Override public int getIconWidth() { return 24; }
+                    @Override public int getIconHeight() { return 24; }
+                });
+            } else if (isSmoothingEnabled) {
+                // Smoothing is ON - show smooth line icon (cyan/teal)
+                smoothButton.setToolTipText("<html>Trajectory smoothing: <b>ON</b><br>Click to disable | Right-click to compare</html>");
+                smoothButton.setIcon(new javax.swing.Icon() {
+                    @Override
+                    public void paintIcon(Component c, Graphics g, int x, int y) {
+                        Graphics2D g2 = (Graphics2D) g.create();
+                        g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                        // Draw smooth curve icon (active/cyan)
+                        g2.setColor(new Color(0, 200, 200));
+                        g2.setStroke(new BasicStroke(2.5f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                        // Smooth curve (gentler wave)
+                        java.awt.geom.QuadCurve2D curve1 = new java.awt.geom.QuadCurve2D.Float(
+                            x + 3, y + 12, x + 9, y + 5, x + 12, y + 12);
+                        java.awt.geom.QuadCurve2D curve2 = new java.awt.geom.QuadCurve2D.Float(
+                            x + 12, y + 12, x + 15, y + 19, x + 21, y + 12);
+                        g2.draw(curve1);
+                        g2.draw(curve2);
+                        // Small checkmark indicator
+                        g2.setColor(new Color(100, 255, 100));
+                        g2.setStroke(new BasicStroke(1.5f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                        g2.drawLine(x + 17, y + 3, x + 19, y + 5);
+                        g2.drawLine(x + 19, y + 5, x + 22, y + 1);
+                        g2.dispose();
+                    }
+                    @Override public int getIconWidth() { return 24; }
+                    @Override public int getIconHeight() { return 24; }
+                });
+                smoothButton.addActionListener(ev -> {
+                    saveState();
+                    disableTrackSmoothing(currentTrackId);
+                    loadSliceImage();
+                    refreshAnnotationList();
+                    imageLabel.repaint();
+                    setStatus("Smoothing disabled for " + currentTrackId);
+                });
+            } else {
+                // Smoothing is OFF - show jagged line icon (gray)
+                smoothButton.setToolTipText("<html>Trajectory smoothing: <b>OFF</b><br>Click to enable | Right-click to compare</html>");
+                smoothButton.setIcon(new javax.swing.Icon() {
+                    @Override
+                    public void paintIcon(Component c, Graphics g, int x, int y) {
+                        Graphics2D g2 = (Graphics2D) g.create();
+                        g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                        // Draw jagged wave icon (inactive/gray)
+                        g2.setColor(new Color(150, 150, 150));
+                        g2.setStroke(new BasicStroke(2, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                        // Jagged/noisy wave
+                        int[] xPoints = {x + 3, x + 6, x + 9, x + 12, x + 15, x + 18, x + 21};
+                        int[] yPoints = {y + 12, y + 5, y + 14, y + 8, y + 16, y + 10, y + 12};
+                        for (int i = 0; i < xPoints.length - 1; i++) {
+                            g2.drawLine(xPoints[i], yPoints[i], xPoints[i + 1], yPoints[i + 1]);
+                        }
+                        g2.dispose();
+                    }
+                    @Override public int getIconWidth() { return 24; }
+                    @Override public int getIconHeight() { return 24; }
+                });
+                smoothButton.addActionListener(ev -> {
+                    saveState();
+                    enableTrackSmoothing(currentTrackId);
+                    loadSliceImage();
+                    refreshAnnotationList();
+                    imageLabel.repaint();
+                    setStatus("Smoothing enabled for " + currentTrackId);
+                });
+            }
+            
+            // Right panel for the smoothing toggle and action button
+            JPanel rightPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 2, 0));
+            rightPanel.setOpaque(false);
+            rightPanel.add(smoothButton);
+            rightPanel.add(actionButton);
+            
+            // Checkbox is always at WEST, leftPanel (colorBox) is not needed separately
+            row.add(leftPanel, BorderLayout.CENTER);
+            row.add(trackLabel, BorderLayout.CENTER);
+            row.add(rightPanel, BorderLayout.EAST);
+            annotationPanel.add(row);
+        }
+        
+        JButton newTrackButton = createAccentButton("+ New Track", null);
+        newTrackButton.setMaximumSize(new Dimension(Integer.MAX_VALUE, rowHeight + 14));
+        newTrackButton.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(ACCENT_BLUE, 1),
+            BorderFactory.createEmptyBorder(10, 15, 10, 15)
+        ));
+        newTrackButton.setAlignmentX(Component.CENTER_ALIGNMENT);
+        newTrackButton.addActionListener(e -> {
+            if (!opticalFlowComputed) {
+                String flowMethod = config.getProperty("flow.method", getDefaultFlowMethod());
+                java.util.List<File> allCachedFiles = findCachedFlowFiles(currentVideoPath, flowMethod);
+                // CRITICAL: Filter by resolution to prevent using wrong-resolution flow data
+                java.util.List<File> cachedFiles = filterFlowFilesByResolution(allCachedFiles);
+                
+                if (!cachedFiles.isEmpty()) {
+                    // Find if any file matches current settings
+                    File matchingFile = null;
+                    for (File f : cachedFiles) {
+                        if (flowFileMatchesCurrentSettings(f, flowMethod)) {
+                            matchingFile = f;
+                            break;
+                        }
+                    }
+                    
+                    // Build informative message
+                    StringBuilder message = new StringBuilder();
+                    message.append("Optical flow is required for tracking.\n\n");
+                    message.append("Current method: ").append(flowMethod.toUpperCase()).append("\n");
+                    message.append("Found ").append(cachedFiles.size()).append(" cached file(s):\n\n");
+                    
+                    for (int i = 0; i < Math.min(cachedFiles.size(), 5); i++) {
+                        File f = cachedFiles.get(i);
+                        boolean isMatch = flowFileMatchesCurrentSettings(f, flowMethod);
+                        message.append(isMatch ? "  ✓ " : "  • ");
+                        message.append(describeFlowFile(f, flowMethod));
+                        if (isMatch) {
+                            message.append(" ← matches");
+                        }
+                        message.append("\n");
+                    }
+                    
+                    message.append("\n");
+                    if (matchingFile != null) {
+                        message.append("A cached file matches your settings.\n");
+                    } else {
+                        message.append("No cached file matches your settings.\n");
+                    }
+                    
+                    String[] options = {"Load Existing", "Recalculate", "Cancel"};
+                    int choice = JOptionPane.showOptionDialog(
+                        frame,
+                        message.toString(),
+                        "Optical Flow Required",
+                        JOptionPane.YES_NO_CANCEL_OPTION,
+                        JOptionPane.QUESTION_MESSAGE,
+                        null,
+                        options,
+                        matchingFile != null ? options[0] : options[1]
+                    );
+                    
+                    if (choice == 0) { // Load Existing
+                        File fileToLoad = (matchingFile != null) ? matchingFile : cachedFiles.get(0);
+                        loadExistingOpticalFlow(fileToLoad);
+                    } else if (choice == 1) { // Recalculate
+                        computeOpticalFlowRemote(true);
+                    }
+                    return; // Wait for flow to be ready
+                } else {
+                    // No existing optical flow file, prompt to compute
+                    int result = JOptionPane.showConfirmDialog(frame,
+                        "Optical flow has not been computed yet.\n" +
+                        "Would you like to compute it now?\n\n" +
+                        "Current method: " + flowMethod.toUpperCase() + "\n" +
+                        "This is required for automatic track propagation.",
+                        "Optical Flow Required",
+                        JOptionPane.YES_NO_OPTION,
+                        JOptionPane.QUESTION_MESSAGE);
+                    
+                    if (result == JOptionPane.YES_OPTION) {
+                        computeOpticalFlowRemote();
+                    }
+                    return;
+                }
+            }
+            
+            // No longer require Frame 1 - bidirectional propagation supported
+            int nextNum = findNextAvailableTrackNumber();
+            selectedTrackId = "Track" + nextNum;
+            trackAnnotations.put(selectedTrackId, new HashMap<>());
+            trackColors.put(selectedTrackId, generateRandomColor());
+            trackAnchors.put(selectedTrackId, new ArrayList<>());
+            trackOptimized.put(selectedTrackId, false);
+            // Only the current track should be selected - deselect all others
+            for (String trackId : trackSelected.keySet()) {
+                trackSelected.put(trackId, false);
+            }
+            trackSelected.put(selectedTrackId, true);
+            // Initialize time tracking for new track
+            trackTotalTime.put(selectedTrackId, 0L);
+            trackStartTime.put(selectedTrackId, 0L);
+            trackCompleted.put(selectedTrackId, false);
+            startTrackTimer(selectedTrackId);
+            // Update trackCounter to be at least nextNum + 1 for compatibility
+            if (nextNum >= trackCounter) {
+                trackCounter = nextNum + 1;
+            }
+            refreshAnnotationList();
+            imageLabel.repaint();
+            frameSlider.repaint(); // Clear anchor annotations from previous track
+        });
+        annotationPanel.add(newTrackButton);
+        
+        // Update fine-tune button state (GPU mode only)
+        // Enable only when: 
+        // 1. Video is loaded
+        // 2. We have at least MIN_TRACKS_FOR_FINETUNING tracks
+        // 3. ALL tracks are marked as complete
+        if (fineTuneButton != null) {
+            boolean canFineTune = false;
+            if (imp != null && !trackAnnotations.isEmpty()) {
+                int minTracks = Constants.MIN_TRACKS_FOR_FINETUNING;
+                boolean hasEnoughTracks = trackAnnotations.size() >= minTracks;
+                // Count completed tracks
+                int completedCount = 0;
+                for (Boolean completed : trackCompleted.values()) {
+                    if (completed) completedCount++;
+                }
+                boolean allComplete = completedCount == trackAnnotations.size() 
+                    && !trackAnnotations.isEmpty();
+                canFineTune = hasEnoughTracks && allComplete;
+            }
+            fineTuneButton.setEnabled(canFineTune);
+            
+            // Update tooltip with current status
+            if (!canFineTune) {
+                if (imp == null) {
+                    fineTuneButton.setToolTipText("Load a video to enable fine-tuning");
+                } else if (trackAnnotations.isEmpty()) {
+                    fineTuneButton.setToolTipText("Create some tracks to enable fine-tuning");
+                } else if (trackAnnotations.size() < Constants.MIN_TRACKS_FOR_FINETUNING) {
+                    fineTuneButton.setToolTipText("Need at least " + Constants.MIN_TRACKS_FOR_FINETUNING + 
+                        " tracks (currently " + trackAnnotations.size() + ")");
+                } else {
+                    int completedCount = 0;
+                    for (Boolean completed : trackCompleted.values()) {
+                        if (completed) completedCount++;
+                    }
+                    int incomplete = trackAnnotations.size() - completedCount;
+                    fineTuneButton.setToolTipText("Mark all tracks complete (" + incomplete + " incomplete)");
+                }
+            } else {
+                fineTuneButton.setToolTipText("Fine-tune LocoTrack on " + trackAnnotations.size() + " completed tracks");
+            }
+        }
+        
+        annotationPanel.revalidate();
+        annotationPanel.repaint();
+    }
+    
+    /**
+     * Select all tracks for batch operations.
+     */
+    private void selectAllTracks() {
+        if (trackAnnotations.isEmpty()) {
+            setStatus("No tracks to select");
+            return;
+        }
+        for (String tid : trackAnnotations.keySet()) {
+            trackSelected.put(tid, true);
+        }
+        refreshAnnotationList();
+        imageLabel.repaint();
+        setStatus("All " + trackAnnotations.size() + " tracks selected");
+    }
+    
+    /**
+     * Deselect all tracks.
+     */
+    private void deselectAllTracks() {
+        for (String tid : trackAnnotations.keySet()) {
+            trackSelected.put(tid, false);
+        }
+        refreshAnnotationList();
+        imageLabel.repaint();
+        setStatus("All tracks deselected");
+    }
+    
+    /**
+     * Scroll the annotation panel to make the specified track visible.
+     * Uses the track index to calculate scroll position based on row height.
+     * 
+     * @param trackId The track ID to scroll to
+     */
+    private void scrollToTrack(String trackId) {
+        if (trackId == null || annotationScrollPane == null) {
+            return;
+        }
+        
+        // Find the index of this track in the sorted list
+        java.util.List<String> sortedIds = getSortedTrackIds();
+        int trackIndex = sortedIds.indexOf(trackId);
+        if (trackIndex < 0) {
+            return;
+        }
+        
+        // Calculate the Y position of this track's row
+        // Each row has height (rowHeight + 12) plus borders
+        int estimatedRowHeight = rowHeight + 12 + 21;  // 21 for padding/border margins
+        int targetY = trackIndex * estimatedRowHeight;
+        
+        // Get viewport dimensions
+        int viewportHeight = annotationScrollPane.getViewport().getHeight();
+        
+        // Center the track in the viewport if possible
+        int scrollY = Math.max(0, targetY - (viewportHeight / 2) + (estimatedRowHeight / 2));
+        
+        // Scroll to position
+        SwingUtilities.invokeLater(() -> {
+            annotationScrollPane.getVerticalScrollBar().setValue(scrollY);
+        });
+    }
+    
+    /**
+     * Ensure that at least the first track is selected when tracks exist but none is selected.
+     * Called after deletion, import, and other operations that may leave no track selected.
+     */
+    private void ensureFirstTrackSelected() {
+        if (trackAnnotations.isEmpty()) {
+            selectedTrackId = null;
+            return;
+        }
+        
+        // If a track is already selected and still exists, keep it
+        if (selectedTrackId != null && trackAnnotations.containsKey(selectedTrackId)) {
+            return;
+        }
+        
+        // Select the first track
+        java.util.List<String> sortedIds = getSortedTrackIds();
+        if (!sortedIds.isEmpty()) {
+            selectedTrackId = sortedIds.get(0);
+            // Ensure selection state is set
+            for (String tid : trackSelected.keySet()) {
+                trackSelected.put(tid, false);
+            }
+            trackSelected.put(selectedTrackId, true);
+            // Start timer if track is not completed
+            if (!trackCompleted.getOrDefault(selectedTrackId, false)) {
+                startTrackTimer(selectedTrackId);
+            }
+        }
+    }
+    
+    /**
+     * Focus the view on a track's position at the current frame.
+     * Centers the view on the track's point if it exists at this frame.
+     * 
+     * @param trackId The track to focus on
+     */
+    private void focusOnTrack(String trackId) {
+        if (trackId == null || currentImage == null) {
+            return;
+        }
+        
+        Map<Integer, Point> trackData = trackAnnotations.get(trackId);
+        if (trackData == null) {
+            return;
+        }
+        
+        // Get the point at the current frame
+        Point p = trackData.get(currentSlice - 1);
+        if (p == null) {
+            // No point at current frame - find the first frame with a point
+            java.util.List<Integer> frames = new ArrayList<>(trackData.keySet());
+            Collections.sort(frames);
+            if (!frames.isEmpty()) {
+                // Navigate to the first frame that has a point
+                int targetFrame = frames.get(0);
+                goToFrame(targetFrame + 1);  // goToFrame uses 1-indexed
+                p = trackData.get(targetFrame);
+            }
+        }
+        
+        if (p == null) {
+            return;
+        }
+        
+        // Center the view on this point while preserving the current zoom level
+        // The coordinate system is simple:
+        // - Image is drawn at position (imageOffsetX, imageOffsetY)
+        // - Point at image coordinate (imgX, imgY) appears on screen at:
+        //   screenX = imageOffsetX + imgX * zoomFactor
+        // So to center point p at screen center:
+        //   panelCenter = imageOffsetX + p.x * zoomFactor
+        //   imageOffsetX = panelCenter - p.x * zoomFactor
+        
+        int panelWidth = imageLabel.getWidth();
+        int panelHeight = imageLabel.getHeight();
+        
+        double targetScreenX = panelWidth / 2.0;
+        double targetScreenY = panelHeight / 2.0;
+        
+        imageOffsetX = targetScreenX - p.x * zoomFactor;
+        imageOffsetY = targetScreenY - p.y * zoomFactor;
+        
+        imageLabel.repaint();
+    }
+    
+    /**
+     * Mark all selected tracks as complete.
+     * Edge cases handled:
+     * - No tracks selected: Shows message
+     * - All selected tracks already complete: Shows message
+     * - Some tracks already complete: Skips them and marks the rest
+     */
+    private void markSelectedTracksComplete() {
+        // Count selected tracks that are not complete
+        List<String> toComplete = new ArrayList<>();
+        for (String trackId : trackAnnotations.keySet()) {
+            if (trackSelected.getOrDefault(trackId, false) && 
+                !trackCompleted.getOrDefault(trackId, false)) {
+                toComplete.add(trackId);
+            }
+        }
+        
+        if (toComplete.isEmpty()) {
+            int selectedCount = (int) trackSelected.values().stream().filter(v -> v).count();
+            if (selectedCount == 0) {
+                JOptionPane.showMessageDialog(frame,
+                    "No tracks selected.\n\n" +
+                    "Select tracks using:\n" +
+                    "• Checkboxes next to each track\n" +
+                    "• Ctrl+click on tracks in the video\n" +
+                    "• 'Select All' button",
+                    "No Selection",
+                    JOptionPane.INFORMATION_MESSAGE);
+            } else {
+                JOptionPane.showMessageDialog(frame,
+                    "All selected tracks are already marked as complete.",
+                    "Already Complete",
+                    JOptionPane.INFORMATION_MESSAGE);
+            }
+            return;
+        }
+        
+        int confirm = JOptionPane.showConfirmDialog(frame,
+            "Mark " + toComplete.size() + " selected track(s) as complete?\n\n" +
+            "This will:\n" +
+            "• Stop the timer for each track\n" +
+            "• Lock the tracks from editing\n" +
+            "• Optionally trim tracks\n\n" +
+            "You can resume editing later using the edit button.",
+            "Mark Tracks Complete",
+            JOptionPane.YES_NO_OPTION,
+            JOptionPane.QUESTION_MESSAGE);
+        
+        if (confirm != JOptionPane.YES_OPTION) {
+            return;
+        }
+        
+        saveState();
+        
+        // Mark each track as complete (without individual trim dialogs for batch)
+        for (String trackId : toComplete) {
+            pauseTrackTimer(trackId);
+            trackCompleted.put(trackId, true);
+        }
+        
+        refreshAnnotationList();
+        imageLabel.repaint();
+        setStatus("Marked " + toComplete.size() + " track(s) as complete");
+    }
+    
+    /**
+     * Remove all selected tracks.
+     * Edge cases handled:
+     * - No tracks selected: Shows message
+     * - Confirmation required before deletion
+     */
+    private void removeSelectedTracks() {
+        List<String> toRemove = new ArrayList<>();
+        for (String trackId : trackAnnotations.keySet()) {
+            if (trackSelected.getOrDefault(trackId, false)) {
+                toRemove.add(trackId);
+            }
+        }
+        
+        if (toRemove.isEmpty()) {
+            JOptionPane.showMessageDialog(frame,
+                "No tracks selected.\n\n" +
+                "Select tracks using:\n" +
+                "• Checkboxes next to each track\n" +
+                "• Ctrl+click on tracks in the video\n" +
+                "• 'Select All' button",
+                "No Selection",
+                JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        
+        int confirm = JOptionPane.showConfirmDialog(frame,
+            "Delete " + toRemove.size() + " selected track(s)?\n\n" +
+            "This action can be undone with Ctrl+Z.",
+            "Confirm Delete",
+            JOptionPane.YES_NO_OPTION,
+            JOptionPane.WARNING_MESSAGE);
+        
+        if (confirm != JOptionPane.YES_OPTION) {
+            return;
+        }
+        
+        saveState();
+        
+        for (String trackId : toRemove) {
+            // Exit comparison mode if deleting the comparison track
+            if (smoothingComparisonMode && trackId.equals(smoothingComparisonTrackId)) {
+                exitSmoothingComparisonMode();
+            }
+            trackAnnotations.remove(trackId);
+            trackColors.remove(trackId);
+            trackAnchors.remove(trackId);
+            trackOptimized.remove(trackId);
+            trackSelected.remove(trackId);
+            trackTotalTime.remove(trackId);
+            trackStartTime.remove(trackId);
+            trackCompleted.remove(trackId);
+            trackUntrimmedAnnotations.remove(trackId);
+            trackUntrimmedAnchors.remove(trackId);
+            trackTrimRange.remove(trackId);
+            // Clean up smoothing data
+            trackSmoothing.remove(trackId);
+            trackOriginalAnnotations.remove(trackId);
+            // Clean up occlusion data
+            trackOcclusionSegments.remove(trackId);
+            
+            if (trackId.equals(selectedTrackId)) {
+                selectedTrackId = null;
+            }
+        }
+        
+        // Ensure first track is selected after deletion
+        ensureFirstTrackSelected();
+        
+        refreshAnnotationList();
+        imageLabel.repaint();
+        setStatus("Removed " + toRemove.size() + " track(s)");
+    }
+    
+    /**
+     * Remove all tracks.
+     * Edge cases handled:
+     * - No tracks exist: Shows message
+     * - Confirmation required before deletion
+     */
+    private void removeAllTracks() {
+        if (trackAnnotations.isEmpty()) {
+            JOptionPane.showMessageDialog(frame,
+                "No tracks to remove.",
+                "No Tracks",
+                JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        
+        int trackCount = trackAnnotations.size();
+        int confirm = JOptionPane.showConfirmDialog(frame,
+            "Delete ALL " + trackCount + " track(s)?\n\n" +
+            "This will remove all annotation data.\n" +
+            "This action can be undone with Ctrl+Z.",
+            "Confirm Delete All",
+            JOptionPane.YES_NO_OPTION,
+            JOptionPane.WARNING_MESSAGE);
+        
+        if (confirm != JOptionPane.YES_OPTION) {
+            return;
+        }
+        
+        saveState();
+        
+        // Exit comparison mode if active (track will be deleted)
+        if (smoothingComparisonMode) {
+            exitSmoothingComparisonMode();
+        }
+        
+        trackAnnotations.clear();
+        trackColors.clear();
+        trackAnchors.clear();
+        trackOptimized.clear();
+        trackSelected.clear();
+        trackTotalTime.clear();
+        trackStartTime.clear();
+        trackCompleted.clear();
+        trackUntrimmedAnnotations.clear();
+        trackUntrimmedAnchors.clear();
+        trackTrimRange.clear();
+        // Clean up smoothing data
+        trackSmoothing.clear();
+        trackOriginalAnnotations.clear();
+        // Clean up occlusion data
+        trackOcclusionSegments.clear();
+        selectedTrackId = null;
+        trackCounter = 1;
+        
+        refreshAnnotationList();
+        imageLabel.repaint();
+        setStatus("Removed all " + trackCount + " track(s)");
+    }
+
+    /**
+     * Start/restart the background thread for async slice loading.
+     * This is ImageJ's approach in StackWindow - it uses a separate thread
+     * that waits on notify() to load slices, keeping the slider responsive.
+     */
+    private void startSliceLoaderThread() {
+        // Stop existing thread if any
+        if (sliceLoaderThread != null && sliceLoaderThread.isAlive()) {
+            sliceLoaderDone = true;
+            synchronized (sliceLoaderLock) {
+                sliceLoaderLock.notify();
+            }
+            try {
+                sliceLoaderThread.join(100);
+            } catch (InterruptedException ignored) {}
+        }
+        
+        sliceLoaderDone = false;
+        pendingSlice = 0;
+        
+        sliceLoaderThread = new Thread(() -> {
+            while (!sliceLoaderDone) {
+                synchronized (sliceLoaderLock) {
+                    try {
+                        sliceLoaderLock.wait();
+                    } catch (InterruptedException e) {
+                        break;
+                    }
+                }
+                if (sliceLoaderDone) break;
+                
+                // Get and reset pending slice (like ImageJ's run() method)
+                int sliceToLoad;
+                synchronized (sliceLoaderLock) {
+                    sliceToLoad = pendingSlice;
+                    pendingSlice = 0;
+                }
+                
+                if (sliceToLoad > 0 && sliceToLoad != currentSlice && imp != null) {
+                    currentSlice = sliceToLoad;
+                    // Load the slice on this background thread
+                    loadSliceImageAsync();
+                }
+            }
+        }, "SliceLoader");
+        sliceLoaderThread.setDaemon(true);
+        sliceLoaderThread.start();
+    }
+    
+    /**
+     * Load slice image - called from background thread.
+     * Minimal work: just load pixels and repaint (like ImageJ).
+     */
+    private void loadSliceImageAsync() {
+        if (imp == null) return;
+        
+        ImagePlus sourceImage = showingFlowViz && flowVisualization != null ? flowVisualization : imp;
+        
+        sourceImage.setSlice(currentSlice);
+        ImageProcessor ip = sourceImage.getProcessor().duplicate();
+        
+        if (!showingFlowViz && viewMin != null && viewMax != null) {
+            ip.setMinAndMax(viewMin, viewMax);
+        }
+        
+        BufferedImage newImage = ip.getBufferedImage();
+        
+        // Update UI on EDT - minimal work, just repaint
+        SwingUtilities.invokeLater(() -> {
+            currentImage = newImage;
+            imageLabel.repaint();
+        });
+    }
+    
+    // Timer for delayed annotation refresh (avoids blocking during rapid scrolling)
+    private javax.swing.Timer annotationRefreshTimer;
+    
+    /**
+     * Fast slice loading - minimal work for responsive scrolling (like ImageJ).
+     * Uses ImageJ's cached image to avoid creating new BufferedImage objects.
+     */
+    private void loadSliceImageFast() {
+        if (imp == null) return;
+        
+        ImagePlus sourceImage = showingFlowViz && flowVisualization != null ? flowVisualization : imp;
+        
+        sourceImage.setSlice(currentSlice);
+        
+        // Apply view settings if set
+        if (!showingFlowViz && viewMin != null && viewMax != null) {
+            sourceImage.getProcessor().setMinAndMax(viewMin, viewMax);
+        }
+        
+        // Tell ImageJ to update its cached image after slice change
+        sourceImage.updateImage();
+        
+        // Use ImageJ's cached image - this reuses existing BufferedImage/raster
+        // Much faster than getBufferedImage() which creates new objects
+        Image img = sourceImage.getImage();
+        if (img instanceof BufferedImage) {
+            currentImage = (BufferedImage) img;
+        } else if (img != null) {
+            // Convert AWT Image to BufferedImage only if needed
+            if (currentImage == null || 
+                currentImage.getWidth() != img.getWidth(null) || 
+                currentImage.getHeight() != img.getHeight(null)) {
+                currentImage = new BufferedImage(img.getWidth(null), img.getHeight(null), BufferedImage.TYPE_INT_RGB);
+            }
+            Graphics2D g = currentImage.createGraphics();
+            g.drawImage(img, 0, 0, null);
+            g.dispose();
+        }
+        
+        imageLabel.repaint();
+    }
+    
+    /**
+     * Schedule annotation list refresh with delay.
+     * Coalesces rapid updates during scrolling.
+     */
+    private void scheduleAnnotationRefresh() {
+        if (annotationRefreshTimer == null) {
+            annotationRefreshTimer = new javax.swing.Timer(150, e -> {
+                refreshAnnotationList();
+                if (satEnabled) {
+                    generateSegmentationMask();
+                    imageLabel.repaint();
+                }
+            });
+            annotationRefreshTimer.setRepeats(false);
+        }
+        annotationRefreshTimer.restart();
+    }
+
+    private void loadSliceImage() {
+        if (imp == null) return;
+        
+        ImagePlus sourceImage = showingFlowViz && flowVisualization != null ? flowVisualization : imp;
+        
+        sourceImage.setSlice(currentSlice);
+        ImageProcessor ip = sourceImage.getProcessor().duplicate();
+        
+        if (!showingFlowViz && viewMin != null && viewMax != null) {
+            ip.setMinAndMax(viewMin, viewMax);
+        }
+        
+        // Force auto-contrast for AVI files if the image appears to be blank
+        // This handles cases where AVI files have unusual pixel value ranges
+        if (currentVideoPath != null && currentVideoPath.toLowerCase().endsWith(".avi")) {
+            double min = ip.getMin();
+            double max = ip.getMax();
+            
+            // If range is invalid or image appears blank, auto-adjust
+            if (max <= min || max == 0) {
+                ip.resetMinAndMax();
+                min = ip.getMin();
+                max = ip.getMax();
+                
+                // If still problematic, use percentile-based adjustment
+                if (max <= min || max < 10) {
+                    double[] range = computePercentileWindow(ip, 0.01, 0.99, 4);
+                    if (range[1] > range[0]) {
+                        ip.setMinAndMax(range[0], range[1]);
+                    }
+                }
+            }
+        }
+        
+        currentImage = ip.getBufferedImage();
+        
+        // Regenerate segmentation mask for current frame if SAT is enabled
+        if (satEnabled) {
+            generateSegmentationMask();
+        }
+        
+        imageLabel.repaint();
+    }
+    
+    /**
+     * Get video dimensions without loading the full image into memory.
+     * Uses TIFF metadata for TIFF files, and reads only first frame header for AVI.
+     * @param path Path to video file
+     * @return int array [width, height] or null if failed
+     */
+    private int[] getVideoDimensionsLightweight(String path) {
+        try {
+            String lowerPath = path.toLowerCase();
+            
+            if (lowerPath.endsWith(".tif") || lowerPath.endsWith(".tiff")) {
+                // For TIFF files, use FileInfo which reads only metadata
+                FileInfo[] info = Opener.getTiffFileInfo(path);
+                if (info != null && info.length > 0) {
+                    return new int[] { info[0].width, info[0].height };
+                }
+            } else if (lowerPath.endsWith(".avi")) {
+                // For AVI files, we need to read just the header
+                // ImageJ's AVI reader unfortunately loads frames, so we use a minimal approach
+                // Try to read just the first frame to get dimensions
+                try {
+                    // Use RandomAccessFile to read AVI header directly
+                    try (RandomAccessFile raf = new RandomAccessFile(path, "r")) {
+                        // AVI header structure: RIFF....AVI LIST....hdrl avih
+                        byte[] buffer = new byte[64];
+                        raf.read(buffer);
+                        
+                        // Check for RIFF header
+                        String riff = new String(buffer, 0, 4);
+                        String avi = new String(buffer, 8, 4);
+                        
+                        if ("RIFF".equals(riff) && "AVI ".equals(avi)) {
+                            // Search for avih chunk (main AVI header)
+                            raf.seek(32); // Skip to approximate location
+                            byte[] searchBuffer = new byte[1024];
+                            raf.read(searchBuffer);
+                            
+                            String searchStr = new String(searchBuffer);
+                            int avihPos = searchStr.indexOf("avih");
+                            
+                            if (avihPos >= 0) {
+                                // avih chunk found, width and height are at offsets 32 and 36 from chunk start
+                                raf.seek(32 + avihPos + 8 + 32); // +8 for chunk header, +32 for dwWidth offset
+                                
+                                // Read width (little-endian int)
+                                int width = raf.read() | (raf.read() << 8) | (raf.read() << 16) | (raf.read() << 24);
+                                int height = raf.read() | (raf.read() << 8) | (raf.read() << 16) | (raf.read() << 24);
+                                
+                                if (width > 0 && height > 0 && width < 50000 && height < 50000) {
+                                    return new int[] { width, height };
+                                }
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    // If direct header reading fails, fall through to slow method
+                    System.err.println("Direct AVI header read failed: " + e.getMessage());
+                }
+                
+                // Fallback: try to get dimensions via ImageJ's Virtual Stack (doesn't load all frames)
+                try {
+                    ij.plugin.AVI_Reader reader = new ij.plugin.AVI_Reader();
+                    // Use virtual stack to avoid loading all frames
+                    ImagePlus aviImp = reader.openVirtual(path);
+                    if (aviImp != null) {
+                        int[] dims = new int[] { aviImp.getWidth(), aviImp.getHeight() };
+                        aviImp.close();
+                        return dims;
+                    }
+                } catch (Exception e) {
+                    System.err.println("Virtual AVI open failed: " + e.getMessage());
+                }
+            }
+            
+            // Fallback for other formats or if above methods fail
+            // This is the slow method that loads the image
+            setStatus("Reading dimensions (fallback method)...");
+            ImagePlus tempImp = new Opener().openImage(path);
+            if (tempImp != null) {
+                int[] dims = new int[] { tempImp.getWidth(), tempImp.getHeight() };
+                tempImp.close(); // Free memory immediately
+                return dims;
+            }
+            
+        } catch (Exception e) {
+            e.printStackTrace();
+            setStatus("Error reading dimensions: " + e.getMessage());
+        }
+        
+        return null;
+    }
+
+    private ImagePlus loadWithOptionalResize(String videoPath, int targetWidth, int targetHeight) {
+        /**
+         * Load video file and optionally resize it to target dimensions.
+         * First tries fast Python compression (OpenCV + tifffile), then falls back to
+         * memory-efficient frame-by-frame loading if Python is unavailable.
+         * If targetWidth or targetHeight is <= 0, no resizing is performed.
+         */
+        boolean shouldResize = (targetWidth > 0 && targetHeight > 0);
+        
+        if (!shouldResize) {
+            // No resizing - just load normally
+            setStatus("Loading video at original resolution...");
+            ImagePlus imp = new Opener().openImage(videoPath);
+            if (imp != null) {
+                scaleFactorX = 1.0;
+                scaleFactorY = 1.0;
+                isAviDownsampled = false;
+                setStatus(String.format("Loaded at original resolution: %dx%d (%d frames)", 
+                    imp.getWidth(), imp.getHeight(), imp.getStackSize()));
+            }
+            return imp;
+        }
+        
+        // Try fast Python compression first (10-50x faster than Java)
+        try {
+            String compressedPath = compressVideoFast(videoPath, targetWidth, targetHeight);
+            if (compressedPath != null) {
+                setStatus("Loading compressed video...");
+                ImagePlus imp = new Opener().openImage(compressedPath);
+                if (imp != null) {
+                    // Get original dimensions for scale factors
+                    int[] dims = getVideoDimensionsLightweight(videoPath);
+                    if (dims != null) {
+                        scaleFactorX = (double) dims[0] / targetWidth;
+                        scaleFactorY = (double) dims[1] / targetHeight;
+                    } else {
+                        scaleFactorX = 1.0;
+                        scaleFactorY = 1.0;
+                    }
+                    isAviDownsampled = true;
+                    setStatus(String.format("Loaded compressed video: %dx%d (%d frames)", 
+                        imp.getWidth(), imp.getHeight(), imp.getStackSize()));
+                    return imp;
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("[FastCompress] Failed, falling back to Java: " + e.getMessage());
+        }
+        
+        // Fall back to Java frame-by-frame loading
+        setStatus("Loading and resizing video frame-by-frame...");
+        
+        try {
+            String lowerPath = videoPath.toLowerCase();
+            
+            // Get dimensions first (lightweight)
+            int[] dims = getVideoDimensionsLightweight(videoPath);
+            if (dims == null) {
+                setStatus("Could not read video dimensions");
+                return null;
+            }
+            int origWidth = dims[0];
+            int origHeight = dims[1];
+            
+            // Calculate scale factors for coordinate mapping
+            scaleFactorX = (double) origWidth / targetWidth;
+            scaleFactorY = (double) origHeight / targetHeight;
+            isAviDownsampled = true;
+            
+            setStatus(String.format("Resizing %dx%d -> %dx%d (scale: %.2fx, %.2fx)", 
+                origWidth, origHeight, targetWidth, targetHeight, scaleFactorX, scaleFactorY));
+            
+            // Create output stack
+            ij.ImageStack resizedStack = new ij.ImageStack(targetWidth, targetHeight);
+            
+            if (lowerPath.endsWith(".tif") || lowerPath.endsWith(".tiff")) {
+                // For TIFF: Use TiffDecoder to read frames one at a time
+                return loadAndResizeTiffFrameByFrame(videoPath, targetWidth, targetHeight, resizedStack);
+            } else if (lowerPath.endsWith(".avi")) {
+                // For AVI: Use virtual stack to load frames one at a time
+                return loadAndResizeAviFrameByFrame(videoPath, targetWidth, targetHeight, resizedStack);
+            } else {
+                // Unknown format - try normal loading as fallback
+                setStatus("Unknown format, using standard loading...");
+                ImagePlus origImp = new Opener().openImage(videoPath);
+                if (origImp == null) return null;
+                
+                int nSlices = origImp.getStackSize();
+                for (int i = 1; i <= nSlices; i++) {
+                    origImp.setSlice(i);
+                    ImageProcessor ip = origImp.getProcessor().duplicate();
+                    ImageProcessor resizedIp = ip.resize(targetWidth, targetHeight, true);
+                    resizedStack.addSlice("", resizedIp);
+                    
+                    if (i % 50 == 0) {
+                        setStatus(String.format("Resizing frame %d/%d...", i, nSlices));
+                    }
+                }
+                origImp.close();
+                
+                ImagePlus resizedImp = new ImagePlus(videoPath, resizedStack);
+                setStatus("Resizing complete");
+                return resizedImp;
+            }
+            
+        } catch (Exception e) {
+            e.printStackTrace();
+            setStatus("Error loading/resizing video: " + e.getMessage());
+            return null;
+        }
+    }
+    
+    /**
+     * Load and resize TIFF file frame-by-frame using TiffDecoder.
+     * This avoids loading the entire stack into memory at once.
+     */
+    private ImagePlus loadAndResizeTiffFrameByFrame(String tiffPath, int targetWidth, int targetHeight, 
+                                                     ij.ImageStack resizedStack) {
+        try {
+            // Get file info to know how many frames and their structure
+            FileInfo[] infos = Opener.getTiffFileInfo(tiffPath);
+            if (infos == null || infos.length == 0) {
+                setStatus("Could not read TIFF file info");
+                return null;
+            }
+            
+            int nFrames = infos.length;
+            if (nFrames == 1 && infos[0].nImages > 1) {
+                // Single FileInfo with multiple images (common for stacks)
+                nFrames = infos[0].nImages;
+            }
+            
+            setStatus(String.format("Processing %d frames...", nFrames));
+            
+            // Use Opener to load one frame at a time
+            Opener opener = new Opener();
+            
+            for (int i = 1; i <= nFrames; i++) {
+                // Load single frame using the (path, frameNumber) variant
+                ImagePlus singleFrame = opener.openImage(tiffPath, i);
+                
+                if (singleFrame == null) {
+                    setStatus(String.format("Warning: Could not load frame %d", i));
+                    continue;
+                }
+                
+                // Get processor and resize
+                ImageProcessor ip = singleFrame.getProcessor();
+                ImageProcessor resizedIp = ip.resize(targetWidth, targetHeight, true);
+                resizedStack.addSlice("", resizedIp);
+                
+                // Close the single frame to free memory immediately
+                singleFrame.close();
+                singleFrame = null;
+                
+                if (i % 20 == 0) {
+                    setStatus(String.format("Resizing frame %d/%d...", i, nFrames));
+                    // Suggest garbage collection periodically
+                    System.gc();
+                }
+            }
+            
+            if (resizedStack.size() == 0) {
+                setStatus("No frames were loaded successfully");
+                return null;
+            }
+            
+            ImagePlus resizedImp = new ImagePlus(tiffPath, resizedStack);
+            setStatus(String.format("Resizing complete (%d frames)", resizedStack.size()));
+            return resizedImp;
+            
+        } catch (Exception e) {
+            e.printStackTrace();
+            setStatus("Error loading TIFF: " + e.getMessage());
+            return null;
+        }
+    }
+    
+    /**
+     * Load TIFF file with correct frame count detection.
+     * Uses virtual stack for large files to avoid memory issues.
+     * ImageJ TiffDecoder correctly parses the "images=" property from ImageJ-style TIFFs.
+     */
+    private ImagePlus loadTiffWithCorrectFrameCount(String tiffPath) {
+        try {
+            File tiffFile = new File(tiffPath);
+            String directory = tiffFile.getParent();
+            String name = tiffFile.getName();
+            long fileSize = tiffFile.length();
+            
+            if (directory != null && !directory.endsWith(File.separator)) {
+                directory = directory + File.separator;
+            }
+            
+            // Get expected frame count from FileInfo first
+            FileInfo[] infos = Opener.getTiffFileInfo(tiffPath);
+            int expectedFrames = 0;
+            if (infos != null && infos.length > 0) {
+                expectedFrames = infos.length;
+                if (expectedFrames == 1 && infos[0].nImages > 1) {
+                    expectedFrames = infos[0].nImages;
+                }
+            }
+            System.out.println("[TIFF] Expected " + expectedFrames + " frames based on FileInfo (file size: " + 
+                (fileSize / (1024*1024)) + " MB)");
+            
+            // For large files (> 500MB), use virtual stack to avoid OutOfMemoryError
+            // Virtual stack reads frames on-demand from disk
+            if (fileSize > 500L * 1024 * 1024) {
+                System.out.println("[TIFF] Large file detected, using virtual stack for memory efficiency");
+                try {
+                    setStatus("Loading with virtual stack (memory-efficient)...");
+                    ImagePlus imp = IJ.openVirtual(tiffPath);
+                    if (imp != null && imp.getStackSize() > 0) {
+                        int loadedFrames = imp.getStackSize();
+                        System.out.println("[TIFF] Virtual stack loaded " + loadedFrames + " frames");
+                        setStatus(String.format("Loaded (virtual): %dx%d (%d frames)", 
+                            imp.getWidth(), imp.getHeight(), loadedFrames));
+                        return imp;
+                    }
+                } catch (Exception e) {
+                    System.out.println("[TIFF] Virtual stack failed: " + e.getMessage());
+                }
+            }
+            
+            // Method 1: Use native ImageJ Opener.openTiff() for smaller files
+            try {
+                setStatus("Loading with ImageJ TiffDecoder...");
+                Opener opener = new Opener();
+                ImagePlus imp = opener.openTiff(directory, name);
+                
+                if (imp != null && imp.getStackSize() > 0) {
+                    int loadedFrames = imp.getStackSize();
+                    System.out.println("[TIFF] ImageJ TiffDecoder loaded " + loadedFrames + " frames");
+                    
+                    // Check if we got all expected frames (OutOfMemoryError causes partial loading)
+                    if (expectedFrames > 0 && loadedFrames < expectedFrames) {
+                        System.out.println("[TIFF] Warning: Only loaded " + loadedFrames + " of " + expectedFrames + 
+                            " frames - likely out of memory. Trying virtual stack...");
+                        imp.close();
+                        
+                        // Retry with virtual stack
+                        setStatus("Retrying with virtual stack...");
+                        ImagePlus virtualImp = IJ.openVirtual(tiffPath);
+                        if (virtualImp != null && virtualImp.getStackSize() >= expectedFrames) {
+                            System.out.println("[TIFF] Virtual stack recovered all " + virtualImp.getStackSize() + " frames");
+                            setStatus(String.format("Loaded (virtual): %dx%d (%d frames)", 
+                                virtualImp.getWidth(), virtualImp.getHeight(), virtualImp.getStackSize()));
+                            return virtualImp;
+                        }
+                    }
+                    
+                    setStatus(String.format("Loaded: %dx%d (%d frames)", 
+                        imp.getWidth(), imp.getHeight(), loadedFrames));
+                    return imp;
+                }
+            } catch (OutOfMemoryError oom) {
+                System.out.println("[TIFF] OutOfMemoryError - trying virtual stack");
+                setStatus("Memory limit reached, trying virtual stack...");
+                ImagePlus virtualImp = IJ.openVirtual(tiffPath);
+                if (virtualImp != null && virtualImp.getStackSize() > 0) {
+                    System.out.println("[TIFF] Virtual stack loaded " + virtualImp.getStackSize() + " frames");
+                    return virtualImp;
+                }
+            } catch (Exception e) {
+                System.out.println("[TIFF] TiffDecoder failed: " + e.getMessage());
+            }
+            
+            // Method 2: Try Bio-Formats with virtual stack
+            try {
+                setStatus("Loading with Bio-Formats (virtual)...");
+                String options = "open=[" + tiffPath + "] view=Hyperstack stack_order=XYCZT use_virtual_stack";
+                IJ.run("Bio-Formats Importer", options);
+                ImagePlus imp = IJ.getImage();
+                if (imp != null && imp.getStackSize() > 0) {
+                    int loadedFrames = imp.getStackSize();
+                    System.out.println("[TIFF] Bio-Formats loaded " + loadedFrames + " frames");
+                    setStatus(String.format("Loaded via Bio-Formats: %dx%d (%d frames)", 
+                        imp.getWidth(), imp.getHeight(), loadedFrames));
+                    return imp;
+                }
+            } catch (Exception e) {
+                System.out.println("[TIFF] Bio-Formats not available: " + e.getMessage());
+            }
+            
+            // Method 3: Fall back to standard IJ.openImage
+            try {
+                setStatus("Loading with standard ImageJ...");
+                ImagePlus imp = IJ.openImage(tiffPath);
+                if (imp != null && imp.getStackSize() > 0) {
+                    System.out.println("[TIFF] Standard loader returned " + imp.getStackSize() + " frames");
+                    setStatus(String.format("Loaded: %dx%d (%d frames)", 
+                        imp.getWidth(), imp.getHeight(), imp.getStackSize()));
+                    return imp;
+                }
+            } catch (Exception e) {
+                System.err.println("[TIFF] Standard loading failed: " + e.getMessage());
+            }
+            
+            // Final fallback: suggest compression
+            setStatus("Could not load file - try compression option");
+            JOptionPane.showMessageDialog(frame,
+                "Could not load this TIFF file at full resolution.\n\n" +
+                "Please use the compression option when loading.\n" +
+                "The compression path correctly handles all frames.",
+                "Load Error",
+                JOptionPane.WARNING_MESSAGE);
+            return null;
+            
+        } catch (Exception e) {
+            e.printStackTrace();
+            setStatus("Error loading TIFF: " + e.getMessage());
+            return null;
+        }
+    }
+    
+    /**
+     * Load and resize AVI file frame-by-frame using virtual stack.
+     * This avoids loading the entire video into memory at once.
+     */
+    private ImagePlus loadAndResizeAviFrameByFrame(String aviPath, int targetWidth, int targetHeight,
+                                                    ij.ImageStack resizedStack) {
+        try {
+            // Use AVI_Reader with virtual stack
+            ij.plugin.AVI_Reader reader = new ij.plugin.AVI_Reader();
+            ImagePlus virtualAvi = reader.openVirtual(aviPath);
+            
+            if (virtualAvi == null) {
+                setStatus("Could not open AVI as virtual stack");
+                return null;
+            }
+            
+            int nFrames = virtualAvi.getStackSize();
+            setStatus(String.format("Processing %d frames...", nFrames));
+            
+            ij.ImageStack virtualStack = virtualAvi.getStack();
+            
+            for (int i = 1; i <= nFrames; i++) {
+                // Get processor for this frame (virtual stack loads on demand)
+                ImageProcessor ip = virtualStack.getProcessor(i);
+                
+                // Resize
+                ImageProcessor resizedIp = ip.resize(targetWidth, targetHeight, true);
+                resizedStack.addSlice("", resizedIp);
+                
+                if (i % 20 == 0) {
+                    setStatus(String.format("Resizing frame %d/%d...", i, nFrames));
+                    // Virtual stacks should manage memory, but help with GC
+                    System.gc();
+                }
+            }
+            
+            // Close virtual stack
+            virtualAvi.close();
+            
+            if (resizedStack.size() == 0) {
+                setStatus("No frames were loaded successfully");
+                return null;
+            }
+            
+            ImagePlus resizedImp = new ImagePlus(aviPath, resizedStack);
+            setStatus(String.format("Resizing complete (%d frames)", resizedStack.size()));
+            return resizedImp;
+            
+        } catch (Exception e) {
+            e.printStackTrace();
+            setStatus("Error loading AVI: " + e.getMessage());
+            return null;
+        }
+    }
+    
+    /**
+     * Save the compressed/resized video to a temporary TIFF file for backend operations.
+     * This ensures the Python backend works with the compressed data, not the original.
+     * @param compressedImp The compressed ImagePlus
+     * @param originalPath The original video path (used for naming)
+     * @return Path to the temp file, or null on failure
+     */
+    private String saveCompressedVideoToTemp(ImagePlus compressedImp, String originalPath) {
+        try {
+            // Clean up any existing temp compressed file before creating a new one
+            cleanupTempVideoFile();
+            
+            // Create temp file in same directory as original (for WSL path compatibility)
+            File originalFile = new File(originalPath);
+            String baseName = originalFile.getName().replaceFirst("\\.[^.]+$", "");
+            String tempFileName = baseName + "_compressed_" + System.currentTimeMillis() + ".tif";
+            File tempFile = new File(originalFile.getParent(), tempFileName);
+            
+            setStatus("Saving compressed video for backend processing...");
+            
+            // Use ImageJ's FileSaver to save as TIFF
+            ij.io.FileSaver saver = new ij.io.FileSaver(compressedImp);
+            boolean saved = saver.saveAsTiffStack(tempFile.getAbsolutePath());
+            
+            if (saved) {
+                tempCompressedVideoPath = tempFile.getAbsolutePath();
+                setStatus(String.format("Compressed video saved: %s", tempFileName));
+                return tempFile.getAbsolutePath();
+            } else {
+                setStatus("Failed to save compressed video");
+                return null;
+            }
+            
+        } catch (Exception e) {
+            e.printStackTrace();
+            setStatus("Error saving compressed video: " + e.getMessage());
+            return null;
+        }
+    }
+    
+    /**
+     * Fast video compression using Python backend (OpenCV + tifffile).
+     * This is 10-50x faster than ImageJ's frame-by-frame approach for large videos.
+     * The bash script will automatically start the server if needed.
+     * 
+     * @param inputPath Path to the original video file
+     * @param targetWidth Target width in pixels
+     * @param targetHeight Target height in pixels
+     * @return Path to the compressed temp file, or null on failure
+     */
+    private String compressVideoFast(String inputPath, int targetWidth, int targetHeight) {
+        System.out.println("[FastCompress] === Starting fast compression ===");
+        System.out.println("[FastCompress] serverAvailable: " + serverAvailable);
+        
+        // Clean up any existing temp compressed file before creating a new one
+        cleanupTempVideoFile();
+        
+        try {
+            File scriptFile = getTrackingScript();
+            System.out.println("[FastCompress] Checking script: " + scriptFile.getAbsolutePath() + " exists: " + scriptFile.exists());
+            
+            if (!scriptFile.exists()) {
+                System.err.println("[FastCompress] Tracking script not found!");
+                return null;
+            }
+            
+            System.out.println("[FastCompress] Using script: " + scriptFile.getAbsolutePath());
+            
+            // Create output path in same directory as input (for WSL compatibility)
+            File inputFile = new File(inputPath);
+            String baseName = inputFile.getName().replaceFirst("\\.[^.]+$", "");
+            String tempFileName = baseName + "_compressed_" + System.currentTimeMillis() + ".tif";
+            File tempFile = new File(inputFile.getParent(), tempFileName);
+            String outputPath = tempFile.getAbsolutePath();
+            
+            System.out.println("[FastCompress] Input: " + inputPath);
+            System.out.println("[FastCompress] Output: " + outputPath);
+            System.out.println("[FastCompress] Target: " + targetWidth + "x" + targetHeight);
+            
+            setStatus("Fast compression via Python (OpenCV)...");
+            
+            List<String> args = new ArrayList<>();
+            args.add("compress_video");
+            args.add("--input");
+            args.add(inputPath);
+            args.add("--output");
+            args.add(outputPath);
+            args.add("--width");
+            args.add(String.valueOf(targetWidth));
+            args.add("--height");
+            args.add(String.valueOf(targetHeight));
+            
+            List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
+            ProcessBuilder pb = new ProcessBuilder(command);
+            pb.redirectErrorStream(true);
+            
+            long startTime = System.currentTimeMillis();
+            Process proc = pb.start();
+            
+            StringBuilder output = new StringBuilder();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(proc.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    System.out.println("[FastCompress] " + line);
+                    output.append(line).append("\n");
+                }
+            }
+            
+            boolean finished = proc.waitFor(120, TimeUnit.SECONDS);  // 2 minute timeout
+            
+            if (!finished) {
+                proc.destroyForcibly();
+                System.err.println("[FastCompress] Compression timed out");
+                return null;
+            }
+            
+            int exitCode = proc.exitValue();
+            long elapsedMs = System.currentTimeMillis() - startTime;
+            
+            // Check output for success/failure
+            String outputStr = output.toString();
+            boolean hasSuccess = outputStr.contains("[SUCCESS]") || outputStr.contains("\"status\": \"ok\"");
+            
+            if (exitCode == 0 && tempFile.exists() && hasSuccess) {
+                System.out.println("[FastCompress] Success in " + elapsedMs + "ms");
+                setStatus(String.format("Fast compression complete in %.1fs", elapsedMs / 1000.0));
+                tempCompressedVideoPath = outputPath;
+                return outputPath;
+            } else {
+                System.err.println("[FastCompress] Failed - exitCode: " + exitCode + 
+                                   ", fileExists: " + tempFile.exists() + 
+                                   ", hasSuccess: " + hasSuccess);
+                System.err.println("[FastCompress] Output: " + outputStr);
+                return null;
+            }
+            
+        } catch (Exception e) {
+            System.err.println("[FastCompress] Exception: " + e.getMessage());
+            e.printStackTrace();
+            return null;
+        }
+    }
+    
+    /**
+     * Clean up temporary compressed video file.
+     */
+    private void cleanupTempVideoFile() {
+        if (tempCompressedVideoPath != null) {
+            try {
+                File tempFile = new File(tempCompressedVideoPath);
+                if (tempFile.exists()) {
+                    boolean deleted = tempFile.delete();
+                    if (deleted) {
+                        System.out.println("Cleaned up temp file: " + tempCompressedVideoPath);
+                    }
+                }
+            } catch (Exception e) {
+                System.err.println("Failed to clean up temp file: " + e.getMessage());
+            }
+            tempCompressedVideoPath = null;
+        }
+    }
+    
+    /**
+     * Send a clear_cache command to the tracking server to free memory from previous video.
+     * This is called when opening a new video to ensure the old flow data is freed.
+     */
+    private void clearServerFlowCache() {
+        if (!serverAvailable) return;
+        
+        try {
+            File scriptFile = getTrackingScript();
+            if (!scriptFile.exists()) {
+                System.err.println("Cannot clear cache: script not found: " + scriptFile.getAbsolutePath());
+                return;
+            }
+            
+            List<String> args = new ArrayList<>();
+            args.add("clear_cache");
+            List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
+            
+            ProcessBuilder pb = new ProcessBuilder(command);
+            pb.redirectErrorStream(true);
+            
+            Process proc = pb.start();
+            
+            // Use a short timeout - cache clearing should be fast
+            boolean finished = proc.waitFor(5, TimeUnit.SECONDS);
+            
+            if (!finished) {
+                proc.destroyForcibly();
+                System.err.println("Cache clear timed out");
+                return;
+            }
+            
+            BufferedReader reader = new BufferedReader(new InputStreamReader(proc.getInputStream()));
+            StringBuilder output = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                output.append(line).append("\n");
+            }
+            reader.close();
+            
+            String result = output.toString();
+            if (result.contains("SUCCESS") || result.contains("caches cleared")) {
+                System.out.println("Server flow cache cleared successfully");
+            } else {
+                System.err.println("Cache clear response: " + result);
+            }
+            
+        } catch (Exception e) {
+            // Silent fail - cache clearing is optional optimization
+            System.err.println("Could not clear server cache: " + e.getMessage());
+        }
+    }
+    
+    /**
+     * Clear memory (flow cache + GPU models) before switching to a new flow method.
+     * This frees both RAM (cached flow arrays) and VRAM (GPU models like RAFT/LocoTrack).
+     * Called when switching between ANY flow methods (RAFT, LocoTrack, Trackpy, DIS).
+     */
+    private void clearMemoryBeforeSwitch() {
+        if (!serverAvailable) {
+            System.out.println("[Memory] Server not available, skipping cleanup");
+            return;
+        }
+        
+        try {
+            File scriptFile = getTrackingScript();
+            if (!scriptFile.exists()) {
+                System.err.println("[Memory] Cannot clear memory: script not found: " + scriptFile.getAbsolutePath());
+                return;
+            }
+            
+            System.out.println("[Memory] ========================================");
+            System.out.println("[Memory] Clearing flow cache and GPU models...");
+            
+            List<String> args = new ArrayList<>();
+            args.add("clear_memory");
+            List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
+            
+            ProcessBuilder pb = new ProcessBuilder(command);
+            pb.redirectErrorStream(true);
+            
+            Process proc = pb.start();
+            
+            // Use a short timeout - cleanup should be fast
+            boolean finished;
+            try {
+                finished = proc.waitFor(15, TimeUnit.SECONDS);
+            } catch (InterruptedException ie) {
+                // Worker was cancelled - destroy process and restore interrupt flag
+                proc.destroyForcibly();
+                Thread.currentThread().interrupt();
+                System.out.println("[Memory] Cleanup interrupted (operation cancelled)");
+                return;
+            }
+            
+            if (!finished) {
+                proc.destroyForcibly();
+                System.err.println("[Memory] Cleanup timed out!");
+                return;
+            }
+            
+            BufferedReader reader = new BufferedReader(new InputStreamReader(proc.getInputStream()));
+            StringBuilder output = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                System.out.println("[Memory] " + line);
+                output.append(line).append("\n");
+            }
+            reader.close();
+            
+            String result = output.toString();
+            if (result.contains("SUCCESS") || result.contains("Freed") || result.contains("complete") || result.contains("\"status\": \"ok\"")) {
+                System.out.println("[Memory] Cleanup successful");
+            } else {
+                System.err.println("[Memory] Unexpected response: " + result);
+            }
+            System.out.println("[Memory] ========================================");
+            
+        } catch (Exception e) {
+            System.err.println("[Memory] ERROR: Could not clear memory: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+    
+    /**
+     * Shows a dialog asking the user if they want to compress/resize the video.
+     * If yes, prompts for target resolution.
+     * @return int array [targetWidth, targetHeight] or null if user cancels, [0,0] if no compression
+     */
+    // Special return values for compression dialog flow control
+    private static final int COMPRESSION_RESULT_CANCELLED = -1;
+    private static final int COMPRESSION_RESULT_KEEP_ORIGINAL = 0;
+    private static final int COMPRESSION_RESULT_COMPRESS = 1;
+    private static final int COMPRESSION_RESULT_FILE_EXPLORER = -2;
+    
+    /**
+     * Shows compression dialog with options: Keep Original, Compress, or File Explorer.
+     * @return int array with result codes:
+     *         null = cancelled (closed dialog)
+     *         [0, 0] = Keep original
+     *         [1, 1] = User wants to compress (caller should show resolution dialog)
+     *         [-2, -2] = User wants to go back to file explorer
+     */
+    private int[] showCompressionDialog(int origWidth, int origHeight) {
+        // Create custom dialog with dark theme
+        JDialog dialog = new JDialog(frame, "Video Compression", true);
+        dialog.setLayout(new BorderLayout(10, 10));
+        styleDialog(dialog);
+        
+        JPanel contentPanel = new JPanel(new BorderLayout(15, 15));
+        contentPanel.setBackground(PANEL_BG);
+        contentPanel.setBorder(BorderFactory.createEmptyBorder(20, 25, 20, 25));
+        
+        // Title and info
+        JLabel titleLabel = new JLabel("\u2139 Video Compression Options");
+        titleLabel.setFont(new Font("Segoe UI Semibold", Font.BOLD, 16));
+        titleLabel.setForeground(TEXT_PRIMARY_COLOR);
+        contentPanel.add(titleLabel, BorderLayout.NORTH);
+        
+        // Info panel
+        JPanel infoPanel = new JPanel();
+        infoPanel.setLayout(new BoxLayout(infoPanel, BoxLayout.Y_AXIS));
+        infoPanel.setBackground(PANEL_BG);
+        infoPanel.setBorder(BorderFactory.createEmptyBorder(10, 0, 10, 0));
+        
+        JLabel sizeLabel = new JLabel(String.format("Original resolution: %d × %d pixels", origWidth, origHeight));
+        sizeLabel.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        sizeLabel.setForeground(TEXT_PRIMARY_COLOR);
+        sizeLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        infoPanel.add(sizeLabel);
+        infoPanel.add(Box.createVerticalStrut(15));
+        
+        JLabel questionLabel = new JLabel("Would you like to compress (resize) this video?");
+        questionLabel.setFont(new Font("Segoe UI", Font.BOLD, 13));
+        questionLabel.setForeground(TEXT_PRIMARY_COLOR);
+        questionLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        infoPanel.add(questionLabel);
+        infoPanel.add(Box.createVerticalStrut(10));
+        
+        // Pros/Cons explanation
+        String explanation = "<html><body style='width: 350px;'>" +
+            "<p style='color: " + String.format("#%02x%02x%02x", ACCENT_GREEN.getRed(), ACCENT_GREEN.getGreen(), ACCENT_GREEN.getBlue()) + ";'><b>✓ Benefits of compression:</b></p>" +
+            "<ul style='margin-left: 15px; color: " + String.format("#%02x%02x%02x", TEXT_SECONDARY_COLOR.getRed(), TEXT_SECONDARY_COLOR.getGreen(), TEXT_SECONDARY_COLOR.getBlue()) + ";'>" +
+            "<li>Uses less memory</li>" +
+            "<li>Faster algorithm execution (optical flow, tracking)</li>" +
+            "<li>Quicker display updates</li>" +
+            "</ul>" +
+            "<p style='color: " + String.format("#%02x%02x%02x", ACCENT_RED.getRed(), ACCENT_RED.getGreen(), ACCENT_RED.getBlue()) + ";'><b>✗ Drawbacks of compression:</b></p>" +
+            "<ul style='margin-left: 15px; color: " + String.format("#%02x%02x%02x", TEXT_SECONDARY_COLOR.getRed(), TEXT_SECONDARY_COLOR.getGreen(), TEXT_SECONDARY_COLOR.getBlue()) + ";'>" +
+            "<li>Loss of image detail and fine features</li>" +
+            "<li>May affect tracking accuracy for small objects</li>" +
+            "<li>Cannot recover original resolution later</li>" +
+            "</ul></body></html>";
+        JLabel explanationLabel = new JLabel(explanation);
+        explanationLabel.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        explanationLabel.setForeground(TEXT_SECONDARY_COLOR);
+        explanationLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        infoPanel.add(explanationLabel);
+        
+        contentPanel.add(infoPanel, BorderLayout.CENTER);
+        
+        // Button panel - use FlowLayout with CENTER alignment for better spacing
+        JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.CENTER, 10, 0));
+        buttonPanel.setBackground(PANEL_BG);
+        
+        final int[] result = new int[] {COMPRESSION_RESULT_CANCELLED, COMPRESSION_RESULT_CANCELLED}; // -1 means cancelled
+        
+        // File Explorer button - allows user to select a different video
+        JButton fileExplorerButton = createStyledButton("File Explorer");
+        fileExplorerButton.setToolTipText("Go back to file explorer to select a different video");
+        fileExplorerButton.addActionListener(e -> {
+            result[0] = COMPRESSION_RESULT_FILE_EXPLORER;
+            result[1] = COMPRESSION_RESULT_FILE_EXPLORER;
+            dialog.dispose();
+        });
+        
+        JButton noButton = createStyledButton("Keep Original");
+        noButton.setToolTipText("Load video at full resolution without compression");
+        noButton.addActionListener(e -> {
+            result[0] = COMPRESSION_RESULT_KEEP_ORIGINAL;
+            result[1] = COMPRESSION_RESULT_KEEP_ORIGINAL;
+            dialog.dispose();
+        });
+        
+        JButton yesButton = createAccentButton("Compress", null);
+        yesButton.setToolTipText("Choose a target resolution to reduce video size");
+        yesButton.addActionListener(e -> {
+            result[0] = COMPRESSION_RESULT_COMPRESS; // Flag to show resolution dialog
+            result[1] = COMPRESSION_RESULT_COMPRESS;
+            dialog.dispose();
+        });
+        
+        buttonPanel.add(fileExplorerButton);
+        buttonPanel.add(noButton);
+        buttonPanel.add(yesButton);
+        contentPanel.add(buttonPanel, BorderLayout.SOUTH);
+        
+        dialog.add(contentPanel);
+        dialog.pack();
+        dialog.setMinimumSize(new Dimension(500, 370));
+        dialog.setLocationRelativeTo(frame);
+        dialog.setVisible(true);
+        
+        // Return the result array directly - caller handles interpretation
+        // null = closed dialog, [0,0] = keep original, [1,1] = compress, [-2,-2] = file explorer
+        if (result[0] == COMPRESSION_RESULT_CANCELLED) {
+            return null; // User closed dialog
+        }
+        
+        return new int[] {result[0], result[1]};
+    }
+    
+    /**
+     * Shows a dialog for user to input target resolution.
+     * @return int array [targetWidth, targetHeight] or null if cancelled
+     */
+    private int[] showResolutionInputDialog(int origWidth, int origHeight) {
+        JDialog dialog = new JDialog(frame, "Enter Target Resolution", true);
+        dialog.setLayout(new BorderLayout(10, 10));
+        styleDialog(dialog);
+        
+        JPanel contentPanel = new JPanel(new BorderLayout(15, 15));
+        contentPanel.setBackground(PANEL_BG);
+        contentPanel.setBorder(BorderFactory.createEmptyBorder(20, 25, 20, 25));
+        
+        // Title
+        JLabel titleLabel = new JLabel("\u21F2 Set Target Resolution");
+        titleLabel.setFont(new Font("Segoe UI Semibold", Font.BOLD, 16));
+        titleLabel.setForeground(TEXT_PRIMARY_COLOR);
+        contentPanel.add(titleLabel, BorderLayout.NORTH);
+        
+        // Input panel
+        JPanel inputPanel = new JPanel(new GridBagLayout());
+        inputPanel.setBackground(PANEL_BG);
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.insets = new Insets(8, 5, 8, 5);
+        gbc.anchor = GridBagConstraints.WEST;
+        
+        // Calculate aspect ratio for preset generation
+        double aspectRatio = (double) origWidth / origHeight;
+        
+        JLabel origLabel = new JLabel(String.format("Original: %d × %d (aspect ratio: %.2f:1)", origWidth, origHeight, aspectRatio));
+        origLabel.setForeground(TEXT_SECONDARY_COLOR);
+        origLabel.setFont(new Font("Segoe UI", Font.ITALIC, 12));
+        gbc.gridx = 0; gbc.gridy = 0; gbc.gridwidth = 4;
+        inputPanel.add(origLabel, gbc);
+        
+        // Suggested resolutions (preserving aspect ratio)
+        JLabel suggestLabel = new JLabel("Suggested resolutions (preserving aspect ratio):");
+        suggestLabel.setForeground(TEXT_SECONDARY_COLOR);
+        suggestLabel.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+        gbc.gridy = 1;
+        inputPanel.add(suggestLabel, gbc);
+        
+        // Generate default resolution preserving aspect ratio (target ~768 on larger dimension)
+        int defaultWidth, defaultHeight;
+        if (origWidth >= origHeight) {
+            defaultWidth = Math.min(768, origWidth);
+            defaultHeight = (int) Math.round((double) defaultWidth / aspectRatio);
+        } else {
+            defaultHeight = Math.min(768, origHeight);
+            defaultWidth = (int) Math.round((double) defaultHeight * aspectRatio);
+        }
+        // Ensure dimensions are even (required by many video codecs)
+        defaultWidth = (defaultWidth / 2) * 2;
+        defaultHeight = (defaultHeight / 2) * 2;
+        
+        // Width input
+        gbc.gridwidth = 1;
+        gbc.gridy = 2;
+        gbc.gridx = 0;
+        JLabel widthLabel = new JLabel("Width:");
+        widthLabel.setForeground(TEXT_PRIMARY_COLOR);
+        inputPanel.add(widthLabel, gbc);
+        
+        gbc.gridx = 1;
+        JTextField widthField = createConfigTextField(String.valueOf(defaultWidth), 6);
+        inputPanel.add(widthField, gbc);
+        
+        gbc.gridx = 2;
+        JLabel heightLabel = new JLabel("Height:");
+        heightLabel.setForeground(TEXT_PRIMARY_COLOR);
+        inputPanel.add(heightLabel, gbc);
+        
+        gbc.gridx = 3;
+        JTextField heightField = createConfigTextField(String.valueOf(defaultHeight), 6);
+        inputPanel.add(heightField, gbc);
+        
+        // Generate aspect-ratio preserving presets
+        JPanel presetPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 5));
+        presetPanel.setBackground(PANEL_BG);
+        
+        // Generate presets at 75%, 50%, 33%, and 25% of original size
+        double[] scaleFactors = {0.75, 0.5, 0.33, 0.25};
+        List<int[]> validPresets = new ArrayList<>();
+        
+        for (double scale : scaleFactors) {
+            int tw = (int) Math.round(origWidth * scale);
+            int th = (int) Math.round(origHeight * scale);
+            // Ensure even dimensions
+            tw = (tw / 2) * 2;
+            th = (th / 2) * 2;
+            // Only add if reasonable size (at least 64 pixels)
+            if (tw >= 64 && th >= 64) {
+                validPresets.add(new int[]{tw, th});
+            }
+        }
+        
+        // Also add some fixed target sizes if they're smaller than original
+        int[] targetSizes = {512, 768, 1024};
+        for (int target : targetSizes) {
+            int tw, th;
+            if (origWidth >= origHeight) {
+                tw = target;
+                th = (int) Math.round((double) target / aspectRatio);
+            } else {
+                th = target;
+                tw = (int) Math.round((double) target * aspectRatio);
+            }
+            tw = (tw / 2) * 2;
+            th = (th / 2) * 2;
+            if (tw < origWidth && th < origHeight && tw >= 64 && th >= 64) {
+                // Check if not duplicate
+                boolean isDup = false;
+                for (int[] existing : validPresets) {
+                    if (Math.abs(existing[0] - tw) < 10 && Math.abs(existing[1] - th) < 10) {
+                        isDup = true;
+                        break;
+                    }
+                }
+                if (!isDup) {
+                    validPresets.add(new int[]{tw, th});
+                }
+            }
+        }
+        
+        // Sort by width
+        validPresets.sort((a, b) -> Integer.compare(a[0], b[0]));
+        
+        // Limit to 5 presets, keeping diverse selection
+        if (validPresets.size() > 5) {
+            List<int[]> limited = new ArrayList<>();
+            int step = Math.max(1, validPresets.size() / 5);
+            for (int i = 0; i < validPresets.size() && limited.size() < 5; i += step) {
+                limited.add(validPresets.get(i));
+            }
+            validPresets = limited;
+        }
+        
+        for (int[] preset : validPresets) {
+            JButton presetBtn = new JButton(preset[0] + "×" + preset[1]);
+            presetBtn.setFont(new Font("Segoe UI", Font.PLAIN, 10));
+            presetBtn.setBackground(SECONDARY_BG);
+            presetBtn.setForeground(TEXT_SECONDARY_COLOR);
+            presetBtn.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(BORDER_COLOR),
+                BorderFactory.createEmptyBorder(3, 8, 3, 8)
+            ));
+            presetBtn.setFocusPainted(false);
+            presetBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            final int w = preset[0], h = preset[1];
+            presetBtn.addActionListener(e -> {
+                widthField.setText(String.valueOf(w));
+                heightField.setText(String.valueOf(h));
+            });
+            presetPanel.add(presetBtn);
+        }
+        
+        gbc.gridx = 0; gbc.gridy = 3; gbc.gridwidth = 4;
+        inputPanel.add(presetPanel, gbc);
+        
+        contentPanel.add(inputPanel, BorderLayout.CENTER);
+        
+        // Button panel
+        JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 0));
+        buttonPanel.setBackground(PANEL_BG);
+        
+        final int[] result = new int[] {-1, -1};
+        
+        JButton cancelButton = createStyledButton("Cancel");
+        cancelButton.setToolTipText("Go back to compression options");
+        cancelButton.addActionListener(e -> dialog.dispose());
+        
+        JButton okButton = createAccentButton("Apply", null);
+        okButton.setToolTipText("Apply compression with the specified resolution");
+        okButton.addActionListener(e -> {
+            try {
+                int w = Integer.parseInt(widthField.getText().trim());
+                int h = Integer.parseInt(heightField.getText().trim());
+                if (w <= 0 || h <= 0) {
+                    JOptionPane.showMessageDialog(dialog, "Width and height must be positive integers.", "Invalid Input", JOptionPane.ERROR_MESSAGE);
+                    return;
+                }
+                if (w > origWidth || h > origHeight) {
+                    int confirm = JOptionPane.showConfirmDialog(dialog, 
+                        "Target resolution is larger than original. This will upscale the image.\nContinue?",
+                        "Confirm Upscaling", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+                    if (confirm != JOptionPane.YES_OPTION) {
+                        return;
+                    }
+                }
+                result[0] = w;
+                result[1] = h;
+                dialog.dispose();
+            } catch (NumberFormatException ex) {
+                JOptionPane.showMessageDialog(dialog, "Please enter valid integers for width and height.", "Invalid Input", JOptionPane.ERROR_MESSAGE);
+            }
+        });
+        
+        buttonPanel.add(cancelButton);
+        buttonPanel.add(okButton);
+        contentPanel.add(buttonPanel, BorderLayout.SOUTH);
+        
+        dialog.add(contentPanel);
+        dialog.pack();
+        dialog.setMinimumSize(new Dimension(400, 280));
+        dialog.setLocationRelativeTo(frame);
+        dialog.setVisible(true);
+        
+        if (result[0] <= 0) {
+            return null; // Cancelled
+        }
+        
+        return result;
+    }
+
+    private void openTiff(JLabel pageLabel) {
+        // Outer loop: allows returning to file explorer from compression dialog
+        fileExplorerLoop:
+        while (true) {
+            JFileChooser chooser = createStyledFileChooser();
+            
+            // Use last opened directory if available, otherwise use current working directory
+            File startDir;
+            if (lastOpenedVideoDirectory != null && lastOpenedVideoDirectory.exists()) {
+                startDir = lastOpenedVideoDirectory;
+            } else {
+                startDir = new File(System.getProperty("user.dir"));
+            }
+            chooser.setCurrentDirectory(startDir);
+            chooser.setFileFilter(new FileNameExtensionFilter("Video Files (TIFF, AVI)", "tif", "tiff", "avi"));
+            
+            if (chooser.showOpenDialog(frame) != JFileChooser.APPROVE_OPTION) {
+                // User cancelled file selection
+                return;
+            }
+            
+            File selectedFile = chooser.getSelectedFile();
+            String path = selectedFile.getAbsolutePath();
+            
+            // Remember this directory for next time (even before we confirm loading)
+            File parentDir = selectedFile.getParentFile();
+            if (parentDir != null && parentDir.exists()) {
+                lastOpenedVideoDirectory = parentDir;
+            }
+            
+            // Get dimensions WITHOUT loading the full image into memory
+            setStatus("Reading video dimensions...");
+            int[] dimensions = getVideoDimensionsLightweight(path);
+            
+            if (dimensions == null) {
+                JOptionPane.showMessageDialog(frame, "Failed to read video dimensions.", "Error", JOptionPane.ERROR_MESSAGE);
+                // Go back to file explorer
+                continue fileExplorerLoop;
+            }
+            
+            int origWidth = dimensions[0];
+            int origHeight = dimensions[1];
+            
+            // Inner loop: allows returning from resolution dialog to compression dialog
+            int[] targetRes = null;
+            compressionDialogLoop:
+            while (true) {
+                // Show compression dialog
+                int[] compressionResult = showCompressionDialog(origWidth, origHeight);
+                
+                if (compressionResult == null) {
+                    // User closed the dialog (X button) - cancel everything
+                    setStatus("Video loading cancelled.");
+                    return;
+                }
+                
+                if (compressionResult[0] == COMPRESSION_RESULT_FILE_EXPLORER) {
+                    // User wants to go back to file explorer
+                    continue fileExplorerLoop;
+                }
+                
+                if (compressionResult[0] == COMPRESSION_RESULT_KEEP_ORIGINAL) {
+                    // User chose to keep original - no compression
+                    targetRes = new int[] {0, 0};
+                    break compressionDialogLoop;
+                }
+                
+                if (compressionResult[0] == COMPRESSION_RESULT_COMPRESS) {
+                    // User wants to compress - show resolution dialog
+                    int[] resolutionResult = showResolutionInputDialog(origWidth, origHeight);
+                    
+                    if (resolutionResult == null) {
+                        // User cancelled resolution dialog - go back to compression dialog
+                        continue compressionDialogLoop;
+                    }
+                    
+                    // User selected a resolution
+                    targetRes = resolutionResult;
+                    break compressionDialogLoop;
+                }
+            }
+            
+            // If we get here, we have a valid selection - proceed with loading
+            currentVideoPath = path;
+            
+            // Clean up previous temp file if exists
+            cleanupTempVideoFile();
+            
+            // Clear server flow cache to free memory from previous video
+            clearServerFlowCache();
+            
+            // Reset scaling factors
+            isAviDownsampled = false;
+            scaleFactorX = 1.0;
+            scaleFactorY = 1.0;
+        
+            // Load video with optional resizing
+            if (targetRes[0] > 0 && targetRes[1] > 0) {
+                // User chose to compress
+                imp = loadWithOptionalResize(path, targetRes[0], targetRes[1]);
+            
+                if (imp != null) {
+                    // Save compressed video to temp file for backend operations
+                    workingVideoPath = saveCompressedVideoToTemp(imp, path);
+                    if (workingVideoPath == null) {
+                        // Failed to save temp file, use original (will be slow/may fail)
+                        setStatus("Warning: Could not save compressed video, backend will use original file");
+                        workingVideoPath = path;
+                    } else {
+                        setStatus(String.format("Compressed video saved for processing: %s", workingVideoPath));
+                    }
+                }
+            } else {
+                // No compression - load at original resolution
+                // For large files, try to use virtual stack to avoid memory issues
+                String lowerPath = path.toLowerCase();
+                long fileSize = new File(path).length();
+                long sizeThreshold = 500L * 1024 * 1024; // 500 MB threshold
+                
+                setStatus("Loading video at original resolution...");
+                
+                if (fileSize > sizeThreshold && lowerPath.endsWith(".avi")) {
+                    // Use virtual stack for large AVI files
+                    try {
+                        ij.plugin.AVI_Reader reader = new ij.plugin.AVI_Reader();
+                        imp = reader.openVirtual(path);
+                        if (imp != null) {
+                            setStatus(String.format("Loaded AVI as virtual stack: %dx%d (%d frames)", 
+                                imp.getWidth(), imp.getHeight(), imp.getStackSize()));
+                        }
+                    } catch (Exception e) {
+                        System.err.println("Virtual AVI loading failed: " + e.getMessage());
+                        imp = null;
+                    }
+                } else if (fileSize > sizeThreshold && (lowerPath.endsWith(".tif") || lowerPath.endsWith(".tiff"))) {
+                    // For large TIFF files, use frame-by-frame loading with correct frame count detection
+                    imp = loadTiffWithCorrectFrameCount(path);
+                } else {
+                    // Normal sized file - still use correct frame count detection for TIFFs
+                    if (lowerPath.endsWith(".tif") || lowerPath.endsWith(".tiff")) {
+                        imp = loadTiffWithCorrectFrameCount(path);
+                    } else {
+                        imp = IJ.openImage(path);
+                    }
+                    if (imp != null) {
+                        setStatus(String.format("Loaded: %dx%d (%d frames)", 
+                            imp.getWidth(), imp.getHeight(), imp.getStackSize()));
+                    }
+                }
+                
+                if (imp != null) {
+                    scaleFactorX = 1.0;
+                    scaleFactorY = 1.0;
+                    isAviDownsampled = false;
+                    setStatus(String.format("Loaded at original resolution: %dx%d (%d frames)", 
+                        origWidth, origHeight, imp.getStackSize()));
+                }
+                // Use original path for backend operations
+                workingVideoPath = path;
+            }
+            
+            if (imp == null) {
+                JOptionPane.showMessageDialog(frame, "Failed to open video file.", "Error", JOptionPane.ERROR_MESSAGE);
+                // Go back to file explorer on load failure
+                continue fileExplorerLoop;
+            }
+
+            // Note: originalImp was removed - it was never used and doubled memory requirements
+            totalSlices = imp.getStackSize();
+            currentSlice = 1;
+            trackAnnotations.clear();
+            trackColors.clear();
+            selectedTrackId = null;
+            trackCounter = 1;
+            colorIndex = 0;
+            undoStack.clear();
+            redoStack.clear();
+            zoomFactor = 1.0;
+            opticalFlowComputed = false;
+            
+            // Exit trim mode if active (before clearing data)
+            if (trimModeActive) {
+                // Simple exit without restore - we're loading a new file anyway
+                trimModeActive = false;
+                trimModeTrackId = null;
+                if (trimModeControlPanel != null) {
+                    frameNavPanel.remove(trimModeControlPanel);
+                    trimModeControlPanel = null;
+                    trimModeInfoLabel = null;
+                    frameNavPanel.add(pageLabel, BorderLayout.WEST);
+                    frameNavPanel.revalidate();
+                    frameNavPanel.repaint();
+                }
+            }
+            
+            // Clear flow visualization from previous video to free memory
+            clearFlowVisualizationAndSwitchToVideo();
+            
+            // Clear time tracking data for new video
+            trackTotalTime.clear();
+            trackStartTime.clear();
+            trackCompleted.clear();
+            sessionStartTime = 0;
+            
+            // Clear trim data for new video
+            trackUntrimmedAnnotations.clear();
+            trackUntrimmedAnchors.clear();
+            trackTrimRange.clear();
+            
+            // Reset brightness/contrast settings to avoid black screen issues
+            viewMin = null;
+            viewMax = null;
+            
+            // Clear SAT metadata when opening new file
+            satEnabled = false;
+            showRegionBoundaries = false;
+            showMask = false;
+            segmentationMask = null;
+            frameRegions.clear();
+            trackToRegion.clear();
+            framePixelToRegion.clear();
+            trackAnchors.clear();
+            trackOptimized.clear();
+            trackSelected.clear();
+            
+            // Reset SAT UI controls
+            if (satCheckbox != null) {
+                satCheckbox.setSelected(false);
+            }
+            if (satAdjustButton != null) {
+                satAdjustButton.setEnabled(false);
+            }
+            if (showMaskCheckbox != null) {
+                showMaskCheckbox.setSelected(false);
+                showMaskCheckbox.setEnabled(false);
+            }
+            if (showRegionsCheckbox != null) {
+                showRegionsCheckbox.setSelected(false);
+                showRegionsCheckbox.setEnabled(false);
+            }
+            
+            // Setup frame slider
+            frameSlider.setMinimum(1);
+            frameSlider.setMaximum(totalSlices);
+            frameSlider.setValue(1);
+            frameSlider.setEnabled(totalSlices > 1);
+            
+            // Start background thread for slice loading (like ImageJ's StackWindow)
+            startSliceLoaderThread();
+            
+            loadSliceImage();
+            pageLabel.setText(String.format("Frame: %d / %d", currentSlice, totalSlices));
+            refreshAnnotationList();
+            
+            SwingUtilities.invokeLater(() -> {
+                JScrollPane scrollPane = (JScrollPane) imageLabel.getParent().getParent();
+                fitImageToPanel(scrollPane);
+            });
+            
+            // Prompt to compute optical flow if configured
+            checkAndPromptOpticalFlow();
+            
+            // Exit the outer loop - video loaded successfully
+            break fileExplorerLoop;
+        } // end of fileExplorerLoop while
+    }
+
+    private void checkAndPromptOpticalFlow() {
+        boolean autoCompute = Boolean.parseBoolean(
+            config.getProperty("auto.compute.optical.flow", "true"));
+        
+        if (!autoCompute) {
+            return;
+        }
+        
+        String flowMethod = config.getProperty("flow.method", getDefaultFlowMethod());
+        java.util.List<File> allCachedFiles = findCachedFlowFiles(currentVideoPath, flowMethod);
+        
+        // CRITICAL: Filter by resolution to prevent using wrong-resolution flow data
+        java.util.List<File> cachedFiles = filterFlowFilesByResolution(allCachedFiles);
+        int incompatibleCount = allCachedFiles.size() - cachedFiles.size();
+        
+        if (!cachedFiles.isEmpty()) {
+            // Find if any file matches current settings
+            File matchingFile = null;
+            for (File f : cachedFiles) {
+                if (flowFileMatchesCurrentSettings(f, flowMethod)) {
+                    matchingFile = f;
+                    break;
+                }
+            }
+            
+            // Build informative message
+            StringBuilder message = new StringBuilder();
+            message.append("Optical flow files found for this video.\n\n");
+            message.append("Current method: ").append(flowMethod.toUpperCase());
+            if (imp != null) {
+                message.append(" | Working resolution: ").append(imp.getWidth()).append("x").append(imp.getHeight());
+            }
+            message.append("\nFound ").append(cachedFiles.size()).append(" compatible cached file(s):\n\n");
+            
+            for (int i = 0; i < Math.min(cachedFiles.size(), 5); i++) {
+                File f = cachedFiles.get(i);
+                boolean isMatch = flowFileMatchesCurrentSettings(f, flowMethod);
+                message.append(isMatch ? "  ✓ " : "  • ");
+                message.append(describeFlowFile(f, flowMethod));
+                if (isMatch) {
+                    message.append(" ← matches current settings");
+                }
+                message.append("\n");
+            }
+            if (cachedFiles.size() > 5) {
+                message.append("  ... and ").append(cachedFiles.size() - 5).append(" more\n");
+            }
+            
+            if (incompatibleCount > 0) {
+                message.append("\n⚠ ").append(incompatibleCount).append(" cached file(s) ignored (different resolution)\n");
+            }
+            
+            message.append("\n");
+            if (matchingFile != null) {
+                message.append("A cached file matches your current settings.\n");
+            } else {
+                message.append("No cached file matches your current settings.\n");
+            }
+            message.append("\nLoad Existing: Use cached file (fast)\n");
+            message.append("Recalculate: Compute with current settings (slow)\n");
+            message.append("Skip: Don't load optical flow now");
+            
+            String[] options = {"Load Existing", "Recalculate", "Skip"};
+            int choice = JOptionPane.showOptionDialog(
+                frame,
+                message.toString(),
+                "Optical Flow Available",
+                JOptionPane.YES_NO_CANCEL_OPTION,
+                JOptionPane.QUESTION_MESSAGE,
+                null,
+                options,
+                matchingFile != null ? options[0] : options[1]
+            );
+            
+            if (choice == 0) { // Load Existing
+                File fileToLoad = (matchingFile != null) ? matchingFile : cachedFiles.get(0);
+                loadExistingOpticalFlow(fileToLoad);
+            } else if (choice == 1) { // Recalculate
+                computeOpticalFlowRemote(true);
+            }
+            // choice == 2 or CLOSED_OPTION: Skip
+        } else {
+            // No compatible cached files - check if there are incompatible ones
+            StringBuilder message = new StringBuilder();
+            message.append("Would you like to compute optical flow for this video?\n");
+            message.append("This is required for automatic track propagation.\n\n");
+            message.append("Current method: ").append(flowMethod.toUpperCase());
+            if (imp != null) {
+                message.append("\nWorking resolution: ").append(imp.getWidth()).append("x").append(imp.getHeight());
+            }
+            
+            if (incompatibleCount > 0) {
+                message.append("\n\n⚠ Found ").append(incompatibleCount).append(" cached file(s) at DIFFERENT resolution(s).\n");
+                message.append("These cannot be used - resolution must match exactly.");
+            }
+            
+            message.append("\n\nThis may take a few minutes depending on video size.");
+            
+            int result = JOptionPane.showConfirmDialog(
+                frame,
+                message.toString(),
+                "Compute Optical Flow",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.QUESTION_MESSAGE
+            );
+            
+            if (result == JOptionPane.YES_OPTION) {
+                computeOpticalFlowRemote();
+            }
+        }
+    }
+
+    /**
+     * Find the most recent optical flow file for a given video and method.
+     * CRITICAL: Only returns files that match the current working resolution.
+     * Files now have descriptive names with parameters, e.g.:
+     * - video_raft_optical_flow.npz (or video_raft_WxH_optical_flow.npz if resized)
+     * - video_locotrack_r2.5_t0.00_kgau_fs15_ts0.10_sf0_optical_flow.npz
+     * - video_trackpy_d11_mm0_sr15_m5_kgau_fs15_optical_flow.npz
+     */
+    private String getOpticalFlowPath(String videoPath) {
+        if (videoPath == null) return null;
+        
+        String outputDir = getOutputDirectory();
+        String videoName = new File(videoPath).getName();
+        String baseName = videoName.replaceFirst("\\.[^.]+$", "");
+        String flowMethod = config.getProperty("flow.method", getDefaultFlowMethod());
+        
+        // Look for existing flow files matching the pattern AND resolution
+        java.util.List<File> allFiles = findCachedFlowFiles(videoPath, flowMethod);
+        java.util.List<File> compatibleFiles = filterFlowFilesByResolution(allFiles);
+        
+        if (!compatibleFiles.isEmpty()) {
+            // Return the most recently modified compatible file
+            File newest = compatibleFiles.get(0);
+            for (File f : compatibleFiles) {
+                if (f.lastModified() > newest.lastModified()) {
+                    newest = f;
+                }
+            }
+            return newest.getAbsolutePath();
+        }
+        
+        // No existing compatible file found, return default path (will be used for new computation)
+        return new File(outputDir, baseName + "_" + flowMethod + "_optical_flow.npz").getAbsolutePath();
+    }
+
+    /**
+     * Check if a compatible optical flow file exists for the current video and resolution.
+     * CRITICAL: Only returns true if the file matches the current working resolution.
+     */
+    private boolean opticalFlowFileExists(String videoPath) {
+        if (videoPath == null) return false;
+        
+        String flowMethod = config.getProperty("flow.method", getDefaultFlowMethod());
+        java.util.List<File> allFiles = findCachedFlowFiles(videoPath, flowMethod);
+        java.util.List<File> compatibleFiles = filterFlowFilesByResolution(allFiles);
+        
+        return !compatibleFiles.isEmpty();
+    }
+
+    // Server management methods
+    
+    /**
+     * Set environment variables for server management scripts.
+     * These variables are read by run_persistent_tracking.sh / run_persistent_tracking.bat to configure:
+     * - CONDA_ENV: The conda environment name for Python execution
+     * - RIPPLE_TRANSPORT: Explicit transport selection (unix|tcp)
+     * - SOCKET_PATH: Unix domain socket path for IPC communication (unix)
+     * - SOCKET_HOST / SOCKET_PORT: TCP connection settings (tcp)
+     * - MODEL_SIZE: RAFT model size (large/small)
+     * - CUDA_VISIBLE_DEVICES: GPU device selection (if specific GPU is configured)
+     * @param pb The ProcessBuilder to configure
+     */
+    private void setServerEnvironmentVariables(ProcessBuilder pb) {
+        Map<String, String> env = pb.environment();
+        env.put("CONDA_ENV", config.getProperty("local.conda.env", "ripple-env"));
+        env.put("SOCKET_PATH", config.getProperty("local.socket.path", "/tmp/ripple-env.sock"));
+        env.put("SOCKET_HOST", config.getProperty("local.tcp.host", "127.0.0.1"));
+        env.put("SOCKET_PORT", config.getProperty("local.tcp.port", "9876"));
+        env.put("MODEL_SIZE", config.getProperty("raft.model.size", "large"));
+        
+        // GPU device selection: if a specific GPU is configured, set CUDA_VISIBLE_DEVICES
+        // This controls which GPU PyTorch will see and use
+        String gpuDevice = config.getProperty("gpu.device", "auto");
+        if (!"auto".equals(gpuDevice)) {
+            env.put("CUDA_VISIBLE_DEVICES", gpuDevice);
+            env.put("SELECTED_GPU", gpuDevice);  // Also pass as explicit argument
+        }
+
+        // Transport selection:
+        // - If we are launching the Windows .bat wrapper, use TCP (Windows transport).
+        // - Otherwise default to Unix socket (Linux/macOS and WSL bash script).
+        try {
+            File scriptFile = getTrackingScript();
+            if (scriptFile != null && scriptFile.getName().toLowerCase().endsWith(".bat")) {
+                env.put("RIPPLE_TRANSPORT", "tcp");
+            } else {
+                env.put("RIPPLE_TRANSPORT", "unix");
+            }
+        } catch (Exception ignored) {
+            env.put("RIPPLE_TRANSPORT", "unix");
+        }
+    }
+    
+    private boolean isServerRunning() {
+        try {
+            File scriptFile = getTrackingScript();
+            if (!scriptFile.exists()) {
+                return false;
+            }
+            
+            List<String> args = new ArrayList<>();
+            args.add("status");
+            List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
+            
+            ProcessBuilder pb = new ProcessBuilder(command);
+            setServerEnvironmentVariables(pb);
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+            
+            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.contains("Server is RUNNING") || line.contains("[SUCCESS] Server is RUNNING")) {
+                    return true;
+                }
+            }
+            process.waitFor();
+            return false;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+    
+    private void stopServer() {
+        try {
+            File scriptFile = getTrackingScript();
+            if (!scriptFile.exists()) {
+                return;
+            }
+            
+            setStatus("Stopping tracking engine...");
+            
+            // Use buildWSLCommand for proper Windows/WSL/native batch support
+            List<String> args = new ArrayList<>();
+            args.add("stop");
+            List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
+            
+            ProcessBuilder pb = new ProcessBuilder(command);
+            setServerEnvironmentVariables(pb);
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+            
+            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+            String line;
+            while ((line = reader.readLine()) != null) {
+                System.out.println(line);
+            }
+            process.waitFor();
+            
+            // Also explicitly clean up the socket file in case the stop command didn't
+            cleanupSocketFile();
+            
+            setStatus("Server stopped.");
+        } catch (Exception e) {
+            setStatus("Failed to stop server: " + e.getMessage());
+        }
+    }
+    
+    /**
+     * Clean up the Unix domain socket file.
+     * Called after server shutdown to ensure no stale socket remains.
+     */
+    private void cleanupSocketFile() {
+        try {
+            String socketPath = config.getProperty("local.socket.path", "/tmp/ripple-env.sock");
+            String os = System.getProperty("os.name").toLowerCase();
+            ProcessBuilder pb;
+            if (os.contains("win")) {
+                // On Windows, use WSL to remove the socket
+                pb = new ProcessBuilder("wsl.exe", "rm", "-f", socketPath);
+            } else {
+                // On Linux/Mac, remove directly
+                pb = new ProcessBuilder("rm", "-f", socketPath);
+            }
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+            process.waitFor();
+        } catch (Exception e) {
+            // Ignore cleanup errors
+            System.err.println("Socket cleanup warning: " + e.getMessage());
+        }
+    }
+    
+    private void restartServer() {
+        // Cancellation flag
+        final AtomicBoolean cancelled = new AtomicBoolean(false);
+        
+        // Reference to the server process for cancellation
+        final Process[] serverProcessRef = new Process[1];
+        
+        // Create progress dialog
+        final JDialog progressDialog = new JDialog(frame, "Initializing Application", true);
+        progressDialog.setDefaultCloseOperation(JDialog.DO_NOTHING_ON_CLOSE);
+        
+        JPanel contentPanel = new JPanel(new BorderLayout(10, 10));
+        contentPanel.setBorder(BorderFactory.createEmptyBorder(20, 20, 20, 20));
+        contentPanel.setBackground(PANEL_DARK);
+        
+        JLabel messageLabel = new JLabel("Initializing tracking engine...");
+        messageLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        messageLabel.setForeground(TEXT_PRIMARY);
+        contentPanel.add(messageLabel, BorderLayout.CENTER);
+        
+        // Bottom panel with elapsed time and cancel button
+        JPanel bottomPanel = new JPanel(new BorderLayout(10, 5));
+        bottomPanel.setBackground(PANEL_DARK);
+        
+        final JLabel elapsedLabel = new JLabel("Elapsed: 0s");
+        elapsedLabel.setFont(new Font("Segoe UI", Font.BOLD, 14));
+        elapsedLabel.setForeground(ACCENT_BLUE);
+        elapsedLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        bottomPanel.add(elapsedLabel, BorderLayout.CENTER);
+        
+        JButton cancelButton = new JButton("Cancel");
+        cancelButton.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        cancelButton.setBackground(new Color(120, 40, 40));
+        cancelButton.setForeground(TEXT_PRIMARY);
+        cancelButton.setFocusPainted(false);
+        cancelButton.setBorder(BorderFactory.createEmptyBorder(8, 20, 8, 20));
+        cancelButton.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        JPanel cancelPanel = new JPanel(new FlowLayout(FlowLayout.CENTER));
+        cancelPanel.setBackground(PANEL_DARK);
+        cancelPanel.add(cancelButton);
+        bottomPanel.add(cancelPanel, BorderLayout.SOUTH);
+        
+        contentPanel.add(bottomPanel, BorderLayout.SOUTH);
+        
+        progressDialog.add(contentPanel);
+        progressDialog.setSize(450, 180);
+        progressDialog.setLocationRelativeTo(frame);
+        
+        // Timer to update elapsed time
+        final long startTime = System.currentTimeMillis();
+        final Timer elapsedTimer = new Timer(1000, e -> {
+            long elapsed = (System.currentTimeMillis() - startTime) / 1000;
+            elapsedLabel.setText(String.format("Elapsed: %ds", elapsed));
+        });
+        elapsedTimer.start();
+        
+        // Reference to worker for cancellation
+        final SwingWorker<Boolean, Void>[] workerRef = new SwingWorker[1];
+        
+        cancelButton.addActionListener(e -> {
+            cancelled.set(true);
+            if (workerRef[0] != null) {
+                workerRef[0].cancel(true);
+            }
+            // Kill the running process immediately to stop output
+            if (serverProcessRef[0] != null) {
+                serverProcessRef[0].destroyForcibly();
+            }
+            elapsedTimer.stop();
+            progressDialog.dispose();
+            
+            // Kill any partially started server process
+            stopServer();
+            serverAvailable = false;
+            setStatus("Initialization cancelled - tracking unavailable");
+            
+            // Show prompt to user about server state
+            JOptionPane.showMessageDialog(frame,
+                "Initialization was cancelled.\n\n" +
+                "Tracking features will be unavailable until the application is initialized.\n" +
+                "You can initialize via: Server > Restart Server\n\n" +
+                "You can still:\n" +
+                "• View and navigate the video\n" +
+                "• Import/export annotations\n" +
+                "• Adjust display settings",
+                "Tracking Unavailable",
+                JOptionPane.WARNING_MESSAGE);
+        });
+        
+        SwingWorker<Boolean, Void> worker = new SwingWorker<Boolean, Void>() {
+            @Override
+            protected Boolean doInBackground() throws Exception {
+                File scriptFile = getTrackingScript();
+                if (!scriptFile.exists()) {
+                    throw new FileNotFoundException("Tracking script not found. Tried: " + scriptFile.getAbsolutePath() + 
+                        "\nMake sure scripts/run_persistent_tracking.sh (Linux/Mac) or scripts/run_persistent_tracking.bat (Windows) exists.");
+                }
+                
+                setStatus("Initializing tracking engine...");
+                
+                List<String> args = new ArrayList<>();
+                args.add("restart");
+                List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
+                
+                ProcessBuilder pb = new ProcessBuilder(command);
+                setServerEnvironmentVariables(pb);
+                pb.redirectErrorStream(true);
+                Process process = pb.start();
+                serverProcessRef[0] = process; // Store reference for cancellation
+                
+                BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+                String line;
+                StringBuilder output = new StringBuilder();
+                boolean serverStartedSuccessfully = false;
+                while ((line = reader.readLine()) != null) {
+                    // Check if cancelled before processing more output
+                    if (cancelled.get() || isCancelled()) {
+                        process.destroyForcibly();
+                        return false;
+                    }
+                    System.out.println("[Server] " + line);
+                    output.append(line).append("\n");
+                    
+                    // Detect successful server start from batch output
+                    if (line.contains("[SUCCESS] Server started") || line.contains("Server started")) {
+                        serverStartedSuccessfully = true;
+                        // On Windows, the batch script runs the server in background, 
+                        // so we can break early once we see success
+                        break;
+                    }
+                    
+                    // Also detect if server failed to start
+                    if (line.contains("[ERROR] Server failed to start")) {
+                        throw new IOException("Server failed to start: " + output.toString());
+                    }
+                }
+                
+                // Check again after reading completes
+                if (cancelled.get() || isCancelled()) {
+                    process.destroyForcibly();
+                    return false;
+                }
+                
+                int exitCode = process.waitFor();
+                
+                // Consider it success if we saw the success message OR exit code is 0
+                if (serverStartedSuccessfully) {
+                    return true;
+                }
+                
+                if (exitCode != 0 && !cancelled.get() && !isCancelled()) {
+                    throw new IOException("Server restart failed: " + output.toString());
+                }
+                
+                return !cancelled.get() && !isCancelled();
+            }
+            
+            @Override
+            protected void done() {
+                elapsedTimer.stop();
+                progressDialog.dispose();
+                
+                // If cancelled, don't process results
+                if (cancelled.get() || isCancelled()) {
+                    return;
+                }
+                
+                try {
+                    Boolean success = get();
+                    if (success != null && success) {
+                        serverAvailable = true;
+                        serverWasRunningOnStart = true; // Mark that we started the server
+                        setStatus("Tracking engine initialized successfully");
+                    } else {
+                        // False return means cancelled during execution
+                        return;
+                    }
+                } catch (Exception e) {
+                    if (cancelled.get() || isCancelled()) {
+                        return;
+                    }
+                    serverAvailable = false;
+                    setStatus("Failed to initialize: " + e.getMessage());
+                    JOptionPane.showMessageDialog(frame, 
+                        "Failed to initialize tracking engine: " + e.getMessage(), 
+                        "Error", 
+                        JOptionPane.ERROR_MESSAGE);
+                }
+            }
+        };
+        
+        workerRef[0] = worker;
+        worker.execute();
+        progressDialog.setVisible(true);
+    }
+    
+    private void checkServerOnStartup() {
+        if (isServerRunning()) {
+            // Server already running, use it as-is
+            serverWasRunningOnStart = true;
+            serverAvailable = true;
+            setStatus("Tracking engine is running");
+        } else {
+            // Server is not running, start it automatically
+            setStatus("Initializing tracking engine...");
+            restartServer(); // This will start the server asynchronously
+            // Note: serverWasRunningOnStart will be set in restartServer's done() callback
+            // and status will be updated there based on success/failure
+        }
+    }
+    
+    /**
+     * Detect available GPUs by running a quick Python check.
+     * This is called on startup to populate the GPU selector.
+     * Runs in the background to avoid blocking the UI.
+     */
+    private void detectAvailableGpus() {
+        if (isCpuOnly) {
+            // In CPU mode, don't bother detecting GPUs
+            return;
+        }
+        
+        new SwingWorker<List<String[]>, Void>() {
+            @Override
+            protected List<String[]> doInBackground() throws Exception {
+                List<String[]> gpus = new ArrayList<>();
+                
+                try {
+                    // Quick Python script to detect GPUs
+                    String condaEnv = config.getProperty("local.conda.env", "ripple-env");
+                    String pythonCode = 
+                        "import json, torch\n" +
+                        "gpus = []\n" +
+                        "if torch.cuda.is_available():\n" +
+                        "    for i in range(torch.cuda.device_count()):\n" +
+                        "        p = torch.cuda.get_device_properties(i)\n" +
+                        "        gpus.append({'index': i, 'name': p.name, 'memory_gb': round(p.total_memory / 1024**3, 1)})\n" +
+                        "print(json.dumps(gpus))";
+                    
+                    ProcessBuilder pb = new ProcessBuilder(
+                        "conda", "run", "-n", condaEnv, "--no-capture-output",
+                        "python", "-c", pythonCode
+                    );
+                    pb.redirectErrorStream(true);
+                    Process process = pb.start();
+                    
+                    BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+                    StringBuilder output = new StringBuilder();
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        output.append(line);
+                    }
+                    process.waitFor();
+                    
+                    // Parse JSON output
+                    String json = output.toString().trim();
+                    if (json.startsWith("[")) {
+                        JSONArray arr = new JSONArray(json);
+                        for (int i = 0; i < arr.length(); i++) {
+                            JSONObject gpu = arr.getJSONObject(i);
+                            gpus.add(new String[]{
+                                String.valueOf(gpu.getInt("index")),
+                                gpu.getString("name"),
+                                String.valueOf(gpu.getDouble("memory_gb"))
+                            });
+                        }
+                    }
+                } catch (Exception e) {
+                    System.err.println("GPU detection failed: " + e.getMessage());
+                }
+                
+                return gpus;
+            }
+            
+            @Override
+            protected void done() {
+                try {
+                    availableGpus = get();
+                    if (!availableGpus.isEmpty()) {
+                        System.out.println("Detected " + availableGpus.size() + " GPU(s):");
+                        for (String[] gpu : availableGpus) {
+                            System.out.println("  GPU " + gpu[0] + ": " + gpu[1] + " (" + gpu[2] + " GB)");
+                        }
+                    }
+                } catch (Exception e) {
+                    availableGpus = new ArrayList<>();
+                }
+            }
+        }.execute();
+    }
+    
+    private void promptServerShutdownOnExit() {
+        // Always stop the tracking engine on application exit
+        if (serverWasRunningOnStart || isServerRunning()) {
+            stopServer();
+        }
+    }
+
+    private void changeSlice(int delta, JLabel pageLabel) {
+        if (imp == null) return;
+        
+        // Block frame navigation during trim mode (slider handles navigation)
+        if (trimModeActive) return;
+        
+        int newSlice = currentSlice + delta;
+        newSlice = Math.max(1, Math.min(newSlice, totalSlices));
+        if (newSlice == currentSlice) return;
+        
+        currentSlice = newSlice;
+        loadSliceImageFast();  // Fast update during wheel scroll
+        pageLabel.setText(String.format("Frame: %d / %d", currentSlice, totalSlices));
+        frameSlider.setValue(currentSlice);
+        // Schedule annotation list refresh after a delay to avoid blocking scroll
+        scheduleAnnotationRefresh();
+    }
+
+    private void updateImageLabelPreferredSize() {
+        if (currentImage == null) return;
+        int w = (int) Math.round(currentImage.getWidth() * zoomFactor);
+        int h = (int) Math.round(currentImage.getHeight() * zoomFactor);
+        imageLabel.setPreferredSize(new Dimension(w, h));
+        imageLabel.revalidate();
+    }
+
+    private void zoomCenteredAt(Point mousePos, double factor) {
+        if (currentImage == null) return;
+        
+        // Calculate image coordinates at mouse position before zoom
+        double imgX = (mousePos.x - imageOffsetX) / zoomFactor;
+        double imgY = (mousePos.y - imageOffsetY) / zoomFactor;
+        
+        // Update zoom factor with limits
+        double newZoom = zoomFactor * factor;
+        newZoom = Math.max(MIN_ZOOM, Math.min(newZoom, MAX_ZOOM));
+        
+        if (newZoom == zoomFactor) return;
+        zoomFactor = newZoom;
+        
+        // Calculate new offset to keep the same image point under the mouse
+        imageOffsetX = mousePos.x - imgX * zoomFactor;
+        imageOffsetY = mousePos.y - imgY * zoomFactor;
+        
+        // Simple repaint like ImageJ
+        imageLabel.repaint();
+    }
+    
+    /**
+     * Zoom centered at mouse position in comparison mode.
+     * Accounts for the split view - converts mouse position to image coordinates
+     * based on which half of the screen the mouse is in.
+     */
+    private void zoomCenteredAtComparison(Point mousePos, double factor) {
+        if (currentImage == null || !smoothingComparisonMode) return;
+        
+        int imgW = currentImage.getWidth();
+        int imgH = currentImage.getHeight();
+        int panelW = imageLabel.getWidth();
+        int panelH = imageLabel.getHeight();
+        int halfW = panelW / 2;
+        int dividerWidth = 4;
+        
+        // Calculate scale (same as paintComparisonView)
+        double scaleX = (double)(halfW - 10) / imgW;
+        double scaleY = (double)(panelH - 60) / imgH;
+        double scale = Math.min(scaleX, scaleY) * zoomFactor;
+        
+        int scaledW = (int)(imgW * scale);
+        int scaledH = (int)(imgH * scale);
+        
+        // Determine which half the mouse is in
+        boolean isLeftHalf = mousePos.x < halfW;
+        
+        // Calculate base position for the relevant half
+        int baseX = isLeftHalf ? (halfW - scaledW) / 2 : (halfW + dividerWidth/2 + (halfW - scaledW) / 2);
+        int baseY = (panelH - scaledH) / 2 + 20;
+        
+        // Convert mouse position to image coordinates
+        // Mouse position relative to the image in that half
+        int relativeX = mousePos.x - baseX - (int)imageOffsetX;
+        int relativeY = mousePos.y - baseY - (int)imageOffsetY;
+        
+        // Image coordinates at mouse position
+        double pixelW = (double) scaledW / imgW;
+        double pixelH = (double) scaledH / imgH;
+        double imgX = relativeX / pixelW;
+        double imgY = relativeY / pixelH;
+        
+        // Update zoom factor with limits
+        double newZoom = zoomFactor * factor;
+        newZoom = Math.max(MIN_ZOOM, Math.min(newZoom, MAX_ZOOM));
+        
+        if (newZoom == zoomFactor) return;
+        zoomFactor = newZoom;
+        
+        // Recalculate scale with new zoom
+        scale = Math.min(scaleX, scaleY) * zoomFactor;
+        scaledW = (int)(imgW * scale);
+        scaledH = (int)(imgH * scale);
+        pixelW = (double) scaledW / imgW;
+        pixelH = (double) scaledH / imgH;
+        
+        // Calculate new base position
+        baseX = isLeftHalf ? (halfW - scaledW) / 2 : (halfW + dividerWidth/2 + (halfW - scaledW) / 2);
+        baseY = (panelH - scaledH) / 2 + 20;
+        
+        // Calculate new offset to keep the same image point under the mouse
+        // Target: mouse should be at the same image coordinates
+        int targetScreenX = (int)(imgX * pixelW);
+        int targetScreenY = (int)(imgY * pixelH);
+        
+        imageOffsetX = mousePos.x - baseX - targetScreenX;
+        imageOffsetY = mousePos.y - baseY - targetScreenY;
+        
+        // Simple repaint
+        imageLabel.repaint();
+    }
+    
+    /**
+     * Clamps image offsets to ensure at least part of the image is always visible.
+     */
+    private void clampImageOffsets() {
+        // Removed clamping for smoother panning - let users pan freely like ImageJ
+    }
+    
+    /**
+     * Update the zoom label to show current zoom percentage.
+     */
+    private void updateZoomLabel() {
+        if (zoomLabel != null) {
+            int zoomPercent = (int) Math.round(zoomFactor * 100);
+            zoomLabel.setText(zoomPercent + "%");
+        }
+    }
+    
+    /**
+     * Fit the image to the current window size while maintaining aspect ratio.
+     */
+    private void fitImageToWindow() {
+        if (currentImage == null || imageLabel == null) return;
+        
+        int imgW = currentImage.getWidth();
+        int imgH = currentImage.getHeight();
+        int viewW = imageLabel.getWidth();
+        int viewH = imageLabel.getHeight();
+        
+        if (viewW <= 0 || viewH <= 0) {
+            // Fallback to parent if label hasn't been laid out yet
+            Container parent = imageLabel.getParent();
+            if (parent != null) {
+                viewW = parent.getWidth();
+                viewH = parent.getHeight();
+            }
+        }
+        
+        if (viewW <= 0 || viewH <= 0) return;
+        
+        // Calculate zoom to fit both dimensions
+        double zoomX = (double) viewW / imgW;
+        double zoomY = (double) viewH / imgH;
+        zoomFactor = Math.min(zoomX, zoomY);
+        zoomFactor = Math.max(MIN_ZOOM, Math.min(zoomFactor, MAX_ZOOM));
+        
+        // Center the image
+        int scaledW = (int) Math.ceil(imgW * zoomFactor);
+        int scaledH = (int) Math.ceil(imgH * zoomFactor);
+        imageOffsetX = (viewW - scaledW) / 2.0;
+        imageOffsetY = (viewH - scaledH) / 2.0;
+        
+        imageLabel.repaint();
+    }
+    
+    /**
+     * Reset zoom to 100% (1:1 actual pixels) and center the image.
+     */
+    private void resetZoomToActual() {
+        if (currentImage == null || imageLabel == null) return;
+        
+        zoomFactor = 1.0;
+        
+        // Center the image in the viewport
+        int imgW = currentImage.getWidth();
+        int imgH = currentImage.getHeight();
+        int viewW = imageLabel.getWidth();
+        int viewH = imageLabel.getHeight();
+        
+        if (viewW > 0 && viewH > 0) {
+            imageOffsetX = (viewW - imgW) / 2.0;
+            imageOffsetY = (viewH - imgH) / 2.0;
+        } else {
+            imageOffsetX = 0;
+            imageOffsetY = 0;
+        }
+        
+        imageLabel.repaint();
+    }
+
+    // Export format enum
+    private enum ExportFormat { JSON, CSV }
+    
+    // Export content enum
+    private enum ExportContent { RICH, TRAJECTORIES_ONLY, BOTH }
+    
+    private void exportAnnotations() {
+        if (imp == null) return;
+        
+        // Check if there's anything to export
+        if (trackAnnotations.isEmpty()) {
+            JOptionPane.showMessageDialog(frame, "No tracks to export.", "Export", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        
+        try {
+            // Show export options dialog
+            ExportOptionsResult exportOptions = showExportOptionsDialog();
+            if (exportOptions == null) return; // User cancelled
+            
+            // Perform export based on selected options
+            // Rich tracks: store current video resolution for import validation
+            // Plain trajectories: always export native coordinates (no resolution conversion)
+            if (exportOptions.content == ExportContent.BOTH) {
+                // Export both rich and trajectories-only files
+                // Pass the directory from the first save to the second so user doesn't have to navigate again
+                File savedDir = exportToFormat(exportOptions.format, ExportContent.RICH, "_rich", null);
+                if (savedDir != null) {
+                    exportToFormat(exportOptions.format, ExportContent.TRAJECTORIES_ONLY, "_trajectories", savedDir);
+                }
+            } else {
+                String suffix = exportOptions.content == ExportContent.TRAJECTORIES_ONLY ? "_trajectories" : "";
+                exportToFormat(exportOptions.format, exportOptions.content, suffix, null);
+            }
+            
+        } catch (Exception ex) {
+            ex.printStackTrace();
+            JOptionPane.showMessageDialog(frame, "Failed to export annotations: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+        }
+    }
+    
+    // Export options result container
+    private static class ExportOptionsResult {
+        ExportFormat format;
+        ExportContent content;
+        
+        ExportOptionsResult(ExportFormat format, ExportContent content) {
+            this.format = format;
+            this.content = content;
+        }
+    }
+    
+    private ExportOptionsResult showExportOptionsDialog() {
+        JDialog dialog = new JDialog(frame, "Export Options", true);
+        dialog.setLayout(new BorderLayout(10, 10));
+        
+        // Format selection panel
+        JPanel formatPanel = new JPanel(new GridLayout(2, 1, 5, 5));
+        formatPanel.setBorder(BorderFactory.createTitledBorder(
+            BorderFactory.createLineBorder(BORDER_DARK), "Export Format", 
+            javax.swing.border.TitledBorder.LEFT, javax.swing.border.TitledBorder.TOP, 
+            null, TEXT_PRIMARY));
+        formatPanel.setBackground(SECONDARY_DARK);
+        
+        ButtonGroup formatGroup = new ButtonGroup();
+        JRadioButton jsonRadio = new JRadioButton("JSON - Structured format with nested data");
+        JRadioButton csvRadio = new JRadioButton("CSV - Spreadsheet-compatible format");
+        jsonRadio.setSelected(true);
+        formatGroup.add(jsonRadio);
+        formatGroup.add(csvRadio);
+        
+        jsonRadio.setBackground(SECONDARY_DARK);
+        jsonRadio.setForeground(TEXT_PRIMARY);
+        csvRadio.setBackground(SECONDARY_DARK);
+        csvRadio.setForeground(TEXT_PRIMARY);
+        
+        formatPanel.add(jsonRadio);
+        formatPanel.add(csvRadio);
+        
+        // Content selection panel
+        JPanel contentPanel = new JPanel(new GridLayout(3, 1, 5, 5));
+        contentPanel.setBorder(BorderFactory.createTitledBorder(
+            BorderFactory.createLineBorder(BORDER_DARK), "Export Content", 
+            javax.swing.border.TitledBorder.LEFT, javax.swing.border.TitledBorder.TOP, 
+            null, TEXT_PRIMARY));
+        contentPanel.setBackground(SECONDARY_DARK);
+        
+        ButtonGroup contentGroup = new ButtonGroup();
+        JRadioButton richRadio = new JRadioButton("Rich - All data (tracks, anchors, colors, timing, etc.)");
+        JRadioButton trajRadio = new JRadioButton("Trajectories Only - Just frame/x/y coordinates");
+        JRadioButton bothRadio = new JRadioButton("Both - Export separate rich and trajectories files");
+        richRadio.setSelected(true);
+        contentGroup.add(richRadio);
+        contentGroup.add(trajRadio);
+        contentGroup.add(bothRadio);
+        
+        richRadio.setBackground(SECONDARY_DARK);
+        richRadio.setForeground(TEXT_PRIMARY);
+        trajRadio.setBackground(SECONDARY_DARK);
+        trajRadio.setForeground(TEXT_PRIMARY);
+        bothRadio.setBackground(SECONDARY_DARK);
+        bothRadio.setForeground(TEXT_PRIMARY);
+        
+        contentPanel.add(richRadio);
+        contentPanel.add(trajRadio);
+        contentPanel.add(bothRadio);
+        
+        // Main content panel
+        JPanel mainPanel = new JPanel(new GridLayout(2, 1, 10, 10));
+        mainPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        mainPanel.setBackground(SECONDARY_DARK);
+        mainPanel.add(formatPanel);
+        mainPanel.add(contentPanel);
+        
+        // Button panel
+        JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 10));
+        buttonPanel.setBackground(SECONDARY_DARK);
+        JButton exportBtn = createStyledButton("Export");
+        JButton cancelBtn = createStyledButton("Cancel");
+        buttonPanel.add(exportBtn);
+        buttonPanel.add(cancelBtn);
+        
+        dialog.add(mainPanel, BorderLayout.CENTER);
+        dialog.add(buttonPanel, BorderLayout.SOUTH);
+        
+        final ExportOptionsResult[] result = {null};
+        
+        exportBtn.addActionListener(e -> {
+            ExportFormat format = jsonRadio.isSelected() ? ExportFormat.JSON : ExportFormat.CSV;
+            ExportContent content;
+            if (richRadio.isSelected()) content = ExportContent.RICH;
+            else if (trajRadio.isSelected()) content = ExportContent.TRAJECTORIES_ONLY;
+            else content = ExportContent.BOTH;
+            result[0] = new ExportOptionsResult(format, content);
+            dialog.dispose();
+        });
+        
+        cancelBtn.addActionListener(e -> dialog.dispose());
+        
+        // Handle ESC key
+        dialog.getRootPane().registerKeyboardAction(e -> dialog.dispose(),
+            KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0),
+            JComponent.WHEN_IN_FOCUSED_WINDOW);
+        
+        styleDialog(dialog);
+        dialog.pack();
+        dialog.setLocationRelativeTo(frame);
+        dialog.setVisible(true);
+        
+        return result[0];
+    }
+    
+    /**
+     * Export to the specified format and content type.
+     * 
+     * @param format The export format (JSON or CSV)
+     * @param content The content type (RICH or TRAJECTORIES_ONLY)
+     * @param filenameSuffix Suffix to add to the filename
+     * @param startDir Optional starting directory for the file chooser (null to use default)
+     * @return The directory where the file was saved, or null if cancelled
+     */
+    private File exportToFormat(ExportFormat format, ExportContent content, String filenameSuffix, File startDir) throws Exception {
+        String filename = imp.getTitle();
+        if (filename.contains(".")) filename = filename.substring(0, filename.lastIndexOf('.'));
+        
+        String extension = format == ExportFormat.JSON ? ".json" : ".csv";
+        
+        // Build filename based on content type
+        // Rich format: video_rich_annotations.json or video_annotations.json
+        // Trajectories only: video_trajectories.json (no "_annotations" suffix)
+        String exportFileName;
+        if (content == ExportContent.TRAJECTORIES_ONLY) {
+            exportFileName = filename + filenameSuffix + extension;  // e.g., video_trajectories.json
+        } else {
+            exportFileName = filename + filenameSuffix + "_annotations" + extension;  // e.g., video_rich_annotations.json
+        }
+        
+        JFileChooser chooser = createStyledFileChooser();
+        if (format == ExportFormat.JSON) {
+            chooser.setFileFilter(new FileNameExtensionFilter("JSON Files (*.json)", "json"));
+        } else {
+            chooser.setFileFilter(new FileNameExtensionFilter("CSV Files (*.csv)", "csv"));
+        }
+        
+        // Set starting directory if provided, otherwise use filename only
+        if (startDir != null && startDir.isDirectory()) {
+            chooser.setSelectedFile(new File(startDir, exportFileName));
+        } else {
+            chooser.setSelectedFile(new File(exportFileName));
+        }
+        
+        if (chooser.showSaveDialog(frame) != JFileChooser.APPROVE_OPTION) return null;
+        
+        File outputFile = chooser.getSelectedFile();
+        // Ensure correct extension
+        if (!outputFile.getName().toLowerCase().endsWith(extension)) {
+            outputFile = new File(outputFile.getAbsolutePath() + extension);
+        }
+        
+        if (format == ExportFormat.JSON) {
+            exportToJson(outputFile, content);
+        } else {
+            exportToCsv(outputFile, content);
+        }
+        
+        String contentDesc = content == ExportContent.RICH ? "rich format" : "trajectories only";
+        
+        JOptionPane.showMessageDialog(frame, 
+            "Exported " + contentDesc + " to:\n" + outputFile.getAbsolutePath());
+        
+        // Return the parent directory so subsequent exports can start there
+        return outputFile.getParentFile();
+    }
+    
+    /**
+     * Export tracks to JSON format.
+     * 
+     * All coordinates are always scaled to ORIGINAL resolution before saving.
+     * This makes all export files interchangeable regardless of compression state.
+     * On import, coordinates are automatically scaled to the current working resolution.
+     * 
+     * Edge cases handled:
+     * - Empty tracks (skipped)
+     * - Null values for maps/lists (treated as empty/default)
+     * - Negative time values (treated as 0)
+     * - Invalid occlusion segments (validated and skipped if invalid)
+     */
+    private void exportToJson(File outputFile, ExportContent content) throws Exception {
+        JSONObject exportRoot = new JSONObject();
+        
+        // Add metadata
+        JSONObject metadata = new JSONObject();
+        metadata.put("format_type", content == ExportContent.RICH ? "rich" : "trajectories_only");
+        
+        // Store source filename for import validation (only check that remains)
+        if (imp != null && imp.getTitle() != null) {
+            metadata.put("source_filename", imp.getTitle());
+        }
+        metadata.put("total_frames", Math.max(0, totalSlices));  // Ensure non-negative
+        
+        if (content == ExportContent.RICH) {
+            // Add timing metadata for rich export
+            if (sessionStartTime > 0) {
+                long totalSessionTimeMs = System.currentTimeMillis() - sessionStartTime;
+                if (totalSessionTimeMs < 0) totalSessionTimeMs = 0;  // Handle clock skew edge case
+                metadata.put("total_session_time_ms", totalSessionTimeMs);
+                metadata.put("total_session_time_formatted", formatTime(totalSessionTimeMs));
+            }
+            
+            long allTracksTimeMs = 0;
+            int completedCount = 0;
+            int validTrackCount = 0;
+            for (Map.Entry<String, Map<Integer, Point>> entry : trackAnnotations.entrySet()) {
+                String trackId = entry.getKey();
+                Map<Integer, Point> frameMap = entry.getValue();
+                
+                // Skip empty tracks in the count
+                if (frameMap == null || frameMap.isEmpty()) continue;
+                validTrackCount++;
+                
+                long trackTimeMs = trackTotalTime.getOrDefault(trackId, 0L);
+                if (trackTimeMs < 0) trackTimeMs = 0;  // Ensure non-negative
+                
+                Long startTime = trackStartTime.get(trackId);
+                if (startTime != null && startTime > 0) {
+                    long elapsed = System.currentTimeMillis() - startTime;
+                    if (elapsed > 0) trackTimeMs += elapsed;
+                }
+                allTracksTimeMs += trackTimeMs;
+                
+                if (trackCompleted.getOrDefault(trackId, false)) {
+                    completedCount++;
+                }
+            }
+            metadata.put("total_tracks_time_ms", allTracksTimeMs);
+            metadata.put("total_tracks_time_formatted", formatTime(allTracksTimeMs));
+            metadata.put("total_tracks", validTrackCount);
+            metadata.put("completed_tracks", completedCount);
+        }
+        
+        exportRoot.put("metadata", metadata);
+        
+        // Build tracks array - scale all coordinates to original resolution
+        JSONArray tracksArray = new JSONArray();
+        
+        for (Map.Entry<String, Map<Integer, Point>> trackEntry : trackAnnotations.entrySet()) {
+            String trackId = trackEntry.getKey();
+            Map<Integer, Point> frameMap = trackEntry.getValue();
+            
+            // Skip null or empty tracks
+            if (trackId == null || trackId.isEmpty() || frameMap == null || frameMap.isEmpty()) continue;
+            
+            JSONObject trackObj = new JSONObject();
+            trackObj.put("track_id", trackId);
+            
+            // Build annotations array - scale to original resolution
+            JSONArray framesArray = new JSONArray();
+            for (Map.Entry<Integer, Point> frameEntry : frameMap.entrySet()) {
+                Integer frameNum = frameEntry.getKey();
+                Point point = frameEntry.getValue();
+                
+                // Skip null entries
+                if (frameNum == null || point == null) continue;
+                
+                // Scale to original resolution (ensure non-negative)
+                int x = Math.max(0, (int) Math.round(point.x * scaleFactorX));
+                int y = Math.max(0, (int) Math.round(point.y * scaleFactorY));
+                
+                JSONObject frameObj = new JSONObject();
+                frameObj.put("frame", Math.max(0, frameNum));  // Ensure non-negative frame
+                frameObj.put("x", x);
+                frameObj.put("y", y);
+                
+                framesArray.put(frameObj);
+            }
+            
+            // Skip track if no valid annotations
+            if (framesArray.length() == 0) continue;
+            
+            trackObj.put("annotations", framesArray);
+            
+            // Rich content: add color, anchors, timing, trim info
+            if (content == ExportContent.RICH) {
+                Color c = getTrackColor(trackId);
+                if (c == null) c = generateRandomColor();  // Fallback if null
+                
+                JSONObject colorObj = new JSONObject();
+                colorObj.put("r", c.getRed());
+                colorObj.put("g", c.getGreen());
+                colorObj.put("b", c.getBlue());
+                colorObj.put("a", c.getAlpha());
+                trackObj.put("color", colorObj);
+                
+                // Export anchors - scaled to original resolution, with null checks
+                List<Anchor> anchors = trackAnchors.get(trackId);
+                if (anchors != null && !anchors.isEmpty()) {
+                    JSONArray anchorsArray = new JSONArray();
+                    for (Anchor anchor : anchors) {
+                        if (anchor == null) continue;  // Skip null anchors
+                        JSONObject anchorObj = new JSONObject();
+                        anchorObj.put("frame", Math.max(0, anchor.frame));  // Ensure non-negative
+                        anchorObj.put("x", Math.max(0, (int) Math.round(anchor.x * scaleFactorX)));
+                        anchorObj.put("y", Math.max(0, (int) Math.round(anchor.y * scaleFactorY)));
+                        anchorsArray.put(anchorObj);
+                    }
+                    if (anchorsArray.length() > 0) {
+                        trackObj.put("anchors", anchorsArray);
+                    }
+                }
+                
+                // Export optimization state
+                trackObj.put("optimized", trackOptimized.getOrDefault(trackId, false));
+                trackObj.put("selected", trackSelected.getOrDefault(trackId, true));
+                
+                // Export time tracking data with validation
+                boolean isCompleted = trackCompleted.getOrDefault(trackId, false);
+                trackObj.put("completed", isCompleted);
+                long totalTimeMs = trackTotalTime.getOrDefault(trackId, 0L);
+                if (totalTimeMs < 0) totalTimeMs = 0;  // Ensure non-negative
+                
+                Long startTime = trackStartTime.get(trackId);
+                if (startTime != null && startTime > 0) {
+                    long elapsed = System.currentTimeMillis() - startTime;
+                    if (elapsed > 0) totalTimeMs += elapsed;
+                }
+                trackObj.put("time_ms", totalTimeMs);
+                trackObj.put("time_formatted", formatTime(totalTimeMs));
+                
+                // Export trim data - scaled to original resolution with null checks
+                int[] trimRange = trackTrimRange.get(trackId);
+                if (trimRange != null && trimRange.length >= 2) {
+                    JSONObject trimObj = new JSONObject();
+                    trimObj.put("trimmed", true);
+                    trimObj.put("trim_start_frame", Math.max(0, trimRange[0]));
+                    trimObj.put("trim_end_frame", Math.max(0, trimRange[1]));
+                    
+                    Map<Integer, Point> untrimmedAnnotations = trackUntrimmedAnnotations.get(trackId);
+                    if (untrimmedAnnotations != null && !untrimmedAnnotations.isEmpty()) {
+                        JSONArray untrimmedArray = new JSONArray();
+                        for (Map.Entry<Integer, Point> frameEntry : untrimmedAnnotations.entrySet()) {
+                            Integer frameNum = frameEntry.getKey();
+                            Point point = frameEntry.getValue();
+                            if (frameNum == null || point == null) continue;
+                            
+                            JSONObject frameObj = new JSONObject();
+                            frameObj.put("frame", Math.max(0, frameNum));
+                            frameObj.put("x", Math.max(0, (int) Math.round(point.x * scaleFactorX)));
+                            frameObj.put("y", Math.max(0, (int) Math.round(point.y * scaleFactorY)));
+                            untrimmedArray.put(frameObj);
+                        }
+                        if (untrimmedArray.length() > 0) {
+                            trimObj.put("original_annotations", untrimmedArray);
+                            
+                            int origMinFrame = Integer.MAX_VALUE;
+                            int origMaxFrame = Integer.MIN_VALUE;
+                            for (Integer frameNum : untrimmedAnnotations.keySet()) {
+                                if (frameNum == null) continue;
+                                origMinFrame = Math.min(origMinFrame, frameNum);
+                                origMaxFrame = Math.max(origMaxFrame, frameNum);
+                            }
+                            if (origMinFrame != Integer.MAX_VALUE) {
+                                trimObj.put("original_start_frame", origMinFrame);
+                                trimObj.put("original_end_frame", origMaxFrame);
+                            }
+                        }
+                    }
+                    
+                    // Export untrimmed anchors - scaled to original resolution with null checks
+                    List<Anchor> untrimmedAnchors = trackUntrimmedAnchors.get(trackId);
+                    if (untrimmedAnchors != null && !untrimmedAnchors.isEmpty()) {
+                        JSONArray untrimmedAnchorsArray = new JSONArray();
+                        for (Anchor anchor : untrimmedAnchors) {
+                            if (anchor == null) continue;
+                            JSONObject anchorObj = new JSONObject();
+                            anchorObj.put("frame", Math.max(0, anchor.frame));
+                            anchorObj.put("x", Math.max(0, (int) Math.round(anchor.x * scaleFactorX)));
+                            anchorObj.put("y", Math.max(0, (int) Math.round(anchor.y * scaleFactorY)));
+                            untrimmedAnchorsArray.put(anchorObj);
+                        }
+                        if (untrimmedAnchorsArray.length() > 0) {
+                            trimObj.put("original_anchors", untrimmedAnchorsArray);
+                        }
+                    }
+                    trackObj.put("trim_info", trimObj);
+                } else {
+                    JSONObject trimObj = new JSONObject();
+                    trimObj.put("trimmed", false);
+                    trackObj.put("trim_info", trimObj);
+                }
+                
+                // Export occlusion segments (frames where object is NOT visible) with validation
+                List<int[]> occlusionSegments = trackOcclusionSegments.get(trackId);
+                if (occlusionSegments != null && !occlusionSegments.isEmpty()) {
+                    JSONArray segmentsArray = new JSONArray();
+                    for (int[] seg : occlusionSegments) {
+                        // Validate segment structure and values
+                        if (seg == null || seg.length < 2) continue;
+                        int segStart = Math.max(0, seg[0]);
+                        int segEnd = Math.max(0, seg[1]);
+                        if (segEnd < segStart) continue;  // Skip invalid segments
+                        
+                        JSONObject segObj = new JSONObject();
+                        segObj.put("start", segStart);
+                        segObj.put("end", segEnd);
+                        segmentsArray.put(segObj);
+                    }
+                    if (segmentsArray.length() > 0) {
+                        trackObj.put("occlusion_segments", segmentsArray);
+                    }
+                }
+            }
+            
+            tracksArray.put(trackObj);
+        }
+        
+        exportRoot.put("tracks", tracksArray);
+        
+        try (FileWriter fw = new FileWriter(outputFile)) {
+            fw.write(exportRoot.toString(2));
+        }
+    }
+    
+    /**
+     * Export tracks to CSV format.
+     * 
+     * All coordinates are always scaled to ORIGINAL resolution before saving.
+     * This makes all export files interchangeable regardless of compression state.
+     */
+    private void exportToCsv(File outputFile, ExportContent content) throws Exception {
+        try (PrintWriter pw = new PrintWriter(new BufferedWriter(new FileWriter(outputFile)))) {
+            // Write metadata comment header (just source filename for validation)
+            writeCsvMetadataHeader(pw, content);
+            
+            // Write header and data based on content type
+            if (content == ExportContent.RICH) {
+                writeRichCsvHeader(pw);
+                writeRichCsvData(pw);
+            } else {
+                writeTrajectoriesCsvHeader(pw);
+                writeTrajectoriesCsvData(pw);
+            }
+        }
+    }
+    
+    /**
+     * Writes a metadata comment header to CSV files.
+     * Format: # RIPPLE_META: key1=value1; key2=value2; ...
+     * For rich format, also writes track-level summary comments with time, trim, and occlusion data.
+     */
+    private void writeCsvMetadataHeader(PrintWriter pw, ExportContent content) {
+        StringBuilder meta = new StringBuilder("# RIPPLE_META: ");
+        meta.append("format_type=").append(content == ExportContent.RICH ? "rich" : "trajectories_only").append("; ");
+        
+        // Store source filename for validation (only check that remains)
+        if (imp != null && imp.getTitle() != null) {
+            meta.append("source_filename=").append(imp.getTitle().replace(";", "_")).append("; ");
+        }
+        
+        meta.append("total_frames=").append(totalSlices);
+        pw.println(meta.toString());
+        
+        // For rich format, write track-level summary comments with data that shouldn't be repeated per-row
+        if (content == ExportContent.RICH) {
+            writeCsvTrackSummaries(pw);
+        }
+    }
+    
+    /**
+     * Writes track-level summary comments for rich CSV format.
+     * Format: # TRACK_SUMMARY: track_id=X; time_ms=Y; completed=Z; trim_start=A; trim_end=B; occlusion_segments=[[s1,e1],[s2,e2]]; ...
+     * This avoids repeating track-level data on every row.
+     */
+    private void writeCsvTrackSummaries(PrintWriter pw) {
+        for (Map.Entry<String, Map<Integer, Point>> trackEntry : trackAnnotations.entrySet()) {
+            String trackId = trackEntry.getKey();
+            Map<Integer, Point> frameMap = trackEntry.getValue();
+            
+            if (frameMap == null || frameMap.isEmpty()) continue;
+            
+            StringBuilder summary = new StringBuilder("# TRACK_SUMMARY: ");
+            summary.append("track_id=").append(escapeCsvMetaValue(trackId)).append("; ");
+            
+            // Time tracking - compute current total including any active timer
+            long timeMs = trackTotalTime.getOrDefault(trackId, 0L);
+            Long startTime = trackStartTime.get(trackId);
+            if (startTime != null && startTime > 0) {
+                timeMs += System.currentTimeMillis() - startTime;
+            }
+            summary.append("time_ms=").append(timeMs).append("; ");
+            summary.append("completed=").append(trackCompleted.getOrDefault(trackId, false)).append("; ");
+            summary.append("optimized=").append(trackOptimized.getOrDefault(trackId, false)).append("; ");
+            summary.append("selected=").append(trackSelected.getOrDefault(trackId, true)).append("; ");
+            
+            // Trim data
+            int[] trimRange = trackTrimRange.get(trackId);
+            if (trimRange != null && trimRange.length >= 2) {
+                summary.append("trimmed=true; ");
+                summary.append("trim_start_frame=").append(trimRange[0]).append("; ");
+                summary.append("trim_end_frame=").append(trimRange[1]).append("; ");
+                
+                // Export original frame range from untrimmed data
+                Map<Integer, Point> untrimmedAnnotations = trackUntrimmedAnnotations.get(trackId);
+                if (untrimmedAnnotations != null && !untrimmedAnnotations.isEmpty()) {
+                    int origMinFrame = Integer.MAX_VALUE;
+                    int origMaxFrame = Integer.MIN_VALUE;
+                    for (int frameNum : untrimmedAnnotations.keySet()) {
+                        origMinFrame = Math.min(origMinFrame, frameNum);
+                        origMaxFrame = Math.max(origMaxFrame, frameNum);
+                    }
+                    if (origMinFrame != Integer.MAX_VALUE) {
+                        summary.append("original_start_frame=").append(origMinFrame).append("; ");
+                        summary.append("original_end_frame=").append(origMaxFrame).append("; ");
+                    }
+                }
+            } else {
+                summary.append("trimmed=false; ");
+            }
+            
+            // Occlusion segments - export as compact array notation
+            List<int[]> occlusionSegments = trackOcclusionSegments.get(trackId);
+            if (occlusionSegments != null && !occlusionSegments.isEmpty()) {
+                StringBuilder segBuilder = new StringBuilder("[");
+                for (int i = 0; i < occlusionSegments.size(); i++) {
+                    int[] seg = occlusionSegments.get(i);
+                    if (seg != null && seg.length >= 2) {
+                        if (i > 0) segBuilder.append(",");
+                        segBuilder.append("[").append(seg[0]).append(",").append(seg[1]).append("]");
+                    }
+                }
+                segBuilder.append("]");
+                summary.append("occlusion_segments=").append(segBuilder.toString());
+            } else {
+                summary.append("occlusion_segments=[]");
+            }
+            
+            pw.println(summary.toString());
+        }
+    }
+    
+    /**
+     * Escape a value for use in CSV metadata comments.
+     * Replaces semicolons and equals signs which are used as delimiters.
+     */
+    private String escapeCsvMetaValue(String value) {
+        if (value == null) return "";
+        return value.replace(";", "_").replace("=", "_");
+    }
+    
+    private void writeRichCsvHeader(PrintWriter pw) {
+        pw.println("track_id,frame,x,y,is_anchor,color_r,color_g,color_b,color_a,optimized,selected,completed,time_ms,occluded");
+    }
+    
+    /**
+     * Write rich CSV data with coordinates scaled to original resolution.
+     * 
+     * Edge cases handled:
+     * - Null/empty tracks (skipped)
+     * - Null points (skipped)
+     * - Null colors (fallback to random)
+     * - Negative time values (treated as 0)
+     * - Invalid occlusion segments (validated)
+     */
+    private void writeRichCsvData(PrintWriter pw) {
+        for (Map.Entry<String, Map<Integer, Point>> trackEntry : trackAnnotations.entrySet()) {
+            String trackId = trackEntry.getKey();
+            Map<Integer, Point> frameMap = trackEntry.getValue();
+            
+            // Skip null or empty entries
+            if (trackId == null || trackId.isEmpty() || frameMap == null || frameMap.isEmpty()) continue;
+            
+            Color c = getTrackColor(trackId);
+            if (c == null) c = generateRandomColor();  // Fallback for null color
+            
+            List<Anchor> anchors = trackAnchors.getOrDefault(trackId, new ArrayList<>());
+            Set<Integer> anchorFrames = new HashSet<>();
+            for (Anchor a : anchors) {
+                if (a != null) anchorFrames.add(a.frame);
+            }
+            
+            boolean optimized = trackOptimized.getOrDefault(trackId, false);
+            boolean selected = trackSelected.getOrDefault(trackId, true);
+            boolean completed = trackCompleted.getOrDefault(trackId, false);
+            long timeMs = trackTotalTime.getOrDefault(trackId, 0L);
+            if (timeMs < 0) timeMs = 0;  // Ensure non-negative
+            
+            Long startTime = trackStartTime.get(trackId);
+            if (startTime != null && startTime > 0) {
+                long elapsed = System.currentTimeMillis() - startTime;
+                if (elapsed > 0) timeMs += elapsed;
+            }
+            
+            // Get occlusion segments for this track (with null validation)
+            List<int[]> occlusionSegments = trackOcclusionSegments.getOrDefault(trackId, new ArrayList<>());
+            
+            for (Map.Entry<Integer, Point> frameEntry : frameMap.entrySet()) {
+                Integer frameNum = frameEntry.getKey();
+                Point point = frameEntry.getValue();
+                
+                // Skip null entries
+                if (frameNum == null || point == null) continue;
+                
+                // Scale to original resolution (ensure non-negative)
+                int x = Math.max(0, (int) Math.round(point.x * scaleFactorX));
+                int y = Math.max(0, (int) Math.round(point.y * scaleFactorY));
+                int validFrameNum = Math.max(0, frameNum);
+                
+                // Check if this frame is in an occlusion segment (with validation)
+                boolean occluded = false;
+                for (int[] segment : occlusionSegments) {
+                    if (segment != null && segment.length >= 2 && 
+                        validFrameNum >= segment[0] && validFrameNum <= segment[1]) {
+                        occluded = true;
+                        break;
+                    }
+                }
+                
+                StringBuilder line = new StringBuilder();
+                line.append(escapeCsv(trackId)).append(",");
+                line.append(validFrameNum).append(",");
+                line.append(x).append(",").append(y);
+                line.append(",").append(anchorFrames.contains(frameNum));
+                line.append(",").append(c.getRed());
+                line.append(",").append(c.getGreen());
+                line.append(",").append(c.getBlue());
+                line.append(",").append(c.getAlpha());
+                line.append(",").append(optimized);
+                line.append(",").append(selected);
+                line.append(",").append(completed);
+                line.append(",").append(timeMs);
+                line.append(",").append(occluded);
+                
+                pw.println(line.toString());
+            }
+        }
+    }
+    
+    private void writeTrajectoriesCsvHeader(PrintWriter pw) {
+        pw.println("track_id,frame,x,y");
+    }
+    
+    /**
+     * Write trajectory CSV data with coordinates scaled to original resolution.
+     * 
+     * Edge cases handled:
+     * - Null/empty tracks (skipped)
+     * - Null points (skipped)
+     * - Negative coordinates (clamped to 0)
+     */
+    private void writeTrajectoriesCsvData(PrintWriter pw) {
+        for (Map.Entry<String, Map<Integer, Point>> trackEntry : trackAnnotations.entrySet()) {
+            String trackId = trackEntry.getKey();
+            Map<Integer, Point> frameMap = trackEntry.getValue();
+            
+            // Skip null or empty entries
+            if (trackId == null || trackId.isEmpty() || frameMap == null || frameMap.isEmpty()) continue;
+            
+            for (Map.Entry<Integer, Point> frameEntry : frameMap.entrySet()) {
+                Integer frameNum = frameEntry.getKey();
+                Point point = frameEntry.getValue();
+                
+                // Skip null entries
+                if (frameNum == null || point == null) continue;
+                
+                // Scale to original resolution (ensure non-negative)
+                int x = Math.max(0, (int) Math.round(point.x * scaleFactorX));
+                int y = Math.max(0, (int) Math.round(point.y * scaleFactorY));
+                int validFrameNum = Math.max(0, frameNum);
+                
+                StringBuilder line = new StringBuilder();
+                line.append(escapeCsv(trackId)).append(",");
+                line.append(validFrameNum).append(",");
+                line.append(x).append(",").append(y);
+                
+                pw.println(line.toString());
+            }
+        }
+    }
+    
+    private String escapeCsv(String value) {
+        if (value == null) return "";
+        // If value contains comma, quote, or newline, wrap in quotes and escape internal quotes
+        if (value.contains(",") || value.contains("\"") || value.contains("\n") || value.contains("\r")) {
+            return "\"" + value.replace("\"", "\"\"") + "\"";
+        }
+        return value;
+    }
+
+    /**
+     * Import annotations from a file.
+     * 
+     * Simplified workflow:
+     * 1. Check filename match (warns if annotation file was for a different video)
+     * 2. Coordinates are automatically scaled from original resolution to current working resolution
+     *    (all exported files contain coordinates in original resolution)
+     * 
+     * No resolution validation is needed because all coordinates are in original resolution
+     * and are automatically scaled to match the current video's working resolution.
+     */
+    private void importAnnotations() {
+        if (imp == null) {
+            JOptionPane.showMessageDialog(frame, "Please open an image first.");
+            return;
+        }
+        
+        JFileChooser chooser = createStyledFileChooser();
+        chooser.setFileFilter(new FileNameExtensionFilter("Annotation Files (*.json, *.csv)", "json", "csv"));
+
+        while (true) {
+            if (chooser.showOpenDialog(frame) != JFileChooser.APPROVE_OPTION) return;
+            
+            File selectedFile = chooser.getSelectedFile();
+            String filename = selectedFile.getName().toLowerCase();
+            
+            try {
+                // Read file content for format detection and filename validation
+                String content = new String(Files.readAllBytes(selectedFile.toPath()), StandardCharsets.UTF_8);
+                content = content.trim();
+                
+                if (content.isEmpty()) {
+                    JOptionPane.showMessageDialog(frame, "The file is empty.", "Import Error", JOptionPane.ERROR_MESSAGE);
+                    continue; // Let user pick another file
+                }
+                
+                // Check for filename mismatch
+                String sourceFilename = extractSourceFilename(content, filename);
+                if (sourceFilename != null && imp != null && imp.getTitle() != null) {
+                    String currentFilename = imp.getTitle();
+                    if (!filenamesMatch(sourceFilename, currentFilename)) {
+                        int choice = JOptionPane.showOptionDialog(frame,
+                            "Warning: Filename mismatch detected!\n\n" +
+                            "The annotation file was created for:\n  \"" + sourceFilename + "\"\n\n" +
+                            "But the currently open volume is:\n  \"" + currentFilename + "\"\n\n" +
+                            "Do you still want to import these annotations?",
+                            "Filename Mismatch",
+                            JOptionPane.YES_NO_CANCEL_OPTION,
+                            JOptionPane.WARNING_MESSAGE,
+                            null,
+                            new String[]{"Import Anyway", "Choose Different File", "Cancel"},
+                            "Choose Different File");
+                        
+                        if (choice == 1) {
+                            // User wants to choose a different file
+                            continue;
+                        } else if (choice != 0) {
+                            // User cancelled or closed dialog
+                            return;
+                        }
+                        // choice == 0: Import anyway, continue with import
+                    }
+                }
+                
+                // Perform the actual import (resolution validation happens inside these functions)
+                if (filename.endsWith(".csv")) {
+                    importFromCsvContent(content);
+                } else {
+                    char firstChar = content.charAt(0);
+                    if (firstChar == '{' || firstChar == '[') {
+                        importFromJson(content);
+                    } else {
+                        // Assume CSV
+                        importFromCsvContent(content);
+                    }
+                }
+                
+                // In multi-seed mode, mark all imported tracks as optimized
+                // (since they represent complete trajectories ready for use)
+                if (isMultiSeedMode()) {
+                    for (String trackId : trackAnnotations.keySet()) {
+                        trackOptimized.put(trackId, true);
+                    }
+                }
+                
+                // Ensure first track is selected after import
+                ensureFirstTrackSelected();
+                
+                loadSliceImage();
+                refreshAnnotationList();
+                JOptionPane.showMessageDialog(frame, "Annotations imported successfully.");
+                return; // Success, exit the loop
+                
+            } catch (Exception ex) {
+                ex.printStackTrace();
+                JOptionPane.showMessageDialog(frame, "Failed to import annotations: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+                // Let user try again with a different file
+            }
+        }
+    }
+    
+    /**
+     * Extracts the source filename from annotation file content.
+     * Works for both JSON and CSV formats.
+     */
+    private String extractSourceFilename(String content, String annotationFilename) {
+        try {
+            if (content.startsWith("{")) {
+                // JSON format with metadata
+                JSONObject root = new JSONObject(content);
+                if (root.has("metadata")) {
+                    JSONObject metadata = root.getJSONObject("metadata");
+                    if (metadata.has("source_filename")) {
+                        return metadata.getString("source_filename");
+                    }
+                }
+            } else if (content.startsWith("# RIPPLE_META:")) {
+                // CSV with metadata header - parse inline
+                String metaLine = content.split("\\r?\\n", 2)[0];
+                metaLine = metaLine.substring("# RIPPLE_META:".length()).trim();
+                for (String pair : metaLine.split(";")) {
+                    pair = pair.trim();
+                    if (pair.startsWith("source_filename=")) {
+                        return pair.substring("source_filename=".length()).trim();
+                    }
+                }
+            }
+            // For CSV or JSON without metadata, try to infer from annotation filename
+            // e.g., "video_annotations.json" -> "video"
+            // This is a fallback heuristic
+            String baseName = annotationFilename;
+            if (baseName.toLowerCase().endsWith(".json") || baseName.toLowerCase().endsWith(".csv")) {
+                baseName = baseName.substring(0, baseName.lastIndexOf('.'));
+            }
+            // Remove common suffixes
+            String[] suffixesToRemove = {"_annotations", "_rich", "_trajectories", "_compressed", "_original_res", "_dual_res"};
+            for (String suffix : suffixesToRemove) {
+                if (baseName.toLowerCase().endsWith(suffix.toLowerCase())) {
+                    baseName = baseName.substring(0, baseName.length() - suffix.length());
+                }
+            }
+            // If the base name is not empty and different from original, return it as a hint
+            if (!baseName.isEmpty() && !baseName.equals(annotationFilename)) {
+                return baseName + " (inferred)";
+            }
+        } catch (Exception e) {
+            // Ignore parsing errors
+        }
+        return null;
+    }
+    
+    /**
+     * Checks if two filenames match, ignoring extensions, paths, and common variations.
+     */
+    private boolean filenamesMatch(String filename1, String filename2) {
+        if (filename1 == null || filename2 == null) return true; // Can't compare, assume match
+        
+        // Remove "(inferred)" suffix if present
+        filename1 = filename1.replace(" (inferred)", "").trim();
+        filename2 = filename2.replace(" (inferred)", "").trim();
+        
+        // Extract just the filename from paths (handle both / and \ separators)
+        if (filename1.contains("/")) {
+            filename1 = filename1.substring(filename1.lastIndexOf('/') + 1);
+        }
+        if (filename1.contains("\\")) {
+            filename1 = filename1.substring(filename1.lastIndexOf('\\') + 1);
+        }
+        if (filename2.contains("/")) {
+            filename2 = filename2.substring(filename2.lastIndexOf('/') + 1);
+        }
+        if (filename2.contains("\\")) {
+            filename2 = filename2.substring(filename2.lastIndexOf('\\') + 1);
+        }
+        
+        // Strip file extensions
+        String base1 = filename1.contains(".") ? filename1.substring(0, filename1.lastIndexOf('.')) : filename1;
+        String base2 = filename2.contains(".") ? filename2.substring(0, filename2.lastIndexOf('.')) : filename2;
+        
+        // Case-insensitive comparison
+        return base1.equalsIgnoreCase(base2);
+    }
+    
+    /**
+     * Clamps a coordinate value to valid bounds [0, maxValue-1].
+     * Used to ensure scaled coordinates don't exceed image dimensions.
+     * 
+     * @param coord The coordinate value to clamp
+     * @param maxValue The exclusive upper bound (image width or height)
+     * @return The clamped coordinate value
+     */
+    private int clampCoordinate(int coord, int maxValue) {
+        return Math.max(0, Math.min(coord, maxValue - 1));
+    }
+    
+    private void importFromCsv(File file) throws Exception {
+        String content = new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
+        importFromCsvContent(content);
+    }
+    
+    /**
+     * Import tracks from CSV content.
+     * 
+     * All coordinates in the file are in ORIGINAL resolution.
+     * If the current video is compressed (scaleFactorX/Y > 1), coordinates are
+     * automatically scaled down to match the current working resolution.
+     * No resolution validation needed - just scale and import.
+     * 
+     * Also parses TRACK_SUMMARY comments for time, trim, and occlusion data.
+     */
+    private void importFromCsvContent(String content) throws Exception {
+        // Clear existing data
+        clearAllTrackData();
+        
+        String[] lines = content.split("\\r?\\n");
+        
+        // First pass: parse TRACK_SUMMARY comments for track-level data
+        Map<String, Map<String, String>> trackSummaries = new HashMap<>();
+        for (String line : lines) {
+            if (line.startsWith("# TRACK_SUMMARY:")) {
+                Map<String, String> summary = parseCsvMetaLine(line.substring("# TRACK_SUMMARY:".length()).trim());
+                String trackId = summary.get("track_id");
+                if (trackId != null && !trackId.isEmpty()) {
+                    trackSummaries.put(trackId, summary);
+                }
+            }
+        }
+        
+        // Find the header line (skip all comment lines)
+        int headerLine = 0;
+        for (int i = 0; i < lines.length; i++) {
+            String line = lines[i].trim();
+            if (!line.isEmpty() && !line.startsWith("#")) {
+                headerLine = i;
+                break;
+            }
+        }
+        
+        if (headerLine >= lines.length - 1) {
+            throw new Exception("CSV file must have at least a header and one data row");
+        }
+        
+        // Parse header to determine column indices
+        String[] header = parseCsvLine(lines[headerLine]);
+        Map<String, Integer> colIndex = new HashMap<>();
+        for (int i = 0; i < header.length; i++) {
+            colIndex.put(header[i].trim().toLowerCase(), i);
+        }
+        
+        // Required columns
+        Integer trackIdCol = colIndex.get("track_id");
+        Integer frameCol = colIndex.get("frame");
+        Integer xCol = colIndex.get("x");
+        Integer yCol = colIndex.get("y");
+        
+        if (trackIdCol == null || frameCol == null || xCol == null || yCol == null) {
+            throw new Exception("CSV must have columns: track_id, frame, x, y");
+        }
+        
+        // Optional columns for rich format
+        Integer isAnchorCol = colIndex.get("is_anchor");
+        Integer colorRCol = colIndex.get("color_r");
+        Integer colorGCol = colIndex.get("color_g");
+        Integer colorBCol = colIndex.get("color_b");
+        Integer colorACol = colIndex.get("color_a");
+        Integer optimizedCol = colIndex.get("optimized");
+        Integer selectedCol = colIndex.get("selected");
+        Integer completedCol = colIndex.get("completed");
+        Integer timeMsCol = colIndex.get("time_ms");
+        Integer occludedCol = colIndex.get("occluded");
+        
+        boolean isRichFormat = colorRCol != null;
+        boolean hasTrackSummaries = !trackSummaries.isEmpty();
+        
+        // Get working dimensions for coordinate clamping
+        int workingWidth = (imp != null) ? imp.getWidth() : Integer.MAX_VALUE;
+        int workingHeight = (imp != null) ? imp.getHeight() : Integer.MAX_VALUE;
+        
+        int maxTrackNum = 0;
+        Map<String, Boolean> trackPropertiesSet = new HashMap<>();
+        
+        // For reconstructing occlusion segments from per-row occluded flags (fallback)
+        Map<String, List<Integer>> trackOccludedFrames = new HashMap<>();
+        
+        // Process data rows - start after header
+        int dataStartLine = headerLine + 1;
+        for (int lineNum = dataStartLine; lineNum < lines.length; lineNum++) {
+            String line = lines[lineNum].trim();
+            if (line.isEmpty() || line.startsWith("#")) continue; // Skip empty lines and comments
+            
+            String[] values = parseCsvLine(line);
+            if (values.length < 4) {
+                System.err.println("Skipping malformed line " + (lineNum + 1) + ": " + line);
+                continue;
+            }
+            
+            try {
+                String trackId = values[trackIdCol].trim();
+                if (trackId.isEmpty()) continue;
+                
+                // Validate frame number
+                int frameNum;
+                try {
+                    frameNum = Integer.parseInt(values[frameCol].trim());
+                    if (frameNum < 0) {
+                        System.err.println("Warning: Negative frame number " + frameNum + " at line " + (lineNum + 1) + ", treating as 0");
+                        frameNum = 0;
+                    }
+                } catch (NumberFormatException e) {
+                    System.err.println("Skipping line " + (lineNum + 1) + ": invalid frame number");
+                    continue;
+                }
+                
+                // Parse and validate coordinates
+                int rawX, rawY;
+                try {
+                    rawX = Integer.parseInt(values[xCol].trim());
+                    rawY = Integer.parseInt(values[yCol].trim());
+                } catch (NumberFormatException e) {
+                    System.err.println("Skipping line " + (lineNum + 1) + ": invalid coordinates");
+                    continue;
+                }
+                
+                // Scale from original resolution to current (divide by scale factor) and clamp
+                int x = clampCoordinate((int) Math.round(rawX / scaleFactorX), workingWidth);
+                int y = clampCoordinate((int) Math.round(rawY / scaleFactorY), workingHeight);
+                
+                // Initialize track if needed
+                if (!trackAnnotations.containsKey(trackId)) {
+                    trackAnnotations.put(trackId, new HashMap<>());
+                    trackAnchors.put(trackId, new ArrayList<>());
+                    trackPropertiesSet.put(trackId, false);
+                    trackOccludedFrames.put(trackId, new ArrayList<>());
+                    
+                    try {
+                        String numStr = trackId.replaceAll("[^0-9]", "");
+                        if (!numStr.isEmpty()) {
+                            maxTrackNum = Math.max(maxTrackNum, Integer.parseInt(numStr));
+                        }
+                    } catch (NumberFormatException ignored) {}
+                }
+                
+                // Add annotation point
+                trackAnnotations.get(trackId).put(frameNum, new Point(x, y));
+                
+                // Track occluded frames for fallback segment reconstruction
+                if (occludedCol != null && values.length > occludedCol) {
+                    boolean occluded = Boolean.parseBoolean(values[occludedCol].trim());
+                    if (occluded) {
+                        trackOccludedFrames.get(trackId).add(frameNum);
+                    }
+                }
+                
+                // Process rich format data from row (only once per track, as fallback)
+                if (isRichFormat && !trackPropertiesSet.get(trackId)) {
+                    // Color
+                    if (colorRCol != null && colorACol != null && values.length > colorACol) {
+                        try {
+                            int r = clampColorValue(Integer.parseInt(values[colorRCol].trim()));
+                            int g = clampColorValue(Integer.parseInt(values[colorGCol].trim()));
+                            int b = clampColorValue(Integer.parseInt(values[colorBCol].trim()));
+                            int a = clampColorValue(Integer.parseInt(values[colorACol].trim()));
+                            trackColors.put(trackId, new Color(r, g, b, a));
+                        } catch (NumberFormatException e) {
+                            trackColors.put(trackId, generateRandomColor());
+                        }
+                    }
+                    
+                    // If we have TRACK_SUMMARY data, use it; otherwise fall back to row data
+                    if (hasTrackSummaries && trackSummaries.containsKey(trackId)) {
+                        Map<String, String> summary = trackSummaries.get(trackId);
+                        applyTrackSummaryData(trackId, summary);
+                    } else {
+                        // Fallback: use row-level data
+                        if (optimizedCol != null && values.length > optimizedCol) {
+                            trackOptimized.put(trackId, Boolean.parseBoolean(values[optimizedCol].trim()));
+                        }
+                        if (selectedCol != null && values.length > selectedCol) {
+                            trackSelected.put(trackId, Boolean.parseBoolean(values[selectedCol].trim()));
+                        }
+                        if (completedCol != null && values.length > completedCol) {
+                            trackCompleted.put(trackId, Boolean.parseBoolean(values[completedCol].trim()));
+                        }
+                        if (timeMsCol != null && values.length > timeMsCol) {
+                            try {
+                                trackTotalTime.put(trackId, Long.parseLong(values[timeMsCol].trim()));
+                            } catch (NumberFormatException e) {
+                                trackTotalTime.put(trackId, 0L);
+                            }
+                        }
+                    }
+                    trackStartTime.put(trackId, 0L);
+                    
+                    trackPropertiesSet.put(trackId, true);
+                }
+                
+                // Handle anchors (x,y already scaled above)
+                if (isAnchorCol != null && values.length > isAnchorCol) {
+                    boolean isAnchor = Boolean.parseBoolean(values[isAnchorCol].trim());
+                    if (isAnchor) {
+                        List<Anchor> anchors = trackAnchors.get(trackId);
+                        // Check if anchor already exists for this frame
+                        boolean exists = false;
+                        for (Anchor a : anchors) {
+                            if (a.frame == frameNum) {
+                                exists = true;
+                                break;
+                            }
+                        }
+                        if (!exists) {
+                            anchors.add(new Anchor(frameNum, x, y));
+                        }
+                    }
+                }
+                
+                // Assign default values if not set
+                if (!trackColors.containsKey(trackId)) {
+                    trackColors.put(trackId, generateRandomColor());
+                }
+                if (!trackOptimized.containsKey(trackId)) {
+                    trackOptimized.put(trackId, false);
+                }
+                if (!trackSelected.containsKey(trackId)) {
+                    trackSelected.put(trackId, true);
+                }
+                if (!trackCompleted.containsKey(trackId)) {
+                    trackCompleted.put(trackId, false);
+                }
+                if (!trackTotalTime.containsKey(trackId)) {
+                    trackTotalTime.put(trackId, 0L);
+                }
+                if (!trackStartTime.containsKey(trackId)) {
+                    trackStartTime.put(trackId, 0L);
+                }
+                
+            } catch (NumberFormatException e) {
+                System.err.println("Skipping line " + (lineNum + 1) + " due to number format error: " + e.getMessage());
+            }
+        }
+        
+        // If no TRACK_SUMMARY data, reconstruct occlusion segments from per-row flags
+        for (Map.Entry<String, List<Integer>> entry : trackOccludedFrames.entrySet()) {
+            String trackId = entry.getKey();
+            List<Integer> occludedFrames = entry.getValue();
+            
+            // Only process if we don't already have occlusion segments from TRACK_SUMMARY
+            if (!trackOcclusionSegments.containsKey(trackId) && !occludedFrames.isEmpty()) {
+                List<int[]> segments = reconstructOcclusionSegments(occludedFrames);
+                if (!segments.isEmpty()) {
+                    trackOcclusionSegments.put(trackId, segments);
+                }
+            }
+        }
+        
+        trackCounter = maxTrackNum + 1;
+    }
+    
+    /**
+     * Clamps a color component value to valid range [0, 255].
+     */
+    private int clampColorValue(int value) {
+        return Math.max(0, Math.min(255, value));
+    }
+    
+    /**
+     * Parse a metadata line in key=value; format.
+     */
+    private Map<String, String> parseCsvMetaLine(String line) {
+        Map<String, String> result = new HashMap<>();
+        String[] parts = line.split(";");
+        for (String part : parts) {
+            part = part.trim();
+            int eqIdx = part.indexOf('=');
+            if (eqIdx > 0) {
+                String key = part.substring(0, eqIdx).trim();
+                String value = part.substring(eqIdx + 1).trim();
+                result.put(key, value);
+            }
+        }
+        return result;
+    }
+    
+    /**
+     * Apply track-level data from TRACK_SUMMARY comment.
+     */
+    private void applyTrackSummaryData(String trackId, Map<String, String> summary) {
+        // Time
+        String timeMs = summary.get("time_ms");
+        if (timeMs != null) {
+            try {
+                trackTotalTime.put(trackId, Long.parseLong(timeMs));
+            } catch (NumberFormatException e) {
+                trackTotalTime.put(trackId, 0L);
+            }
+        }
+        
+        // Completed
+        String completed = summary.get("completed");
+        if (completed != null) {
+            trackCompleted.put(trackId, Boolean.parseBoolean(completed));
+        }
+        
+        // Optimized
+        String optimized = summary.get("optimized");
+        if (optimized != null) {
+            trackOptimized.put(trackId, Boolean.parseBoolean(optimized));
+        }
+        
+        // Selected
+        String selected = summary.get("selected");
+        if (selected != null) {
+            trackSelected.put(trackId, Boolean.parseBoolean(selected));
+        }
+        
+        // Trim data
+        String trimmed = summary.get("trimmed");
+        if ("true".equalsIgnoreCase(trimmed)) {
+            String trimStart = summary.get("trim_start_frame");
+            String trimEnd = summary.get("trim_end_frame");
+            if (trimStart != null && trimEnd != null) {
+                try {
+                    int start = Integer.parseInt(trimStart);
+                    int end = Integer.parseInt(trimEnd);
+                    trackTrimRange.put(trackId, new int[]{start, end});
+                } catch (NumberFormatException ignored) {}
+            }
+        }
+        
+        // Occlusion segments
+        String occlusionStr = summary.get("occlusion_segments");
+        if (occlusionStr != null && !occlusionStr.equals("[]")) {
+            List<int[]> segments = parseOcclusionSegmentsArray(occlusionStr);
+            if (!segments.isEmpty()) {
+                trackOcclusionSegments.put(trackId, segments);
+            }
+        }
+    }
+    
+    /**
+     * Parse occlusion segments from array notation like [[1,5],[10,15]].
+     */
+    private List<int[]> parseOcclusionSegmentsArray(String arrayStr) {
+        List<int[]> segments = new ArrayList<>();
+        // Remove outer brackets and split on "],["
+        arrayStr = arrayStr.trim();
+        if (arrayStr.startsWith("[")) arrayStr = arrayStr.substring(1);
+        if (arrayStr.endsWith("]")) arrayStr = arrayStr.substring(0, arrayStr.length() - 1);
+        
+        if (arrayStr.isEmpty()) return segments;
+        
+        // Pattern to match [start,end] pairs
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("\\[(\\d+),(\\d+)\\]");
+        java.util.regex.Matcher matcher = pattern.matcher(arrayStr);
+        
+        while (matcher.find()) {
+            try {
+                int start = Integer.parseInt(matcher.group(1));
+                int end = Integer.parseInt(matcher.group(2));
+                if (start <= end) {  // Validate segment
+                    segments.add(new int[]{start, end});
+                }
+            } catch (NumberFormatException ignored) {}
+        }
+        
+        return segments;
+    }
+    
+    /**
+     * Reconstruct occlusion segments from a list of individual occluded frame numbers.
+     * Consecutive frames are merged into segments.
+     */
+    private List<int[]> reconstructOcclusionSegments(List<Integer> occludedFrames) {
+        List<int[]> segments = new ArrayList<>();
+        if (occludedFrames.isEmpty()) return segments;
+        
+        // Sort frame numbers
+        Collections.sort(occludedFrames);
+        
+        int segStart = occludedFrames.get(0);
+        int segEnd = segStart;
+        
+        for (int i = 1; i < occludedFrames.size(); i++) {
+            int frame = occludedFrames.get(i);
+            if (frame == segEnd + 1) {
+                // Consecutive, extend segment
+                segEnd = frame;
+            } else {
+                // Gap found, save current segment and start new one
+                segments.add(new int[]{segStart, segEnd});
+                segStart = frame;
+                segEnd = frame;
+            }
+        }
+        
+        // Add final segment
+        segments.add(new int[]{segStart, segEnd});
+        
+        return segments;
+    }
+    
+    private String[] parseCsvLine(String line) {
+        List<String> values = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        boolean inQuotes = false;
+        
+        for (int i = 0; i < line.length(); i++) {
+            char c = line.charAt(i);
+            
+            if (inQuotes) {
+                if (c == '"') {
+                    // Check for escaped quote
+                    if (i + 1 < line.length() && line.charAt(i + 1) == '"') {
+                        current.append('"');
+                        i++; // Skip next quote
+                    } else {
+                        inQuotes = false;
+                    }
+                } else {
+                    current.append(c);
+                }
+            } else {
+                if (c == '"') {
+                    inQuotes = true;
+                } else if (c == ',') {
+                    values.add(current.toString());
+                    current = new StringBuilder();
+                } else {
+                    current.append(c);
+                }
+            }
+        }
+        values.add(current.toString());
+        
+        return values.toArray(new String[0]);
+    }
+    
+    private void clearAllTrackData() {
+        trackAnnotations.clear();
+        trackColors.clear();
+        trackAnchors.clear();
+        trackOptimized.clear();
+        trackSelected.clear();
+        trackTotalTime.clear();
+        trackStartTime.clear();
+        trackCompleted.clear();
+        trackUntrimmedAnnotations.clear();
+        trackUntrimmedAnchors.clear();
+        trackTrimRange.clear();
+        trackVisibleSegments.clear();  // Clear occlusion data
+        trackSmoothing.clear();  // Clear smoothing state
+        trackOriginalAnnotations.clear();  // Clear smoothing original data
+        selectedTrackId = null;
+    }
+    
+    /**
+     * Import tracks from JSON content.
+     * 
+     * All coordinates in the file are in ORIGINAL resolution.
+     * If the current video is compressed (scaleFactorX/Y > 1), coordinates are
+     * automatically scaled down to match the current working resolution.
+     * No resolution validation needed - just scale and import.
+     * 
+     * Edge cases handled:
+     * - Empty tracks (skipped with warning)
+     * - Missing annotations (skipped with warning)
+     * - Invalid color values (clamped to [0,255])
+     * - Negative frame numbers (treated as 0 with warning)
+     * - Invalid coordinates (clamped to image bounds)
+     * - Invalid occlusion segments (skipped)
+     */
+    private void importFromJson(String content) throws Exception {
+        if (content == null || content.trim().isEmpty()) {
+            throw new Exception("Empty JSON content");
+        }
+        
+        JSONArray tracksArray;
+        
+        try {
+            if (content.trim().startsWith("{")) {
+                // New format with metadata
+                JSONObject root = new JSONObject(content);
+                if (!root.has("tracks")) {
+                    throw new Exception("JSON object missing 'tracks' array");
+                }
+                tracksArray = root.getJSONArray("tracks");
+            } else if (content.trim().startsWith("[")) {
+                // Old format - just an array
+                tracksArray = new JSONArray(content);
+            } else {
+                throw new Exception("Invalid JSON format: expected object or array");
+            }
+        } catch (org.json.JSONException e) {
+            throw new Exception("Invalid JSON syntax: " + e.getMessage());
+        }
+        
+        if (tracksArray.length() == 0) {
+            throw new Exception("No tracks found in JSON file");
+        }
+        
+        // Clear existing data
+        clearAllTrackData();
+        
+        // Get working dimensions for coordinate clamping
+        int workingWidth = (imp != null) ? imp.getWidth() : Integer.MAX_VALUE;
+        int workingHeight = (imp != null) ? imp.getHeight() : Integer.MAX_VALUE;
+        
+        int maxTrackNum = 0;
+        int importedCount = 0;
+        int skippedCount = 0;
+        
+        for (int i = 0; i < tracksArray.length(); i++) {
+            try {
+                JSONObject trackObj = tracksArray.getJSONObject(i);
+                String trackId = trackObj.optString("track_id", "");
+                
+                // Generate track ID if missing or empty
+                if (trackId == null || trackId.trim().isEmpty()) {
+                    trackId = "Track_" + (i + 1);
+                    System.err.println("Warning: Track at index " + i + " has no track_id, assigned: " + trackId);
+                }
+                
+                // Import color (rich format only, or use default)
+                if (trackObj.has("color")) {
+                    try {
+                        JSONObject colorObj = trackObj.getJSONObject("color");
+                        int r = clampColorValue(colorObj.optInt("r", 255));
+                        int g = clampColorValue(colorObj.optInt("g", 255));
+                        int b = clampColorValue(colorObj.optInt("b", 0));
+                        int a = clampColorValue(colorObj.optInt("a", 255));
+                        trackColors.put(trackId, new Color(r, g, b, a));
+                    } catch (Exception e) {
+                        System.err.println("Warning: Invalid color for track " + trackId + ", using random color");
+                        trackColors.put(trackId, generateRandomColor());
+                    }
+                } else {
+                    trackColors.put(trackId, generateRandomColor());
+                }
+                
+                // Initialize anchors list
+                trackAnchors.put(trackId, new ArrayList<>());
+                
+                // Import anchors (rich format only) - scale from original to current resolution
+                if (trackObj.has("anchors")) {
+                    try {
+                        JSONArray anchorsArray = trackObj.getJSONArray("anchors");
+                        List<Anchor> anchors = trackAnchors.get(trackId);
+                        for (int j = 0; j < anchorsArray.length(); j++) {
+                            try {
+                                JSONObject anchorObj = anchorsArray.getJSONObject(j);
+                                int frame = anchorObj.optInt("frame", 0);
+                                if (frame < 0) {
+                                    System.err.println("Warning: Negative anchor frame " + frame + " in track " + trackId + ", treating as 0");
+                                    frame = 0;
+                                }
+                                // Scale from original resolution to current (divide by scale factor)
+                                int x = clampCoordinate((int) Math.round(anchorObj.optInt("x", 0) / scaleFactorX), workingWidth);
+                                int y = clampCoordinate((int) Math.round(anchorObj.optInt("y", 0) / scaleFactorY), workingHeight);
+                                anchors.add(new Anchor(frame, x, y));
+                            } catch (Exception e) {
+                                System.err.println("Warning: Skipping invalid anchor at index " + j + " in track " + trackId);
+                            }
+                        }
+                    } catch (Exception e) {
+                        System.err.println("Warning: Could not parse anchors for track " + trackId);
+                    }
+                }
+                
+                // Import optimization state
+                trackOptimized.put(trackId, trackObj.optBoolean("optimized", false));
+                trackSelected.put(trackId, trackObj.optBoolean("selected", true));
+                
+                // Import time tracking data - validate non-negative
+                long timeMs = trackObj.optLong("time_ms", 0L);
+                if (timeMs < 0) {
+                    System.err.println("Warning: Negative time_ms for track " + trackId + ", treating as 0");
+                    timeMs = 0L;
+                }
+                trackTotalTime.put(trackId, timeMs);
+                trackStartTime.put(trackId, 0L);
+                trackCompleted.put(trackId, trackObj.optBoolean("completed", false));
+                
+                // Import trim data
+                if (trackObj.has("trim_info")) {
+                    try {
+                        JSONObject trimInfo = trackObj.getJSONObject("trim_info");
+                        boolean wasTrimmed = trimInfo.optBoolean("trimmed", false);
+                        
+                        if (wasTrimmed) {
+                            int trimStart = trimInfo.optInt("trim_start_frame", 0);
+                            int trimEnd = trimInfo.optInt("trim_end_frame", 0);
+                            
+                            // Validate trim range
+                            if (trimStart < 0) trimStart = 0;
+                            if (trimEnd < trimStart) {
+                                System.err.println("Warning: Invalid trim range for track " + trackId + ", ignoring");
+                            } else {
+                                trackTrimRange.put(trackId, new int[]{trimStart, trimEnd});
+                            }
+                            
+                            if (trimInfo.has("original_annotations")) {
+                                JSONArray origArray = trimInfo.getJSONArray("original_annotations");
+                                Map<Integer, Point> untrimmedMap = new HashMap<>();
+                                
+                                for (int k = 0; k < origArray.length(); k++) {
+                                    try {
+                                        JSONObject frameObj = origArray.getJSONObject(k);
+                                        int origFrame = frameObj.optInt("frame", 0);
+                                        if (origFrame < 0) origFrame = 0;
+                                        // Scale from original resolution to current
+                                        int origX = clampCoordinate((int) Math.round(frameObj.optInt("x", 0) / scaleFactorX), workingWidth);
+                                        int origY = clampCoordinate((int) Math.round(frameObj.optInt("y", 0) / scaleFactorY), workingHeight);
+                                        untrimmedMap.put(origFrame, new Point(origX, origY));
+                                    } catch (Exception e) {
+                                        System.err.println("Warning: Skipping invalid original annotation at index " + k + " in track " + trackId);
+                                    }
+                                }
+                                
+                                if (!untrimmedMap.isEmpty()) {
+                                    trackUntrimmedAnnotations.put(trackId, untrimmedMap);
+                                }
+                            }
+                            
+                            // Import untrimmed anchors
+                            if (trimInfo.has("original_anchors")) {
+                                JSONArray origAnchorsArray = trimInfo.getJSONArray("original_anchors");
+                                List<Anchor> untrimmedAnchors = new ArrayList<>();
+                                
+                                for (int k = 0; k < origAnchorsArray.length(); k++) {
+                                    try {
+                                        JSONObject anchorObj = origAnchorsArray.getJSONObject(k);
+                                        int anchorFrame = anchorObj.optInt("frame", 0);
+                                        if (anchorFrame < 0) anchorFrame = 0;
+                                        // Scale from original resolution to current
+                                        int anchorX = clampCoordinate((int) Math.round(anchorObj.optInt("x", 0) / scaleFactorX), workingWidth);
+                                        int anchorY = clampCoordinate((int) Math.round(anchorObj.optInt("y", 0) / scaleFactorY), workingHeight);
+                                        untrimmedAnchors.add(new Anchor(anchorFrame, anchorX, anchorY));
+                                    } catch (Exception e) {
+                                        System.err.println("Warning: Skipping invalid original anchor at index " + k + " in track " + trackId);
+                                    }
+                                }
+                                
+                                if (!untrimmedAnchors.isEmpty()) {
+                                    trackUntrimmedAnchors.put(trackId, untrimmedAnchors);
+                                }
+                            }
+                        }
+                    } catch (Exception e) {
+                        System.err.println("Warning: Could not parse trim_info for track " + trackId);
+                    }
+                }
+                
+                // Import occlusion segments (frames where object is NOT visible)
+                // Also handle legacy "visible_segments" for backward compatibility
+                if (trackObj.has("occlusion_segments")) {
+                    try {
+                        JSONArray segmentsArray = trackObj.getJSONArray("occlusion_segments");
+                        List<int[]> segments = new ArrayList<>();
+                        for (int j = 0; j < segmentsArray.length(); j++) {
+                            try {
+                                JSONObject segObj = segmentsArray.getJSONObject(j);
+                                int segStart = segObj.optInt("start", 0);
+                                int segEnd = segObj.optInt("end", 0);
+                                
+                                // Validate segment
+                                if (segStart < 0) segStart = 0;
+                                if (segEnd >= segStart) {  // Valid segment
+                                    segments.add(new int[]{segStart, segEnd});
+                                } else {
+                                    System.err.println("Warning: Invalid occlusion segment [" + segStart + "," + segEnd + "] in track " + trackId + ", skipping");
+                                }
+                            } catch (Exception e) {
+                                System.err.println("Warning: Skipping invalid occlusion segment at index " + j + " in track " + trackId);
+                            }
+                        }
+                        if (!segments.isEmpty()) {
+                            trackOcclusionSegments.put(trackId, segments);
+                        }
+                    } catch (Exception e) {
+                        System.err.println("Warning: Could not parse occlusion_segments for track " + trackId);
+                    }
+                } else if (trackObj.has("visible_segments")) {
+                    // Legacy format: visible_segments meant frames where object IS visible
+                    // We need to invert this to get occlusion segments
+                    // For simplicity, just import as-is and let user re-edit if needed
+                    // (This maintains backward compatibility with old exports)
+                    System.out.println("Note: Track " + trackId + " has legacy visible_segments format. " +
+                        "Occlusion data not imported - please re-mark occlusions if needed.");
+                }
+                
+                // Track number for counter
+                try {
+                    String numStr = trackId.replaceAll("[^0-9]", "");
+                    if (!numStr.isEmpty()) {
+                        maxTrackNum = Math.max(maxTrackNum, Integer.parseInt(numStr));
+                    }
+                } catch (NumberFormatException ignored) {}
+                
+                // Import annotations - scale from original resolution to current
+                if (!trackObj.has("annotations")) {
+                    System.err.println("Warning: Track " + trackId + " has no annotations, skipping");
+                    skippedCount++;
+                    continue;
+                }
+                
+                JSONArray framesArray = trackObj.getJSONArray("annotations");
+                if (framesArray.length() == 0) {
+                    System.err.println("Warning: Track " + trackId + " has empty annotations array, skipping");
+                    skippedCount++;
+                    continue;
+                }
+                
+                Map<Integer, Point> frameMap = new HashMap<>();
+                
+                for (int j = 0; j < framesArray.length(); j++) {
+                    try {
+                        JSONObject frameObj = framesArray.getJSONObject(j);
+                        int frame = frameObj.optInt("frame", 0);
+                        
+                        // Validate frame number
+                        if (frame < 0) {
+                            System.err.println("Warning: Negative frame number " + frame + " in track " + trackId + ", treating as 0");
+                            frame = 0;
+                        }
+                        
+                        // Scale from original resolution to current (divide by scale factor)
+                        int x = clampCoordinate((int) Math.round(frameObj.optInt("x", 0) / scaleFactorX), workingWidth);
+                        int y = clampCoordinate((int) Math.round(frameObj.optInt("y", 0) / scaleFactorY), workingHeight);
+                        frameMap.put(frame, new Point(x, y));
+                    } catch (Exception e) {
+                        System.err.println("Warning: Skipping invalid annotation at index " + j + " in track " + trackId);
+                    }
+                }
+                
+                if (frameMap.isEmpty()) {
+                    System.err.println("Warning: Track " + trackId + " has no valid annotations after parsing, skipping");
+                    skippedCount++;
+                    continue;
+                }
+                
+                trackAnnotations.put(trackId, frameMap);
+                importedCount++;
+                
+            } catch (Exception e) {
+                System.err.println("Warning: Error processing track at index " + i + ": " + e.getMessage());
+                skippedCount++;
+            }
+        }
+        
+        if (importedCount == 0) {
+            throw new Exception("No valid tracks could be imported (all " + skippedCount + " tracks had errors)");
+        }
+        
+        trackCounter = maxTrackNum + 1;
+        
+        if (skippedCount > 0) {
+            System.out.println("Import complete: " + importedCount + " tracks imported, " + skippedCount + " skipped due to errors");
+        }
+    }
+
+    private void adjustBrightness() {
+        if (imp == null) {
+            JOptionPane.showMessageDialog(frame, "Please open an image first.");
+            return;
+        }
+
+        if (viewMin == null || viewMax == null) {
+            double[] win = computePercentileWindow(imp.getProcessor(), 0.005, 0.995, 4);
+            viewMin = win[0];
+            viewMax = win[1];
+            loadSliceImage();
+        }
+
+        final JDialog dlg = new JDialog(frame, "Brightness / Contrast (display only)", false);
+        dlg.setLayout(new BorderLayout());
+
+        ImageProcessor ip = imp.getProcessor();
+        double dataMin = ip.getMin();
+        double dataMax = ip.getMax();
+        if (!(dataMax > dataMin)) {
+            dataMin = 0;
+            dataMax = 65535;
+        }
+        final double rangeMin = dataMin;
+        final double rangeMax = dataMax;
+
+        JPanel fields = new JPanel(new GridLayout(2, 3, 8, 8));
+        
+        JSlider minSlider = new JSlider(0, 1000);
+        minSlider.setValue((int)(1000 * (viewMin - rangeMin) / (rangeMax - rangeMin)));
+        JTextField minField = new JTextField(String.format("%.1f", viewMin), 8);
+        
+        JSlider maxSlider = new JSlider(0, 1000);
+        maxSlider.setValue((int)(1000 * (viewMax - rangeMin) / (rangeMax - rangeMin)));
+        JTextField maxField = new JTextField(String.format("%.1f", viewMax), 8);
+        
+        fields.add(new JLabel("Black (min):"));
+        fields.add(minSlider);
+        fields.add(minField);
+        fields.add(new JLabel("White (max):"));
+        fields.add(maxSlider);
+        fields.add(maxField);
+
+        JPanel buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+        JButton autoBtn  = new JButton("Auto");
+        JButton resetBtn = new JButton("Reset");
+        JButton closeBtn = new JButton("Close");
+        buttons.add(autoBtn);
+        buttons.add(resetBtn);
+        buttons.add(closeBtn);
+
+        ChangeListener sliderListener = e -> {
+            if (e.getSource() == minSlider) {
+                double newMin = rangeMin + (rangeMax - rangeMin) * minSlider.getValue() / 1000.0;
+                viewMin = newMin;
+                minField.setText(String.format("%.1f", newMin));
+            } else if (e.getSource() == maxSlider) {
+                double newMax = rangeMin + (rangeMax - rangeMin) * maxSlider.getValue() / 1000.0;
+                viewMax = newMax;
+                maxField.setText(String.format("%.1f", newMax));
+            }
+            if (viewMax > viewMin) {
+                loadSliceImage();
+            }
+        };
+
+        minSlider.addChangeListener(sliderListener);
+        maxSlider.addChangeListener(sliderListener);
+
+        ActionListener fieldListener = e -> {
+            try {
+                double newMin = Double.parseDouble(minField.getText());
+                double newMax = Double.parseDouble(maxField.getText());
+                if (newMax > newMin) {
+                    viewMin = newMin;
+                    viewMax = newMax;
+                    minSlider.setValue((int)(1000 * (newMin - rangeMin) / (rangeMax - rangeMin)));
+                    maxSlider.setValue((int)(1000 * (newMax - rangeMin) / (rangeMax - rangeMin)));
+                    loadSliceImage();
+                }
+            } catch (NumberFormatException ex) {
+            }
+        };
+
+        minField.addActionListener(fieldListener);
+        maxField.addActionListener(fieldListener);
+
+        autoBtn.addActionListener(e -> {
+            double[] win = computePercentileWindow(imp.getProcessor(), 0.005, 0.995, 4);
+            viewMin = win[0];
+            viewMax = win[1];
+            minSlider.setValue((int)(1000 * (viewMin - rangeMin) / (rangeMax - rangeMin)));
+            maxSlider.setValue((int)(1000 * (viewMax - rangeMin) / (rangeMax - rangeMin)));
+            minField.setText(String.format("%.1f", viewMin));
+            maxField.setText(String.format("%.1f", viewMax));
+            loadSliceImage();
+        });
+
+        resetBtn.addActionListener(e -> {
+            ImageProcessor ip2 = imp.getProcessor();
+            double min = ip2.getMin();
+            double max = ip2.getMax();
+            if (!(max > min) || (max - min > 1e7)) {
+                double[] win = computePercentileWindow(ip2, 0.005, 0.995, 4);
+                min = win[0]; max = win[1];
+            }
+            viewMin = min; viewMax = max;
+            minSlider.setValue((int)(1000 * (viewMin - rangeMin) / (rangeMax - rangeMin)));
+            maxSlider.setValue((int)(1000 * (viewMax - rangeMin) / (rangeMax - rangeMin)));
+            minField.setText(String.format("%.1f", viewMin));
+            maxField.setText(String.format("%.1f", viewMax));
+            loadSliceImage();
+        });
+
+        closeBtn.addActionListener(e -> dlg.dispose());
+
+        dlg.add(fields, BorderLayout.CENTER);
+        dlg.add(buttons, BorderLayout.SOUTH);
+        
+        // Apply dark theme styling
+        styleDialog(dlg);
+        
+        dlg.pack();
+        dlg.setLocationRelativeTo(frame);
+        dlg.setVisible(true);
+    }
+
+    private static double[] computePercentileWindow(ImageProcessor ip, double low, double high, int step) {
+        int w = ip.getWidth(), h = ip.getHeight();
+        java.util.ArrayList<Float> vals = new java.util.ArrayList<>();
+        for (int y = 0; y < h; y += Math.max(1, step)) {
+            for (int x = 0; x < w; x += Math.max(1, step)) {
+                vals.add(ip.getf(x, y));
+            }
+        }
+        if (vals.isEmpty()) return new double[]{0, 1};
+        Collections.sort(vals);
+        int n = vals.size();
+        int iLo = Math.max(0, Math.min(n - 1, (int)Math.floor(low  * (n - 1))));
+        int iHi = Math.max(0, Math.min(n - 1, (int)Math.floor(high * (n - 1))));
+        double vLo = vals.get(iLo);
+        double vHi = Math.max(vLo + 1e-6, vals.get(iHi));
+        return new double[]{vLo, vHi};
+    }
+    
+    private void adjustSegmentationThreshold() {
+        if (imp == null) {
+            JOptionPane.showMessageDialog(frame, "No video loaded.", "Error", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+
+        // Initialize threshold values if not set
+        if (satThresholdMin == 0.0 && satThresholdMax == 255.0) {
+            ImageProcessor ip = imp.getProcessor();
+            double dataMin = ip.getMin();
+            double dataMax = ip.getMax();
+            satThresholdMin = dataMin;
+            satThresholdMax = dataMax;
+        }
+
+        final JDialog dlg = new JDialog(frame, "Segmentation Threshold (display only)", false);
+        dlg.setLayout(new BorderLayout());
+
+        ImageProcessor ip = imp.getProcessor();
+        double dataMin = ip.getMin();
+        double dataMax = ip.getMax();
+        if (!(dataMax > dataMin)) {
+            dataMin = 0.0;
+            dataMax = 255.0;
+        }
+        final double rangeMin = dataMin;
+        final double rangeMax = dataMax;
+
+        JPanel fields = new JPanel(new GridLayout(3, 3, 8, 8));
+        
+        JSlider minSlider = new JSlider(0, 1000);
+        minSlider.setValue((int)(1000 * (satThresholdMin - rangeMin) / (rangeMax - rangeMin)));
+        JTextField minField = new JTextField(String.format("%.1f", satThresholdMin), 8);
+        
+        JSlider maxSlider = new JSlider(0, 1000);
+        maxSlider.setValue((int)(1000 * (satThresholdMax - rangeMin) / (rangeMax - rangeMin)));
+        JTextField maxField = new JTextField(String.format("%.1f", satThresholdMax), 8);
+        
+        JSlider opacitySlider = new JSlider(0, 255, satMaskOpacity);
+        JTextField opacityField = new JTextField(String.valueOf(satMaskOpacity), 8);
+        
+        fields.add(new JLabel("Min Threshold:"));
+        fields.add(minSlider);
+        fields.add(minField);
+        fields.add(new JLabel("Max Threshold:"));
+        fields.add(maxSlider);
+        fields.add(maxField);
+        fields.add(new JLabel("Mask Opacity (0-255):"));
+        fields.add(opacitySlider);
+        fields.add(opacityField);
+
+        ChangeListener minSliderListener = e -> {
+            int val = minSlider.getValue();
+            satThresholdMin = rangeMin + val * (rangeMax - rangeMin) / 1000.0;
+            minField.setText(String.format("%.1f", satThresholdMin));
+            // Update mask in real-time when mask is visible
+            if (showMask) {
+                generateSegmentationMask();
+                imageLabel.repaint();
+            }
+        };
+
+        ChangeListener maxSliderListener = e -> {
+            int val = maxSlider.getValue();
+            satThresholdMax = rangeMin + val * (rangeMax - rangeMin) / 1000.0;
+            maxField.setText(String.format("%.1f", satThresholdMax));
+            // Update mask in real-time when mask is visible
+            if (showMask) {
+                generateSegmentationMask();
+                imageLabel.repaint();
+            }
+        };
+        
+        ChangeListener opacitySliderListener = e -> {
+            int val = opacitySlider.getValue();
+            satMaskOpacity = val;
+            opacityField.setText(String.valueOf(satMaskOpacity));
+            // Update mask in real-time when mask is visible
+            if (showMask) {
+                generateSegmentationMask();
+                imageLabel.repaint();
+            }
+        };
+
+        minSlider.addChangeListener(minSliderListener);
+        maxSlider.addChangeListener(maxSliderListener);
+        opacitySlider.addChangeListener(opacitySliderListener);
+
+        minField.addActionListener(e -> {
+            try {
+                double v = Double.parseDouble(minField.getText());
+                v = Math.max(rangeMin, Math.min(v, rangeMax));
+                satThresholdMin = v;
+                minSlider.setValue((int)(1000 * (v - rangeMin) / (rangeMax - rangeMin)));
+                // Update mask in real-time when mask is visible
+                if (showMask) {
+                    generateSegmentationMask();
+                    imageLabel.repaint();
+                }
+            } catch (NumberFormatException ex) {
+                minField.setText(String.format("%.1f", satThresholdMin));
+            }
+        });
+
+        maxField.addActionListener(e -> {
+            try {
+                double v = Double.parseDouble(maxField.getText());
+                v = Math.max(rangeMin, Math.min(v, rangeMax));
+                satThresholdMax = v;
+                maxSlider.setValue((int)(1000 * (v - rangeMin) / (rangeMax - rangeMin)));
+                // Update mask in real-time when mask is visible
+                if (showMask) {
+                    generateSegmentationMask();
+                    imageLabel.repaint();
+                }
+            } catch (NumberFormatException ex) {
+                maxField.setText(String.format("%.1f", satThresholdMax));
+            }
+        });
+        
+        opacityField.addActionListener(e -> {
+            try {
+                int v = Integer.parseInt(opacityField.getText());
+                v = Math.max(0, Math.min(v, 255));
+                satMaskOpacity = v;
+                opacitySlider.setValue(v);
+                // Update mask in real-time when mask is visible
+                if (showMask) {
+                    generateSegmentationMask();
+                    imageLabel.repaint();
+                }
+            } catch (NumberFormatException ex) {
+                opacityField.setText(String.valueOf(satMaskOpacity));
+            }
+        });
+
+        JPanel topPanel = new JPanel(new BorderLayout());
+        topPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        topPanel.add(fields, BorderLayout.CENTER);
+        
+        // Add connectivity structure parameters panel
+        JPanel connectivityPanel = new JPanel(new GridLayout(3, 3, 8, 8));
+        connectivityPanel.setBorder(BorderFactory.createTitledBorder("Connectivity Structure (h × w × t)"));
+        
+        JLabel widthLabel = new JLabel("Width (spatial X):");
+        JSlider widthSlider = new JSlider(1, 9, connectivityWidth);
+        widthSlider.setMajorTickSpacing(2);
+        widthSlider.setMinorTickSpacing(1);
+        widthSlider.setPaintTicks(true);
+        widthSlider.setSnapToTicks(true);
+        JTextField widthField = new JTextField(String.valueOf(connectivityWidth), 5);
+        
+        widthSlider.addChangeListener(ev -> {
+            // Ensure odd values only
+            int val = widthSlider.getValue();
+            if (val % 2 == 0) val++;
+            connectivityWidth = val;
+            widthField.setText(String.valueOf(connectivityWidth));
+            widthSlider.setValue(val);
+        });
+        
+        widthField.addActionListener(ev -> {
+            try {
+                int val = Integer.parseInt(widthField.getText());
+                // Ensure odd values only and within range
+                if (val % 2 == 0) val++;
+                val = Math.max(1, Math.min(val, 9));
+                connectivityWidth = val;
+                widthSlider.setValue(val);
+                widthField.setText(String.valueOf(val));
+            } catch (NumberFormatException ex) {
+                widthField.setText(String.valueOf(connectivityWidth));
+            }
+        });
+        
+        JLabel heightLabel = new JLabel("Height (spatial Y):");
+        JSlider heightSlider = new JSlider(1, 9, connectivityHeight);
+        heightSlider.setMajorTickSpacing(2);
+        heightSlider.setMinorTickSpacing(1);
+        heightSlider.setPaintTicks(true);
+        heightSlider.setSnapToTicks(true);
+        JTextField heightField = new JTextField(String.valueOf(connectivityHeight), 5);
+        
+        heightSlider.addChangeListener(ev -> {
+            // Ensure odd values only
+            int val = heightSlider.getValue();
+            if (val % 2 == 0) val++;
+            connectivityHeight = val;
+            heightField.setText(String.valueOf(connectivityHeight));
+            heightSlider.setValue(val);
+        });
+        
+        heightField.addActionListener(ev -> {
+            try {
+                int val = Integer.parseInt(heightField.getText());
+                // Ensure odd values only and within range
+                if (val % 2 == 0) val++;
+                val = Math.max(1, Math.min(val, 9));
+                connectivityHeight = val;
+                heightSlider.setValue(val);
+                heightField.setText(String.valueOf(val));
+            } catch (NumberFormatException ex) {
+                heightField.setText(String.valueOf(connectivityHeight));
+            }
+        });
+        
+        JLabel depthLabel = new JLabel("Depth (temporal):");
+        JSlider depthSlider = new JSlider(1, 5, connectivityDepth);
+        depthSlider.setMajorTickSpacing(1);
+        depthSlider.setPaintTicks(true);
+        depthSlider.setSnapToTicks(true);
+        JTextField depthField = new JTextField(String.valueOf(connectivityDepth), 5);
+        
+        depthSlider.addChangeListener(ev -> {
+            // Ensure odd values only
+            int val = depthSlider.getValue();
+            if (val % 2 == 0) val++;
+            connectivityDepth = val;
+            depthField.setText(String.valueOf(connectivityDepth));
+            depthSlider.setValue(val);
+        });
+        
+        depthField.addActionListener(ev -> {
+            try {
+                int val = Integer.parseInt(depthField.getText());
+                // Ensure odd values only and within range
+                if (val % 2 == 0) val++;
+                val = Math.max(1, Math.min(val, 5));
+                connectivityDepth = val;
+                depthSlider.setValue(val);
+                depthField.setText(String.valueOf(val));
+            } catch (NumberFormatException ex) {
+                depthField.setText(String.valueOf(connectivityDepth));
+            }
+        });
+        
+        connectivityPanel.add(widthLabel);
+        connectivityPanel.add(widthSlider);
+        connectivityPanel.add(widthField);
+        connectivityPanel.add(heightLabel);
+        connectivityPanel.add(heightSlider);
+        connectivityPanel.add(heightField);
+        connectivityPanel.add(depthLabel);
+        connectivityPanel.add(depthSlider);
+        connectivityPanel.add(depthField);
+        
+        JPanel topCombined = new JPanel();
+        topCombined.setLayout(new BoxLayout(topCombined, BoxLayout.Y_AXIS));
+        topCombined.add(topPanel);
+        topCombined.add(connectivityPanel);
+
+        JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+        JButton autoButton = new JButton("Auto");
+        autoButton.addActionListener(e -> {
+            double[] percentiles = computePercentileWindow(ip, 0.1, 99.9, 5);
+            satThresholdMin = percentiles[0];
+            satThresholdMax = percentiles[1];
+            minSlider.setValue((int)(1000 * (satThresholdMin - rangeMin) / (rangeMax - rangeMin)));
+            maxSlider.setValue((int)(1000 * (satThresholdMax - rangeMin) / (rangeMax - rangeMin)));
+            minField.setText(String.format("%.1f", satThresholdMin));
+            maxField.setText(String.format("%.1f", satThresholdMax));
+            // Update mask in real-time when mask is visible
+            if (showMask) {
+                generateSegmentationMask();
+                imageLabel.repaint();
+            }
+        });
+
+        JButton resetButton = new JButton("Reset");
+        resetButton.addActionListener(e -> {
+            satThresholdMin = rangeMin;
+            satThresholdMax = rangeMax;
+            minSlider.setValue(0);
+            maxSlider.setValue(1000);
+            minField.setText(String.format("%.1f", satThresholdMin));
+            maxField.setText(String.format("%.1f", satThresholdMax));
+            // Update mask in real-time when mask is visible
+            if (showMask) {
+                generateSegmentationMask();
+                imageLabel.repaint();
+            }
+        });
+        
+        JButton recomputeButton = new JButton("Recompute Regions");
+        recomputeButton.setToolTipText("Recompute regions with current threshold and connectivity settings");
+        recomputeButton.addActionListener(e -> {
+            // Update mask if mask is visible
+            if (showMask) {
+                generateSegmentationMask();
+            }
+            // Always recompute regions when this button is clicked
+            if (satEnabled) {
+                precomputeAllRegions();
+            }
+        });
+
+        JButton closeButton = new JButton("Close");
+        closeButton.addActionListener(e -> {
+            dlg.dispose();
+        });
+        
+        // Add live preview checkboxes to the button panel
+        JCheckBox dialogShowMaskCheckbox = new JCheckBox("Show Mask", showMask);
+        dialogShowMaskCheckbox.setToolTipText("Toggle mask overlay visibility");
+        dialogShowMaskCheckbox.addActionListener(e -> {
+            showMask = dialogShowMaskCheckbox.isSelected();
+            if (showMaskCheckbox != null) {
+                showMaskCheckbox.setSelected(showMask);
+            }
+            imageLabel.repaint();
+        });
+        
+        JCheckBox dialogShowRegionsCheckbox = new JCheckBox("Show Regions", showRegionBoundaries);
+        dialogShowRegionsCheckbox.setToolTipText("Toggle region boundaries visibility");
+        dialogShowRegionsCheckbox.addActionListener(e -> {
+            showRegionBoundaries = dialogShowRegionsCheckbox.isSelected();
+            if (showRegionsCheckbox != null) {
+                showRegionsCheckbox.setSelected(showRegionBoundaries);
+            }
+            imageLabel.repaint();
+        });
+
+        buttonPanel.add(dialogShowMaskCheckbox);
+        buttonPanel.add(dialogShowRegionsCheckbox);
+        buttonPanel.add(new JSeparator(SwingConstants.VERTICAL));
+        buttonPanel.add(autoButton);
+        buttonPanel.add(resetButton);
+        buttonPanel.add(recomputeButton);
+        buttonPanel.add(closeButton);
+
+        dlg.add(topCombined, BorderLayout.CENTER);
+        dlg.add(buttonPanel, BorderLayout.SOUTH);
+        
+        // Apply dark theme styling
+        styleDialog(dlg);
+        
+        dlg.pack();
+        dlg.setLocationRelativeTo(frame);
+        
+        // Generate initial mask
+        generateSegmentationMask();
+        imageLabel.repaint();
+        
+        dlg.setVisible(true);
+    }
+    
+    /**
+     * Generate a 3D connectivity structure based on user-defined dimensions.
+     * Similar to make_struct in pixel_connectivity.py
+     * 
+     * @return List of relative coordinate offsets [dx, dy, dt] representing the connectivity neighborhood
+     */
+    private List<int[]> generateConnectivityStructure() {
+        List<int[]> offsets = new ArrayList<>();
+        
+        int halfWidth = connectivityWidth / 2;
+        int halfHeight = connectivityHeight / 2;
+        int halfDepth = connectivityDepth / 2;
+        
+        // Generate all offsets within the structure bounds
+        for (int dt = -halfDepth; dt <= halfDepth; dt++) {
+            for (int dy = -halfHeight; dy <= halfHeight; dy++) {
+                for (int dx = -halfWidth; dx <= halfWidth; dx++) {
+                    // Skip the center point (0,0,0) as we don't need to check against itself
+                    if (dx == 0 && dy == 0 && dt == 0) continue;
+                    
+                    // Add this offset to the connectivity structure
+                    offsets.add(new int[]{dx, dy, dt});
+                }
+            }
+        }
+        
+        return offsets;
+    }
+    
+    private void generateSegmentationMask() {
+        if (imp == null || currentImage == null) {
+            segmentationMask = null;
+            return;
+        }
+        
+        // Get current image processor
+        ImageProcessor ip = imp.getProcessor();
+        int width = ip.getWidth();
+        int height = ip.getHeight();
+        
+        // Create transparent green mask
+        segmentationMask = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+        
+        // Slicer3D-style transparent green: RGB(0, 255, 0) with user-adjustable alpha
+        // Pre-compute RGBA values for better performance (avoid creating Color objects)
+        final int maskRGBA = (satMaskOpacity << 24) | (0 << 16) | (255 << 8) | 0; // ARGB format: alpha, red, green, blue
+        final int transparentRGBA = 0;
+        
+        // OPTIMIZATION: Use int[] array for bulk pixel operations instead of setRGB per pixel
+        int[] pixels = new int[width * height];
+        
+        // Threshold comparisons as local variables (JIT optimization hint)
+        final double threshMin = satThresholdMin;
+        final double threshMax = satThresholdMax;
+        
+        // Apply threshold to generate visual mask - optimized single loop
+        int idx = 0;
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                float pixelValue = ip.getf(x, y);
+                pixels[idx++] = (pixelValue >= threshMin && pixelValue <= threshMax) ? maskRGBA : transparentRGBA;
+            }
+        }
+        
+        // Bulk set all pixels at once (much faster than per-pixel setRGB)
+        segmentationMask.setRGB(0, 0, width, height, pixels, 0, width);
+        
+        // Note: Region identification is now done globally in precomputeAllRegions()
+        // which follows the proper 4-step sequence: binarize -> label frame 1 -> 
+        // propagate through time -> filter non-persistent
+    }
+    
+
+    
+    private void precomputeAllRegions() {
+        if (imp == null || !satEnabled) return;
+        
+        setStatus("Computing segmentation regions for all frames...");
+        
+        SwingWorker<Void, Integer> worker = new SwingWorker<Void, Integer>() {
+            @Override
+            protected Void doInBackground() throws Exception {
+                int savedSlice = currentSlice;
+                
+                // Step 1: Generate binary masks for all frames
+                ImageProcessor ip = imp.getProcessor();
+                int width = ip.getWidth();
+                int height = ip.getHeight();
+                boolean[][][] binaryVolume = new boolean[totalSlices][height][width];
+                
+                for (int i = 1; i <= totalSlices; i++) {
+                    imp.setSlice(i);
+                    ip = imp.getProcessor();
+                    
+                    for (int y = 0; y < height; y++) {
+                        for (int x = 0; x < width; x++) {
+                            float pixelValue = ip.getf(x, y);
+                            binaryVolume[i - 1][y][x] = (pixelValue >= satThresholdMin && pixelValue <= satThresholdMax);
+                        }
+                    }
+                    
+                    publish((i * 25) / totalSlices); // 0-25%
+                }
+                
+                // Step 2: Label regions on frame 1 using 2D connectivity (spatial only)
+                publish(30);
+                setStatus("Labeling regions on frame 1...");
+                int[][][] labelVolume = new int[totalSlices][height][width];
+                labelFirstFrame(binaryVolume, labelVolume, width, height);
+                
+                // Step 3: Propagate labels through time using 3D connectivity
+                publish(40);
+                setStatus("Propagating labels through time...");
+                propagateLabelsTemporally(binaryVolume, labelVolume, width, height);
+                
+                // Step 4: Filter non-persistent labels
+                publish(90);
+                setStatus("Filtering non-persistent regions...");
+                filterNonPersistentLabels(labelVolume, width, height);
+                
+                // Convert label volume to frameRegions and framePixelToRegion structures
+                publish(95);
+                convertLabelVolumeToRegions(labelVolume, width, height);
+                
+                // Restore original slice
+                currentSlice = savedSlice;
+                imp.setSlice(savedSlice);
+                
+                publish(100);
+                return null;
+            }
+            
+            @Override
+            protected void process(List<Integer> chunks) {
+                int progress = chunks.get(chunks.size() - 1);
+                setStatus("Computing regions: " + progress + "%");
+            }
+            
+            @Override
+            protected void done() {
+                setStatus("Regions computed for all " + totalSlices + " frames. " + 
+                          frameRegions.size() + " frames have segmented regions.");
+                loadSliceImage();
+                imageLabel.repaint();
+            }
+        };
+        
+        worker.execute();
+    }
+    
+    /**
+     * Step 2: Label regions on frame 1 (frame 0) using 2D spatial connectivity only.
+     * This identifies initial regions without considering temporal propagation.
+     */
+    private void labelFirstFrame(boolean[][][] binaryVolume, int[][][] labelVolume, int width, int height) {
+        if (totalSlices == 0) return;
+        
+        // Get spatial connectivity structure (only dx, dy where dt = 0)
+        List<int[]> connectivityOffsets = generateConnectivityStructure();
+        List<int[]> spatialOffsets = new ArrayList<>();
+        for (int[] offset : connectivityOffsets) {
+            if (offset[2] == 0) { // Only include same-frame offsets (dt = 0)
+                spatialOffsets.add(new int[]{offset[0], offset[1]});
+            }
+        }
+        
+        int currentLabel = 0;
+        boolean[][] visited = new boolean[height][width];
+        
+        // Flood-fill labeling on frame 0 (first frame)
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                if (binaryVolume[0][y][x] && !visited[y][x]) {
+                    currentLabel++;
+                    floodFill2D(binaryVolume[0], labelVolume[0], visited, x, y, 
+                               currentLabel, width, height, spatialOffsets);
+                }
+            }
+        }
+    }
+    
+    /**
+     * 2D flood fill for initial labeling on frame 1.
+     */
+    private void floodFill2D(boolean[][] mask, int[][] labels, boolean[][] visited, 
+                            int startX, int startY, int label, int width, int height, 
+                            List<int[]> spatialOffsets) {
+        Stack<Point> stack = new Stack<>();
+        stack.push(new Point(startX, startY));
+        
+        while (!stack.isEmpty()) {
+            Point p = stack.pop();
+            int x = p.x;
+            int y = p.y;
+            
+            if (x < 0 || x >= width || y < 0 || y >= height) continue;
+            if (!mask[y][x] || visited[y][x]) continue;
+            
+            visited[y][x] = true;
+            labels[y][x] = label;
+            
+            // Use connectivity structure
+            for (int[] offset : spatialOffsets) {
+                int nx = x + offset[0];
+                int ny = y + offset[1];
+                stack.push(new Point(nx, ny));
+            }
+        }
+    }
+    
+    /**
+     * Step 3: Propagate labels from frame 1 through all frames using 3D connectivity.
+     * A pixel in frame t gets the label from frame t-1 if:
+     * 1) It's part of the binary mask
+     * 2) It's connected via the 3D connectivity structure to a labeled neighbor in frame t-1
+     */
+    private void propagateLabelsTemporally(boolean[][][] binaryVolume, int[][][] labelVolume, 
+                                          int width, int height) {
+        List<int[]> connectivityOffsets = generateConnectivityStructure();
+        
+        // Process each frame sequentially from frame 1 onwards
+        for (int t = 1; t < totalSlices; t++) {
+            // For each pixel in current frame
+            for (int y = 0; y < height; y++) {
+                for (int x = 0; x < width; x++) {
+                    // Skip if not in mask or already labeled
+                    if (!binaryVolume[t][y][x] || labelVolume[t][y][x] != 0) continue;
+                    
+                    // Check all 3D connectivity neighbors (including temporal)
+                    for (int[] offset : connectivityOffsets) {
+                        int dx = offset[0];
+                        int dy = offset[1];
+                        int dt = offset[2];
+                        
+                        int neighborT = t + dt;
+                        int neighborY = y + dy;
+                        int neighborX = x + dx;
+                        
+                        // Check bounds
+                        if (neighborT < 0 || neighborT >= totalSlices) continue;
+                        if (neighborX < 0 || neighborX >= width) continue;
+                        if (neighborY < 0 || neighborY >= height) continue;
+                        
+                        // If neighbor is labeled and in the mask, propagate that label
+                        if (binaryVolume[neighborT][neighborY][neighborX] && 
+                            labelVolume[neighborT][neighborY][neighborX] != 0) {
+                            labelVolume[t][y][x] = labelVolume[neighborT][neighborY][neighborX];
+                            break; // Found a label, stop searching
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /**
+     * Step 4: Filter out labels that don't appear in all frames.
+     * Similar to remove_inconsistent_labels in pixel_connectivity.py
+     */
+    private void filterNonPersistentLabels(int[][][] labelVolume, int width, int height) {
+        // Build set of labels present in each frame
+        List<Set<Integer>> labelsPerFrame = new ArrayList<>();
+        for (int t = 0; t < totalSlices; t++) {
+            Set<Integer> labelsInFrame = new HashSet<>();
+            for (int y = 0; y < height; y++) {
+                for (int x = 0; x < width; x++) {
+                    int label = labelVolume[t][y][x];
+                    if (label > 0) {
+                        labelsInFrame.add(label);
+                    }
+                }
+            }
+            labelsPerFrame.add(labelsInFrame);
+        }
+        
+        // Find intersection: labels present in ALL frames
+        if (labelsPerFrame.isEmpty()) return;
+        
+        Set<Integer> persistentLabels = new HashSet<>(labelsPerFrame.get(0));
+        for (int i = 1; i < labelsPerFrame.size(); i++) {
+            persistentLabels.retainAll(labelsPerFrame.get(i));
+        }
+        
+        // Zero out non-persistent labels
+        for (int t = 0; t < totalSlices; t++) {
+            for (int y = 0; y < height; y++) {
+                for (int x = 0; x < width; x++) {
+                    int label = labelVolume[t][y][x];
+                    if (label > 0 && !persistentLabels.contains(label)) {
+                        labelVolume[t][y][x] = 0;
+                    }
+                }
+            }
+        }
+    }
+    
+    /**
+     * Convert 3D label volume to the frameRegions and framePixelToRegion data structures.
+     */
+    private void convertLabelVolumeToRegions(int[][][] labelVolume, int width, int height) {
+        frameRegions.clear();
+        framePixelToRegion.clear();
+        
+        for (int t = 0; t < totalSlices; t++) {
+            Map<Integer, SegmentedRegion> regionsInFrame = new HashMap<>();
+            int[][] pixelMap = new int[height][width];
+            
+            // First pass: create regions
+            for (int y = 0; y < height; y++) {
+                for (int x = 0; x < width; x++) {
+                    int label = labelVolume[t][y][x];
+                    pixelMap[y][x] = label;
+                    
+                    if (label > 0) {
+                        SegmentedRegion region = regionsInFrame.get(label);
+                        if (region == null) {
+                            region = new SegmentedRegion(label);
+                            regionsInFrame.put(label, region);
+                        }
+                        region.addPixel(x, y);
+                    }
+                }
+            }
+            
+            // Compute centroids for all regions
+            for (SegmentedRegion region : regionsInFrame.values()) {
+                region.computeCentroid();
+            }
+            
+            frameRegions.put(t, regionsInFrame);
+            framePixelToRegion.put(t, pixelMap);
+        }
+    }
+    
+    // Apply SAT constraints to tracked points
+    private Map<Integer, Point> applyRegionConstraints(String trackId, Map<Integer, Point> trackedPoints) {
+        if (!satEnabled || !trackToRegion.containsKey(trackId)) {
+            return trackedPoints; // No constraints if SAT disabled or track not in region
+        }
+        
+        int regionId = trackToRegion.get(trackId);
+        Map<Integer, Point> constrainedPoints = new HashMap<>();
+        
+        for (Map.Entry<Integer, Point> entry : trackedPoints.entrySet()) {
+            int frameIndex = entry.getKey();
+            Point originalPoint = entry.getValue();
+            
+            // Check if we have region data for this frame
+            if (!frameRegions.containsKey(frameIndex)) {
+                constrainedPoints.put(frameIndex, originalPoint);
+                continue;
+            }
+            
+            Map<Integer, SegmentedRegion> regions = frameRegions.get(frameIndex);
+            SegmentedRegion targetRegion = regions.get(regionId);
+            
+            if (targetRegion == null) {
+                // Region disappeared in this frame - keep original point
+                constrainedPoints.put(frameIndex, originalPoint);
+                continue;
+            }
+            
+            // Always snap to brightest pixel in the region for this frame
+            ImageProcessor ip = imp.getStack().getProcessor(frameIndex + 1);
+            Point brightestPoint = targetRegion.findBrightestPixel(ip);
+            
+            if (brightestPoint != null) {
+                constrainedPoints.put(frameIndex, brightestPoint);
+                if (!brightestPoint.equals(originalPoint)) {
+                    System.out.println("[SAT] Frame " + frameIndex + ": Snapped to brightest pixel from (" + 
+                                       originalPoint.x + "," + originalPoint.y + ") to (" + 
+                                       brightestPoint.x + "," + brightestPoint.y + ")");
+                }
+            } else {
+                // Fallback: if brightest pixel not found, use closest point in region
+                if (targetRegion.contains(originalPoint.x, originalPoint.y)) {
+                    constrainedPoints.put(frameIndex, originalPoint);
+                } else {
+                    Point constrainedPoint = targetRegion.findClosestPoint(originalPoint.x, originalPoint.y);
+                    constrainedPoints.put(frameIndex, constrainedPoint);
+                    System.out.println("[SAT] Frame " + frameIndex + ": Constrained point from (" + 
+                                       originalPoint.x + "," + originalPoint.y + ") to (" + 
+                                       constrainedPoint.x + "," + constrainedPoint.y + ")");
+                }
+            }
+        }
+        
+        return constrainedPoints;
+    }
+    
+    // Modern UI Helper Methods
+    private JButton createStyledButton(String text) {
+        return createStyledButton(text, null);
+    }
+    
+    private JButton createStyledButton(String text, String iconType) {
+        JButton button = new JButton(text);
+        button.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        button.setFocusPainted(false);
+        button.setBorderPainted(true);
+        button.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(BORDER_DARK, 1),
+            BorderFactory.createEmptyBorder(7, 14, 7, 14)
+        ));
+        button.setBackground(PANEL_DARK);
+        button.setForeground(TEXT_PRIMARY);
+        button.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        button.setContentAreaFilled(false);
+        button.setOpaque(true);
+        
+        // Create programmatic icon if type specified
+        if (iconType != null) {
+            ImageIcon icon = createProgrammaticIcon(iconType, 16, 16);
+            if (icon != null) {
+                button.setIcon(icon);
+                // Adjust text position for icon
+                button.setHorizontalTextPosition(SwingConstants.RIGHT);
+                button.setIconTextGap(6);
+            }
+        }
+        
+        // Hover effect
+        button.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseEntered(MouseEvent e) {
+                button.setBackground(SURFACE_HOVER);
+            }
+            
+            @Override
+            public void mouseExited(MouseEvent e) {
+                button.setBackground(PANEL_DARK);
+            }
+        });
+        
+        return button;
+    }
+    
+    // Accent button (blue primary button) for important actions
+    private JButton createAccentButton(String text, String iconType) {
+        JButton button = new JButton(text);
+        button.setFont(new Font("Segoe UI Semibold", Font.BOLD, 13));
+        button.setFocusPainted(false);
+        button.setBorderPainted(true);
+        button.setBorder(BorderFactory.createEmptyBorder(10, 20, 10, 20));
+        button.setBackground(ACCENT_BLUE);
+        button.setForeground(Color.WHITE);
+        button.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        button.setContentAreaFilled(false);
+        button.setOpaque(true);
+        
+        // Create icon if specified
+        if (iconType != null) {
+            ImageIcon icon = createProgrammaticIconLight(iconType, 16, 16);
+            if (icon != null) {
+                button.setIcon(icon);
+                button.setHorizontalTextPosition(SwingConstants.RIGHT);
+                button.setIconTextGap(8);
+            }
+        }
+        
+        // Hover effect
+        button.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseEntered(MouseEvent e) {
+                button.setBackground(ACCENT_BLUE_HOVER);
+            }
+            
+            @Override
+            public void mouseExited(MouseEvent e) {
+                button.setBackground(ACCENT_BLUE);
+            }
+        });
+        
+        return button;
+    }
+    
+    // Delete button styling (red accent)
+    private void styleDeleteButton(JButton button) {
+        button.setForeground(TEXT_PRIMARY);
+        button.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseEntered(MouseEvent e) {
+                button.setBackground(new Color(70, 35, 35));
+                button.setForeground(ACCENT_RED);
+            }
+            
+            @Override
+            public void mouseExited(MouseEvent e) {
+                button.setBackground(PANEL_DARK);
+                button.setForeground(TEXT_PRIMARY);
+            }
+        });
+    }
+    
+    // Styled text field for dark theme
+    private JTextField createStyledTextField(String text, int columns) {
+        JTextField field = new JTextField(text, columns);
+        field.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        field.setBackground(SECONDARY_DARK);
+        field.setForeground(TEXT_PRIMARY);
+        field.setCaretColor(TEXT_PRIMARY);
+        field.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(BORDER_DARK, 1),
+            BorderFactory.createEmptyBorder(5, 8, 5, 8)
+        ));
+        return field;
+    }
+    
+    // Styled checkbox for dark theme
+    private JCheckBox createStyledCheckbox(String text) {
+        JCheckBox checkbox = new JCheckBox(text);
+        checkbox.setFont(new Font("Segoe UI", Font.BOLD, 11));
+        checkbox.setForeground(TEXT_PRIMARY);
+        checkbox.setBackground(PANEL_DARK);
+        checkbox.setOpaque(false);
+        checkbox.setFocusPainted(false);
+        return checkbox;
+    }
+    
+    /**
+     * Creates programmatic icons using Java's Graphics2D API (light icon for dark background)
+     * No external dependencies or files required
+     */
+    private ImageIcon createProgrammaticIcon(String iconType, int width, int height) {
+        BufferedImage image = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g2d = image.createGraphics();
+        
+        // Enable antialiasing for smooth icons
+        g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        g2d.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+        
+        // Icon color - light for dark theme
+        g2d.setColor(TEXT_SECONDARY);
+        
+        switch (iconType.toLowerCase()) {
+            case "delete":
+                // Trash can icon
+                g2d.setStroke(new BasicStroke(1.5f));
+                // Lid
+                g2d.drawLine(4, 5, 12, 5);
+                g2d.drawLine(3, 6, 13, 6);
+                // Body
+                g2d.drawRect(5, 7, 6, 6);
+                // Handle
+                g2d.drawLine(7, 9, 9, 9);
+                break;
+                
+            case "play":
+                // Play triangle
+                int[] xPoints = {5, 12, 5};
+                int[] yPoints = {4, 8, 12};
+                g2d.fillPolygon(xPoints, yPoints, 3);
+                break;
+                
+            case "open":
+                // Folder icon
+                g2d.setStroke(new BasicStroke(1.5f));
+                // Folder body
+                g2d.drawRect(3, 6, 10, 7);
+                // Folder tab
+                g2d.drawLine(3, 6, 6, 6);
+                g2d.drawLine(6, 3, 6, 6);
+                g2d.drawLine(6, 3, 10, 3);
+                g2d.drawLine(10, 3, 10, 6);
+                break;
+                
+            case "brightness":
+                // Sun/brightness icon
+                g2d.setStroke(new BasicStroke(1.5f));
+                // Center circle
+                g2d.drawOval(6, 6, 4, 4);
+                // Rays
+                g2d.drawLine(8, 2, 8, 4);
+                g2d.drawLine(8, 12, 8, 14);
+                g2d.drawLine(2, 8, 4, 8);
+                g2d.drawLine(12, 8, 14, 8);
+                g2d.drawLine(5, 5, 6, 6);
+                g2d.drawLine(10, 10, 11, 11);
+                g2d.drawLine(5, 11, 6, 10);
+                g2d.drawLine(10, 5, 11, 6);
+                break;
+                
+            case "import":
+                // Down arrow into box
+                g2d.setStroke(new BasicStroke(1.5f));
+                // Box
+                g2d.drawRect(5, 9, 6, 4);
+                // Arrow
+                g2d.drawLine(8, 2, 8, 8);
+                g2d.drawLine(6, 6, 8, 8);
+                g2d.drawLine(8, 8, 10, 6);
+                break;
+                
+            case "export":
+                // Up arrow out of box
+                g2d.setStroke(new BasicStroke(1.5f));
+                // Box
+                g2d.drawRect(5, 3, 6, 4);
+                // Arrow
+                g2d.drawLine(8, 14, 8, 8);
+                g2d.drawLine(6, 10, 8, 8);
+                g2d.drawLine(8, 8, 10, 10);
+                break;
+                
+            case "help":
+                // Question mark
+                g2d.setStroke(new BasicStroke(1.5f));
+                // Question mark shape
+                g2d.drawOval(6, 3, 4, 4);
+                g2d.drawLine(8, 7, 8, 9);
+                g2d.fillOval(7, 10, 2, 2);
+                break;
+                
+            case "flow":
+                // Flow/wave icon
+                g2d.setStroke(new BasicStroke(2.0f));
+                // Wave lines
+                g2d.drawArc(2, 4, 6, 6, 0, 180);
+                g2d.drawArc(8, 4, 6, 6, 0, 180);
+                g2d.drawArc(2, 8, 6, 6, 180, 180);
+                g2d.drawArc(8, 8, 6, 6, 180, 180);
+                break;
+                
+            default:
+                return null;
+        }
+        
+        g2d.dispose();
+        return new ImageIcon(image);
+    }
+    
+    /**
+     * Creates an anchor icon programmatically using Graphics2D
+     * @param size The size of the icon
+     * @param color The color to use for the anchor
+     * @return An Icon representing an anchor/pin
+     */
+    private Icon createAnchorIcon(int size, Color color) {
+        return new Icon() {
+            @Override
+            public void paintIcon(Component c, Graphics g, int x, int y) {
+                Graphics2D g2d = (Graphics2D) g.create();
+                g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                
+                // Use the track's color for the anchor
+                g2d.setColor(color);
+                g2d.setStroke(new BasicStroke(1.5f));
+                
+                // Draw a pin/anchor shape
+                // Circle at the top
+                int circleSize = size / 3;
+                g2d.fillOval(x + size/2 - circleSize/2, y, circleSize, circleSize);
+                
+                // Pin body (vertical line)
+                g2d.setStroke(new BasicStroke(2f));
+                g2d.drawLine(x + size/2, y + circleSize, x + size/2, y + size);
+                
+                // Pin point (small triangle at bottom)
+                int[] xPoints = {x + size/2 - 2, x + size/2 + 2, x + size/2};
+                int[] yPoints = {y + size - 2, y + size - 2, y + size};
+                g2d.fillPolygon(xPoints, yPoints, 3);
+                
+                g2d.dispose();
+            }
+            
+            @Override
+            public int getIconWidth() {
+                return size;
+            }
+            
+            @Override
+            public int getIconHeight() {
+                return size;
+            }
+        };
+    }
+    
+    private JLabel createStyledLabel(String text) {
+        JLabel label = new JLabel(text);
+        label.setFont(new Font("Segoe UI", Font.BOLD, 12));
+        label.setForeground(TEXT_SECONDARY);
+        return label;
+    }
+    
+    private JSeparator createSeparator() {
+        JSeparator separator = new JSeparator(SwingConstants.VERTICAL);
+        separator.setPreferredSize(new Dimension(1, 24));
+        separator.setForeground(BORDER_DARK);
+        separator.setBackground(BORDER_DARK);
+        return separator;
+    }
+    
+    // Configuration dialog helper methods
+    private JLabel createConfigLabel(String text) {
+        JLabel label = new JLabel(text);
+        label.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        label.setForeground(TEXT_PRIMARY);
+        return label;
+    }
+    
+    private JTextField createConfigTextField(String text, int columns) {
+        JTextField field = new JTextField(text, columns);
+        field.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        field.setBackground(PANEL_DARK);
+        field.setForeground(TEXT_PRIMARY);
+        field.setCaretColor(TEXT_PRIMARY);
+        field.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(BORDER_DARK, 1),
+            BorderFactory.createEmptyBorder(6, 10, 6, 10)
+        ));
+        return field;
+    }
+    
+    /**
+     * Creates a panel containing a text field with a browse button for file/directory selection.
+     * @param textField The text field to populate with the selected path
+     * @param parent Parent dialog for the file chooser
+     * @param directoryMode If true, select directories; if false, select files
+     * @param fileFilter Array of {description, ext1, ext2, ...} for file filter, or null for no filter
+     * @param dialogTitle Title for the file chooser dialog
+     * @return A JPanel containing the text field and browse button
+     */
+    private JPanel createPathFieldWithBrowse(JTextField textField, JDialog parent, boolean directoryMode, 
+                                              String[] fileFilter, String dialogTitle) {
+        JPanel panel = new JPanel(new BorderLayout(4, 0));
+        panel.setBackground(PANEL_DARK);
+        panel.add(textField, BorderLayout.CENTER);
+        
+        JButton browseBtn = new JButton("...");
+        browseBtn.setFont(new Font("Segoe UI", Font.BOLD, 12));
+        browseBtn.setBackground(SECONDARY_DARK);
+        browseBtn.setForeground(TEXT_PRIMARY);
+        browseBtn.setFocusPainted(false);
+        browseBtn.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(BORDER_DARK, 1),
+            BorderFactory.createEmptyBorder(4, 8, 4, 8)
+        ));
+        browseBtn.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        browseBtn.setToolTipText("Browse...");
+        
+        // Hover effect
+        browseBtn.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseEntered(MouseEvent e) {
+                browseBtn.setBackground(SURFACE_HOVER);
+            }
+            @Override
+            public void mouseExited(MouseEvent e) {
+                browseBtn.setBackground(SECONDARY_DARK);
+            }
+        });
+        
+        browseBtn.addActionListener(e -> {
+            JFileChooser chooser = new JFileChooser();
+            chooser.setDialogTitle(dialogTitle);
+            
+            // Set initial directory from current text field value
+            String currentPath = textField.getText().trim();
+            if (!currentPath.isEmpty() && !currentPath.startsWith("{")) {
+                File currentFile = new File(currentPath);
+                if (currentFile.exists()) {
+                    if (currentFile.isDirectory()) {
+                        chooser.setCurrentDirectory(currentFile);
+                    } else {
+                        chooser.setCurrentDirectory(currentFile.getParentFile());
+                        chooser.setSelectedFile(currentFile);
+                    }
+                } else if (currentFile.getParentFile() != null && currentFile.getParentFile().exists()) {
+                    chooser.setCurrentDirectory(currentFile.getParentFile());
+                }
+            }
+            
+            if (directoryMode) {
+                chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+            } else {
+                chooser.setFileSelectionMode(JFileChooser.FILES_ONLY);
+                if (fileFilter != null && fileFilter.length >= 2) {
+                    String description = fileFilter[0];
+                    String[] extensions = new String[fileFilter.length - 1];
+                    System.arraycopy(fileFilter, 1, extensions, 0, extensions.length);
+                    chooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter(description, extensions));
+                }
+            }
+            
+            int result = chooser.showOpenDialog(parent);
+            if (result == JFileChooser.APPROVE_OPTION) {
+                File selected = chooser.getSelectedFile();
+                textField.setText(selected.getAbsolutePath());
+            }
+        });
+        
+        panel.add(browseBtn, BorderLayout.EAST);
+        return panel;
+    }
+    
+    private JComboBox<String> createConfigComboBox(String[] items) {
+        JComboBox<String> combo = new JComboBox<>(items);
+        combo.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        combo.setBackground(PANEL_DARK);
+        combo.setForeground(TEXT_PRIMARY);
+        combo.setBorder(BorderFactory.createLineBorder(BORDER_DARK, 1));
+        
+        // Custom renderer to force dark background in dropdown
+        combo.setRenderer(new DefaultListCellRenderer() {
+            @Override
+            public Component getListCellRendererComponent(JList<?> list, Object value,
+                    int index, boolean isSelected, boolean cellHasFocus) {
+                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+                if (isSelected) {
+                    setBackground(ACCENT_BLUE);
+                    setForeground(Color.WHITE);
+                } else {
+                    setBackground(PANEL_DARK);
+                    setForeground(TEXT_PRIMARY);
+                }
+                setBorder(BorderFactory.createEmptyBorder(4, 8, 4, 8));
+                return this;
+            }
+        });
+        
+        // Force the popup to have dark background - initially
+        forceStyleComboPopup(combo);
+        
+        // Add popup listener to style popup when it becomes visible
+        combo.addPopupMenuListener(new PopupMenuListener() {
+            @Override
+            public void popupMenuWillBecomeVisible(PopupMenuEvent e) {
+                SwingUtilities.invokeLater(() -> forceStyleComboPopup(combo));
+            }
+            @Override
+            public void popupMenuWillBecomeInvisible(PopupMenuEvent e) {}
+            @Override
+            public void popupMenuCanceled(PopupMenuEvent e) {}
+        });
+        
+        return combo;
+    }
+    
+    // Style any JComboBox for dark theme
+    private void styleComboBox(JComboBox<?> combo) {
+        combo.setBackground(PANEL_DARK);
+        combo.setForeground(TEXT_PRIMARY);
+        combo.setRenderer(new DefaultListCellRenderer() {
+            @Override
+            public Component getListCellRendererComponent(JList<?> list, Object value,
+                    int index, boolean isSelected, boolean cellHasFocus) {
+                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+                if (isSelected) {
+                    setBackground(ACCENT_BLUE);
+                    setForeground(Color.WHITE);
+                } else {
+                    setBackground(PANEL_DARK);
+                    setForeground(TEXT_PRIMARY);
+                }
+                return this;
+            }
+        });
+        
+        // Force popup styling - initially
+        forceStyleComboPopup(combo);
+        
+        // Add popup listener to style popup when it becomes visible
+        combo.addPopupMenuListener(new PopupMenuListener() {
+            @Override
+            public void popupMenuWillBecomeVisible(PopupMenuEvent e) {
+                // Re-style when popup is about to show
+                SwingUtilities.invokeLater(() -> forceStyleComboPopup(combo));
+            }
+            @Override
+            public void popupMenuWillBecomeInvisible(PopupMenuEvent e) {}
+            @Override
+            public void popupMenuCanceled(PopupMenuEvent e) {}
+        });
+    }
+    
+    // Force style combo box popup
+    private void forceStyleComboPopup(JComboBox<?> combo) {
+        Object child = combo.getAccessibleContext().getAccessibleChild(0);
+        if (child instanceof javax.swing.plaf.basic.BasicComboPopup) {
+            javax.swing.plaf.basic.BasicComboPopup popup = (javax.swing.plaf.basic.BasicComboPopup) child;
+            popup.setBackground(PANEL_DARK);
+            popup.setBorder(BorderFactory.createLineBorder(BORDER_DARK, 1));
+            JList<?> list = popup.getList();
+            if (list != null) {
+                list.setBackground(PANEL_DARK);
+                list.setForeground(TEXT_PRIMARY);
+                list.setSelectionBackground(ACCENT_BLUE);
+                list.setSelectionForeground(Color.WHITE);
+            }
+            // Style the scroll pane in the popup
+            for (Component c : popup.getComponents()) {
+                c.setBackground(PANEL_DARK);
+                if (c instanceof JScrollPane) {
+                    JScrollPane sp = (JScrollPane) c;
+                    sp.setBackground(PANEL_DARK);
+                    sp.getViewport().setBackground(PANEL_DARK);
+                    if (sp.getVerticalScrollBar() != null) {
+                        sp.getVerticalScrollBar().setBackground(SECONDARY_DARK);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Style any JSpinner for dark theme
+    private void styleSpinner(JSpinner spinner) {
+        spinner.setBackground(PANEL_DARK);
+        spinner.setForeground(TEXT_PRIMARY);
+        
+        // Style the editor (text field)
+        JComponent editor = spinner.getEditor();
+        if (editor instanceof JSpinner.DefaultEditor) {
+            JTextField textField = ((JSpinner.DefaultEditor) editor).getTextField();
+            textField.setBackground(PANEL_DARK);
+            textField.setForeground(TEXT_PRIMARY);
+            textField.setCaretColor(TEXT_PRIMARY);
+            textField.setBorder(BorderFactory.createEmptyBorder(2, 5, 2, 5));
+        }
+        
+        // Style the spinner buttons
+        for (Component c : spinner.getComponents()) {
+            if (c instanceof JButton) {
+                JButton button = (JButton) c;
+                button.setBackground(SECONDARY_DARK);
+                button.setForeground(TEXT_PRIMARY);
+                button.setBorder(BorderFactory.createLineBorder(BORDER_DARK, 1));
+            }
+        }
+        
+        spinner.setBorder(BorderFactory.createLineBorder(BORDER_DARK, 1));
+    }
+    
+    // Light icons for accent (blue) buttons
+    private ImageIcon createProgrammaticIconLight(String iconType, int width, int height) {
+        BufferedImage image = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g2d = image.createGraphics();
+        
+        g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        g2d.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+        
+        g2d.setColor(Color.WHITE);
+        
+        switch (iconType.toLowerCase()) {
+            case "play":
+                int[] xPoints = {5, 12, 5};
+                int[] yPoints = {4, 8, 12};
+                g2d.fillPolygon(xPoints, yPoints, 3);
+                break;
+            default:
+                return createProgrammaticIcon(iconType, width, height);
+        }
+        
+        g2d.dispose();
+        return new ImageIcon(image);
+    }
+    
+    // Create custom application icon
+    private BufferedImage createAppIcon() {
+        int size = 64;
+        BufferedImage icon = new BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g2d = icon.createGraphics();
+        
+        g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        g2d.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+        
+        // Background circle with gradient
+        GradientPaint gradient = new GradientPaint(0, 0, ACCENT_BLUE, size, size, new Color(40, 80, 180));
+        g2d.setPaint(gradient);
+        g2d.fillOval(4, 4, size - 8, size - 8);
+        
+        // White "R" letter for RIPPLE
+        g2d.setColor(Color.WHITE);
+        g2d.setFont(new Font("Arial", Font.BOLD, 36));
+        FontMetrics fm = g2d.getFontMetrics();
+        String text = "R";
+        int textWidth = fm.stringWidth(text);
+        int textX = (size - textWidth) / 2;
+        int textY = (size + fm.getAscent() - fm.getDescent()) / 2;
+        g2d.drawString(text, textX, textY);
+        
+        // Small ripple circles emanating from bottom right
+        g2d.setColor(new Color(255, 255, 255, 100));
+        g2d.setStroke(new BasicStroke(2f));
+        g2d.drawOval(size - 20, size - 20, 12, 12);
+        g2d.setColor(new Color(255, 255, 255, 60));
+        g2d.drawOval(size - 26, size - 26, 24, 24);
+        
+        g2d.dispose();
+        return icon;
+    }
+    
+    // Create styled file chooser with dark theme
+    private JFileChooser createStyledFileChooser() {
+        JFileChooser chooser = new JFileChooser();
+        styleFileChooser(chooser);
+        return chooser;
+    }
+    
+    // Apply dark theme styling to file chooser components recursively
+    private void styleFileChooser(JFileChooser chooser) {
+        chooser.setBackground(SECONDARY_DARK);
+        chooser.setForeground(TEXT_PRIMARY);
+        styleComponentRecursively(chooser);
+    }
+    
+    // Recursively style all components for dark theme - comprehensive version
+    private void styleComponentRecursively(Container container) {
+        for (Component comp : container.getComponents()) {
+            // Force background on ALL components first
+            comp.setBackground(SECONDARY_DARK);
+            comp.setForeground(TEXT_PRIMARY);
+            
+            // Then apply specific styling
+            if (comp instanceof JPanel) {
+                ((JPanel) comp).setOpaque(true);
+                comp.setBackground(SECONDARY_DARK);
+                comp.setForeground(TEXT_PRIMARY);
+            } else if (comp instanceof JLabel) {
+                comp.setForeground(TEXT_PRIMARY);
+                comp.setBackground(SECONDARY_DARK);
+            } else if (comp instanceof JTextField) {
+                comp.setBackground(PANEL_DARK);
+                comp.setForeground(TEXT_PRIMARY);
+                ((JTextField) comp).setCaretColor(TEXT_PRIMARY);
+                ((JTextField) comp).setSelectionColor(ACCENT_BLUE);
+                ((JTextField) comp).setSelectedTextColor(Color.WHITE);
+            } else if (comp instanceof JTextArea) {
+                comp.setBackground(PANEL_DARK);
+                comp.setForeground(TEXT_PRIMARY);
+                ((JTextArea) comp).setCaretColor(TEXT_PRIMARY);
+                ((JTextArea) comp).setSelectionColor(ACCENT_BLUE);
+                ((JTextArea) comp).setSelectedTextColor(Color.WHITE);
+            } else if (comp instanceof JComboBox) {
+                styleComboBox((JComboBox<?>) comp);
+            } else if (comp instanceof JButton) {
+                comp.setBackground(PANEL_DARK);
+                comp.setForeground(TEXT_PRIMARY);
+                ((JButton) comp).setOpaque(true);
+                ((JButton) comp).setBorderPainted(true);
+            } else if (comp instanceof JToggleButton) {
+                comp.setBackground(PANEL_DARK);
+                comp.setForeground(TEXT_PRIMARY);
+            } else if (comp instanceof JList) {
+                comp.setBackground(PANEL_DARK);
+                comp.setForeground(TEXT_PRIMARY);
+                ((JList<?>) comp).setSelectionBackground(ACCENT_BLUE);
+                ((JList<?>) comp).setSelectionForeground(Color.WHITE);
+            } else if (comp instanceof JScrollPane) {
+                comp.setBackground(PANEL_DARK);
+                JScrollPane sp = (JScrollPane) comp;
+                sp.getViewport().setBackground(PANEL_DARK);
+                if (sp.getVerticalScrollBar() != null) {
+                    sp.getVerticalScrollBar().setBackground(SECONDARY_DARK);
+                }
+                if (sp.getHorizontalScrollBar() != null) {
+                    sp.getHorizontalScrollBar().setBackground(SECONDARY_DARK);
+                }
+            } else if (comp instanceof JScrollBar) {
+                comp.setBackground(SECONDARY_DARK);
+            } else if (comp instanceof JCheckBox) {
+                comp.setBackground(SECONDARY_DARK);
+                comp.setForeground(TEXT_PRIMARY);
+            } else if (comp instanceof JRadioButton) {
+                comp.setBackground(SECONDARY_DARK);
+                comp.setForeground(TEXT_PRIMARY);
+            } else if (comp instanceof JSlider) {
+                comp.setBackground(SECONDARY_DARK);
+                comp.setForeground(TEXT_PRIMARY);
+            } else if (comp instanceof JSpinner) {
+                comp.setBackground(PANEL_DARK);
+                comp.setForeground(TEXT_PRIMARY);
+                JSpinner spinner = (JSpinner) comp;
+                JComponent editor = spinner.getEditor();
+                if (editor instanceof JSpinner.DefaultEditor) {
+                    JTextField tf = ((JSpinner.DefaultEditor) editor).getTextField();
+                    tf.setBackground(PANEL_DARK);
+                    tf.setForeground(TEXT_PRIMARY);
+                    tf.setCaretColor(TEXT_PRIMARY);
+                }
+            } else if (comp instanceof JProgressBar) {
+                comp.setBackground(PANEL_DARK);
+                comp.setForeground(ACCENT_BLUE);
+            } else if (comp instanceof JTabbedPane) {
+                comp.setBackground(SECONDARY_DARK);
+                comp.setForeground(TEXT_PRIMARY);
+            } else if (comp instanceof JTable) {
+                comp.setBackground(PANEL_DARK);
+                comp.setForeground(TEXT_PRIMARY);
+                ((JTable) comp).setSelectionBackground(ACCENT_BLUE);
+                ((JTable) comp).setSelectionForeground(Color.WHITE);
+                ((JTable) comp).setGridColor(BORDER_DARK);
+            } else if (comp instanceof JTree) {
+                comp.setBackground(PANEL_DARK);
+                comp.setForeground(TEXT_PRIMARY);
+            } else if (comp instanceof JSplitPane) {
+                comp.setBackground(SECONDARY_DARK);
+            } else if (comp instanceof JToolBar) {
+                comp.setBackground(PANEL_DARK);
+                comp.setForeground(TEXT_PRIMARY);
+            } else if (comp instanceof JMenuBar) {
+                comp.setBackground(PRIMARY_DARK);
+                comp.setForeground(TEXT_PRIMARY);
+            } else if (comp instanceof JMenu) {
+                comp.setBackground(PANEL_DARK);
+                comp.setForeground(TEXT_PRIMARY);
+            } else if (comp instanceof JMenuItem) {
+                comp.setBackground(PANEL_DARK);
+                comp.setForeground(TEXT_PRIMARY);
+            } else if (comp instanceof JPopupMenu) {
+                comp.setBackground(PANEL_DARK);
+                comp.setForeground(TEXT_PRIMARY);
+            }
+            
+            // Recursively process containers
+            if (comp instanceof Container) {
+                styleComponentRecursively((Container) comp);
+            }
+        }
+    }
+    
+    // Style a JDialog for dark theme
+    private void styleDialog(JDialog dialog) {
+        dialog.getContentPane().setBackground(SECONDARY_DARK);
+        if (dialog.getRootPane() != null) {
+            dialog.getRootPane().setBackground(SECONDARY_DARK);
+        }
+        styleComponentRecursively(dialog.getContentPane());
+    }
+    
+    // Style a component for dark theme (can be called on any component)
+    private void forceStyleComponent(Component comp) {
+        comp.setBackground(SECONDARY_DARK);
+        comp.setForeground(TEXT_PRIMARY);
+        if (comp instanceof Container) {
+            styleComponentRecursively((Container) comp);
+        }
+    }
+}

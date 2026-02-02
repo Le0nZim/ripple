@@ -1,0 +1,53 @@
+# Git LFS tracking for large files
+# See https://git-lfs.github.com/
+
+# Model weights and checkpoints
+*.ckpt filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+
+# Large data files
+*.npy filter=lfs diff=lfs merge=lfs -text
+*.npz filter=lfs diff=lfs merge=lfs -text
+*.h5 filter=lfs diff=lfs merge=lfs -text
+*.hdf5 filter=lfs diff=lfs merge=lfs -text
+
+# Video files (if any)
+*.mp4 filter=lfs diff=lfs merge=lfs -text
+*.avi filter=lfs diff=lfs merge=lfs -text
+*.mov filter=lfs diff=lfs merge=lfs -text
+
+# Large image stacks
+*.tif filter=lfs diff=lfs merge=lfs -text
+*.tiff filter=lfs diff=lfs merge=lfs -text
+
+# Ensure shell scripts use LF line endings
+*.sh text eol=lf
+quickstart.sh text eol=lf
+uninstall.sh text eol=lf
+RIPPLE.sh text eol=lf
+
+# Ensure batch files use CRLF line endings
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Java source files
+*.java text
+
+# Python source files
+*.py text
+
+# Config files
+*.properties text
+*.yml text
+*.yaml text
+*.xml text
+*.json text
+*.ini text
+
+# Documentation
+*.md text
+*.txt text

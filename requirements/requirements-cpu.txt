@@ -1,0 +1,47 @@
+# =============================================================================
+# RIPPLE - CPU Requirements (No GPU needed)
+# =============================================================================
+# These packages work on any system without GPU/CUDA requirements.
+# This mode provides TrackPy, TrackMate-style DoG, and DIS optical flow.
+#
+# GPU features (RAFT, LocoTrack) are NOT available in this mode.
+#
+# Install with: pip install -r requirements-cpu.txt
+# =============================================================================
+
+# Core scientific computing
+numpy>=2.0.0
+scipy>=1.10.0
+pandas>=2.0.0
+
+# Image processing
+tifffile>=2023.2.0
+imageio>=2.28.0
+mediapy>=1.2.0
+opencv-python>=4.7.0
+scikit-image>=0.20.0
+pillow>=10.0.0
+
+# PyTorch CPU version
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Particle tracking (CPU-based)
+trackpy>=0.6.0
+
+# Data handling
+h5py>=3.8.0
+
+# System utilities
+psutil>=5.9.0
+tqdm>=4.65.0
+requests>=2.28.0
+
+# Visualization
+matplotlib>=3.7.0
+
+# Utilities
+pyyaml>=6.0
+click>=8.0.0
+rich>=13.0.0

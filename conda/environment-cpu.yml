@@ -1,0 +1,64 @@
+# =============================================================================
+# RIPPLE - Conda Environment Configuration (CPU Only)
+# =============================================================================
+# Environment configuration for RIPPLE in CPU mode.
+# Use this on systems without NVIDIA GPUs.
+#
+# Installation:
+#   conda env create -f environment-cpu.yml -n ripple-env
+#   conda activate ripple-env
+#
+# Note: GPU features (RAFT, LocoTrack) are NOT available in CPU mode.
+#       TrackPy, TrackMate-style DoG, and DIS optical flow are available.
+# =============================================================================
+
+name: ripple-env
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip>=25.0
+  - setuptools>=80.0
+  - wheel>=0.45
+  - pip:
+      # Core scientific computing
+      - numpy>=2.2.0
+      - scipy>=1.16.0
+      - pandas>=2.3.0
+      
+      # Image processing
+      - tifffile>=2025.10.0
+      - imageio>=2.37.0
+      - mediapy>=1.2.0
+      - opencv-python>=4.12.0
+      - scikit-image>=0.25.0
+      - pillow>=12.0.0
+      
+      # PyTorch CPU only (from CPU-only wheel index)
+      - --extra-index-url https://download.pytorch.org/whl/cpu
+      - torch>=2.0.0
+      - torchvision>=0.15.0
+      
+      # Particle tracking
+      - trackpy>=0.7
+      
+      # Data handling
+      - h5py>=3.15.0
+      
+      # System utilities
+      - psutil>=7.1.0
+      - tqdm>=4.67.0
+      - requests>=2.32.0
+      
+      # Visualization
+      - matplotlib>=3.10.0
+      
+      # Utilities
+      - pyyaml>=6.0.0
+      - click>=8.3.0
+      - rich>=14.2.0
+
+# Environment variables
+variables:
+  RIPPLE_ENV: "conda"
+  RIPPLE_MODE: "cpu"

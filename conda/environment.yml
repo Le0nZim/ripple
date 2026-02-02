@@ -1,0 +1,75 @@
+# =============================================================================
+# RIPPLE - Conda Environment Configuration (GPU Mode)
+# =============================================================================
+# Environment configuration for RIPPLE with GPU (CUDA) support.
+# 
+# Installation:
+#   conda env create -f environment.yml -n ripple-env
+#   conda activate ripple-env
+#
+# For CPU-only systems, use:
+#   conda env create -f environment-cpu.yml -n ripple-env
+# =============================================================================
+
+name: ripple-env
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip>=25.0
+  - setuptools>=80.0
+  - wheel>=0.45
+  - pip:
+      # Core scientific computing
+      - numpy>=2.2.0
+      - scipy>=1.16.0
+      - pandas>=2.3.0
+      
+      # Image processing
+      - tifffile>=2025.10.0
+      - imageio>=2.37.0
+      - mediapy>=1.2.0
+      - opencv-python>=4.12.0
+      - scikit-image>=0.25.0
+      - pillow>=12.0.0
+      
+      # PyTorch with CUDA
+      - torch>=2.9.0
+      - torchvision>=0.24.0
+      - torchaudio>=2.9.0
+      - pytorch-lightning>=2.6.0
+      - lightning>=2.3.0
+      - torchmetrics>=1.8.0
+      - einops>=0.8.0
+      
+      # TensorFlow (for LocoTrack)
+      - tensorflow>=2.20.0
+      - tensorflow-addons>=0.22.0
+      - tensorflow-datasets>=4.9.0
+      - tensorflow-graphics>=2021.12.0
+      - keras>=3.12.0
+      
+      # Particle tracking
+      - trackpy>=0.7
+      
+      # Data handling
+      - h5py>=3.15.0
+      - pyarrow>=22.0.0
+      
+      # System utilities
+      - psutil>=7.1.0
+      - tqdm>=4.67.0
+      - requests>=2.32.0
+      
+      # Visualization
+      - matplotlib>=3.10.0
+      
+      # Utilities
+      - pyyaml>=6.0.0
+      - click>=8.3.0
+      - rich>=14.2.0
+
+# Environment variables
+variables:
+  RIPPLE_ENV: "conda"
+  RIPPLE_MODE: "gpu"
