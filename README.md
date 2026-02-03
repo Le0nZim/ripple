@@ -181,7 +181,7 @@ nvidia-smi  # Should show GPU info
 
 ## 📄 License
 
-MIT License. See [LICENSE](LICENSE).
+MIT License. See [LICENSE](https://github.com/Le0nZim/ripple/blob/main/LICENCE).
 
 ## 🙏 Acknowledgments
 
