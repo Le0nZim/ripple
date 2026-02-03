@@ -905,6 +905,12 @@ public class VideoAnnotationTool {
             cancelTrimMode();
         }
         
+        // Pause any active track timer before restoring state
+        // This ensures time is properly accumulated before we overwrite trackStartTime
+        if (selectedTrackId != null) {
+            pauseTrackTimer(selectedTrackId);
+        }
+        
         redoStack.push(new AnnotationState(trackAnnotations, trackColors, trackAnchors,
                                            trackOptimized, trackSelected,
                                            trackTotalTime, trackStartTime, trackCompleted,
@@ -958,6 +964,12 @@ public class VideoAnnotationTool {
         // Exit trim mode if active (redo could change track state)
         if (trimModeActive) {
             cancelTrimMode();
+        }
+        
+        // Pause any active track timer before restoring state
+        // This ensures time is properly accumulated before we overwrite trackStartTime
+        if (selectedTrackId != null) {
+            pauseTrackTimer(selectedTrackId);
         }
         
         undoStack.push(new AnnotationState(trackAnnotations, trackColors, trackAnchors,
@@ -1786,19 +1798,27 @@ public class VideoAnnotationTool {
     /**
      * Format milliseconds as a human-readable time string.
      * @param millis Time in milliseconds
-     * @return Formatted string like "1h 23m 45s" or "5m 30s" or "45s"
+     * @return Formatted string like "2d 1h 23m 45s" or "1h 23m 45s" or "5m 30s" or "45s"
      */
     private String formatTime(long millis) {
+        // Handle negative values (shouldn't happen, but be defensive)
+        if (millis < 0) {
+            return "0s (invalid)";
+        }
         if (millis < 1000) {
             return "< 1s";
         }
         long seconds = millis / 1000;
         long minutes = seconds / 60;
         long hours = minutes / 60;
+        long days = hours / 24;
         seconds = seconds % 60;
         minutes = minutes % 60;
+        hours = hours % 24;
         
-        if (hours > 0) {
+        if (days > 0) {
+            return String.format("%dd %dh %dm %ds", days, hours, minutes, seconds);
+        } else if (hours > 0) {
             return String.format("%dh %dm %ds", hours, minutes, seconds);
         } else if (minutes > 0) {
             return String.format("%dm %ds", minutes, seconds);
@@ -1835,9 +1855,34 @@ public class VideoAnnotationTool {
     private void pauseTrackTimer(String trackId) {
         Long startTime = trackStartTime.get(trackId);
         if (startTime != null && startTime > 0) {
-            long elapsed = System.currentTimeMillis() - startTime;
-            long currentTotal = trackTotalTime.getOrDefault(trackId, 0L);
-            trackTotalTime.put(trackId, currentTotal + elapsed);
+            long now = System.currentTimeMillis();
+            long elapsed = now - startTime;
+            // Only accumulate positive elapsed time (handles clock skew edge case)
+            if (elapsed > 0) {
+                long currentTotal = trackTotalTime.getOrDefault(trackId, 0L);
+                if (currentTotal < 0) currentTotal = 0;  // Ensure non-negative base
+                
+                // Cap elapsed time to prevent unreasonably large values (max 24 hours per session)
+                final long MAX_ELAPSED_MS = 24L * 60 * 60 * 1000;
+                if (elapsed > MAX_ELAPSED_MS) {
+                    System.err.println("Warning: Elapsed time for track " + trackId + " (" + (elapsed / 1000 / 60) + 
+                        " min) exceeds 24h, capping to 24h. Possible system clock change.");
+                    elapsed = MAX_ELAPSED_MS;
+                }
+                
+                // Overflow-safe addition
+                long newTotal = currentTotal + elapsed;
+                if (newTotal < currentTotal) {
+                    // Overflow occurred
+                    newTotal = Long.MAX_VALUE;
+                    System.err.println("Warning: Time overflow for track " + trackId + ", capping to max value");
+                }
+                trackTotalTime.put(trackId, newTotal);
+            } else if (elapsed < -60000) {
+                // Only warn if clock went backwards by more than 1 minute (ignore minor drift)
+                System.err.println("Warning: System clock may have moved backwards for track " + trackId + 
+                    " (elapsed=" + elapsed + "ms). Discarding this timing segment.");
+            }
             trackStartTime.put(trackId, 0L); // Mark as paused
         }
     }
@@ -1845,14 +1890,32 @@ public class VideoAnnotationTool {
     /**
      * Get the current total time for a track (including any active timing).
      * @param trackId The track ID
-     * @return Total time in milliseconds
+     * @return Total time in milliseconds (guaranteed non-negative, capped to reasonable max)
      */
     private long getTrackTotalTime(String trackId) {
+        // Max reasonable time: 30 days in milliseconds
+        final long MAX_REASONABLE_TIME_MS = 30L * 24 * 60 * 60 * 1000;
+        
         long total = trackTotalTime.getOrDefault(trackId, 0L);
+        if (total < 0) total = 0;  // Ensure non-negative base
+        if (total > MAX_REASONABLE_TIME_MS) total = MAX_REASONABLE_TIME_MS;  // Cap to reasonable max
+        
         Long startTime = trackStartTime.get(trackId);
         if (startTime != null && startTime > 0) {
-            // Add currently running time
-            total += System.currentTimeMillis() - startTime;
+            // Add currently running time (only if positive to handle clock skew)
+            long elapsed = System.currentTimeMillis() - startTime;
+            if (elapsed > 0) {
+                // Cap elapsed to 24 hours max per session
+                if (elapsed > 24L * 60 * 60 * 1000) {
+                    elapsed = 24L * 60 * 60 * 1000;
+                }
+                // Overflow-safe addition
+                if (total <= Long.MAX_VALUE - elapsed && total + elapsed <= MAX_REASONABLE_TIME_MS) {
+                    total += elapsed;
+                } else {
+                    total = MAX_REASONABLE_TIME_MS;
+                }
+            }
         }
         return total;
     }
@@ -2017,6 +2080,18 @@ public class VideoAnnotationTool {
      */
     private void resumeTrackEditing(String trackId) {
         saveState(); // Save state for undo
+        
+        // Pause timer for the previously selected track before switching
+        if (selectedTrackId != null && !selectedTrackId.equals(trackId)) {
+            pauseTrackTimer(selectedTrackId);
+        }
+        
+        // Switch selection to the resumed track
+        selectedTrackId = trackId;
+        for (String tid : trackSelected.keySet()) {
+            trackSelected.put(tid, false);
+        }
+        trackSelected.put(trackId, true);
         
         // Restore untrimmed data if this track was trimmed (legacy support)
         if (trackUntrimmedAnnotations.containsKey(trackId)) {
@@ -3607,12 +3682,21 @@ public class VideoAnnotationTool {
                         .filter(trackId -> !trackOptimized.getOrDefault(trackId, false))
                         .collect(java.util.stream.Collectors.toList());
                     
+                    // Pause timer for the selected track if it will be removed
+                    if (toRemove.contains(selectedTrackId)) {
+                        pauseTrackTimer(selectedTrackId);
+                    }
+                    
                     for (String trackId : toRemove) {
                         trackAnnotations.remove(trackId);
                         trackColors.remove(trackId);
                         trackAnchors.remove(trackId);
                         trackOptimized.remove(trackId);
                         trackSelected.remove(trackId);
+                        // Clean up time tracking data
+                        trackTotalTime.remove(trackId);
+                        trackStartTime.remove(trackId);
+                        trackCompleted.remove(trackId);
                         // Clean up trim data
                         trackUntrimmedAnnotations.remove(trackId);
                         trackUntrimmedAnchors.remove(trackId);
@@ -13295,6 +13379,8 @@ public class VideoAnnotationTool {
             "Confirm Delete", JOptionPane.YES_NO_OPTION);
         
         if (confirm == JOptionPane.YES_OPTION) {
+            // Pause timer for the track being deleted to properly accumulate time
+            pauseTrackTimer(selectedTrackId);
             saveState();
             // Exit comparison mode if deleting the comparison track
             if (smoothingComparisonMode && selectedTrackId.equals(smoothingComparisonTrackId)) {
@@ -13958,6 +14044,10 @@ public class VideoAnnotationTool {
             }
             
             // No longer require Frame 1 - bidirectional propagation supported
+            // Pause the timer for the previously selected track before switching
+            if (selectedTrackId != null) {
+                pauseTrackTimer(selectedTrackId);
+            }
             int nextNum = findNextAvailableTrackNumber();
             selectedTrackId = "Track" + nextNum;
             trackAnnotations.put(selectedTrackId, new HashMap<>());
@@ -14282,6 +14372,11 @@ public class VideoAnnotationTool {
             return;
         }
         
+        // Pause timer for the selected track if it will be removed
+        if (toRemove.contains(selectedTrackId)) {
+            pauseTrackTimer(selectedTrackId);
+        }
+        
         saveState();
         
         for (String trackId : toRemove) {
@@ -14345,6 +14440,11 @@ public class VideoAnnotationTool {
         
         if (confirm != JOptionPane.YES_OPTION) {
             return;
+        }
+        
+        // Pause all active track timers before clearing
+        for (String trackId : trackStartTime.keySet()) {
+            pauseTrackTimer(trackId);
         }
         
         saveState();
@@ -15818,6 +15918,12 @@ public class VideoAnnotationTool {
             // Note: originalImp was removed - it was never used and doubled memory requirements
             totalSlices = imp.getStackSize();
             currentSlice = 1;
+            
+            // Pause any active track timer before clearing track data
+            if (selectedTrackId != null) {
+                pauseTrackTimer(selectedTrackId);
+            }
+            
             trackAnnotations.clear();
             trackColors.clear();
             selectedTrackId = null;
@@ -16936,6 +17042,12 @@ public class VideoAnnotationTool {
     private void exportToJson(File outputFile, ExportContent content) throws Exception {
         JSONObject exportRoot = new JSONObject();
         
+        // Snapshot current time once for consistent calculations across the export
+        final long exportTimeMs = System.currentTimeMillis();
+        
+        // Max reasonable time: 30 days in milliseconds (prevents overflow issues)
+        final long MAX_REASONABLE_TIME_MS = 30L * 24 * 60 * 60 * 1000;
+        
         // Add metadata
         JSONObject metadata = new JSONObject();
         metadata.put("format_type", content == ExportContent.RICH ? "rich" : "trajectories_only");
@@ -16948,9 +17060,12 @@ public class VideoAnnotationTool {
         
         if (content == ExportContent.RICH) {
             // Add timing metadata for rich export
+            // Persist session start time so it can be restored on import
             if (sessionStartTime > 0) {
-                long totalSessionTimeMs = System.currentTimeMillis() - sessionStartTime;
+                metadata.put("session_start_time", sessionStartTime);
+                long totalSessionTimeMs = exportTimeMs - sessionStartTime;
                 if (totalSessionTimeMs < 0) totalSessionTimeMs = 0;  // Handle clock skew edge case
+                if (totalSessionTimeMs > MAX_REASONABLE_TIME_MS) totalSessionTimeMs = MAX_REASONABLE_TIME_MS;  // Cap to prevent overflow
                 metadata.put("total_session_time_ms", totalSessionTimeMs);
                 metadata.put("total_session_time_formatted", formatTime(totalSessionTimeMs));
             }
@@ -16971,10 +17086,18 @@ public class VideoAnnotationTool {
                 
                 Long startTime = trackStartTime.get(trackId);
                 if (startTime != null && startTime > 0) {
-                    long elapsed = System.currentTimeMillis() - startTime;
+                    long elapsed = exportTimeMs - startTime;
                     if (elapsed > 0) trackTimeMs += elapsed;
                 }
-                allTracksTimeMs += trackTimeMs;
+                // Cap individual track time to prevent overflow when summing
+                if (trackTimeMs > MAX_REASONABLE_TIME_MS) trackTimeMs = MAX_REASONABLE_TIME_MS;
+                
+                // Overflow-safe addition for allTracksTimeMs
+                if (allTracksTimeMs <= Long.MAX_VALUE - trackTimeMs) {
+                    allTracksTimeMs += trackTimeMs;
+                } else {
+                    allTracksTimeMs = Long.MAX_VALUE;  // Saturate on overflow
+                }
                 
                 if (trackCompleted.getOrDefault(trackId, false)) {
                     completedCount++;
@@ -17068,9 +17191,11 @@ public class VideoAnnotationTool {
                 
                 Long startTime = trackStartTime.get(trackId);
                 if (startTime != null && startTime > 0) {
-                    long elapsed = System.currentTimeMillis() - startTime;
+                    long elapsed = exportTimeMs - startTime;  // Use snapshotted time for consistency
                     if (elapsed > 0) totalTimeMs += elapsed;
                 }
+                // Cap to prevent unreasonably large values
+                if (totalTimeMs > MAX_REASONABLE_TIME_MS) totalTimeMs = MAX_REASONABLE_TIME_MS;
                 trackObj.put("time_ms", totalTimeMs);
                 trackObj.put("time_formatted", formatTime(totalTimeMs));
                 
@@ -17219,6 +17344,11 @@ public class VideoAnnotationTool {
      * This avoids repeating track-level data on every row.
      */
     private void writeCsvTrackSummaries(PrintWriter pw) {
+        // Snapshot current time once for consistent calculations
+        final long exportTimeMs = System.currentTimeMillis();
+        // Max reasonable time: 30 days in milliseconds
+        final long MAX_REASONABLE_TIME_MS = 30L * 24 * 60 * 60 * 1000;
+        
         for (Map.Entry<String, Map<Integer, Point>> trackEntry : trackAnnotations.entrySet()) {
             String trackId = trackEntry.getKey();
             Map<Integer, Point> frameMap = trackEntry.getValue();
@@ -17230,10 +17360,14 @@ public class VideoAnnotationTool {
             
             // Time tracking - compute current total including any active timer
             long timeMs = trackTotalTime.getOrDefault(trackId, 0L);
+            if (timeMs < 0) timeMs = 0;  // Ensure non-negative
             Long startTime = trackStartTime.get(trackId);
             if (startTime != null && startTime > 0) {
-                timeMs += System.currentTimeMillis() - startTime;
+                long elapsed = exportTimeMs - startTime;
+                if (elapsed > 0) timeMs += elapsed;  // Only add positive elapsed time (handles clock skew)
             }
+            // Cap to prevent unreasonably large values (consistent with JSON export)
+            if (timeMs > MAX_REASONABLE_TIME_MS) timeMs = MAX_REASONABLE_TIME_MS;
             summary.append("time_ms=").append(timeMs).append("; ");
             summary.append("completed=").append(trackCompleted.getOrDefault(trackId, false)).append("; ");
             summary.append("optimized=").append(trackOptimized.getOrDefault(trackId, false)).append("; ");
@@ -18070,6 +18204,11 @@ public class VideoAnnotationTool {
     }
     
     private void clearAllTrackData() {
+        // Pause all active track timers before clearing
+        for (String trackId : trackStartTime.keySet()) {
+            pauseTrackTimer(trackId);
+        }
+        
         trackAnnotations.clear();
         trackColors.clear();
         trackAnchors.clear();
@@ -18109,6 +18248,7 @@ public class VideoAnnotationTool {
         }
         
         JSONArray tracksArray;
+        long importedSessionStartTime = 0;  // Will be restored from metadata if available
         
         try {
             if (content.trim().startsWith("{")) {
@@ -18118,6 +18258,23 @@ public class VideoAnnotationTool {
                     throw new Exception("JSON object missing 'tracks' array");
                 }
                 tracksArray = root.getJSONArray("tracks");
+                
+                // Restore session start time from metadata if available
+                if (root.has("metadata")) {
+                    JSONObject metadata = root.getJSONObject("metadata");
+                    if (metadata.has("session_start_time")) {
+                        importedSessionStartTime = metadata.optLong("session_start_time", 0L);
+                        // Validate: session start time should be in the past and reasonable
+                        long now = System.currentTimeMillis();
+                        if (importedSessionStartTime > now) {
+                            System.err.println("Warning: session_start_time is in the future, ignoring");
+                            importedSessionStartTime = 0;
+                        } else if (importedSessionStartTime > 0 && (now - importedSessionStartTime) > 365L * 24 * 60 * 60 * 1000) {
+                            System.err.println("Warning: session_start_time is more than 1 year old, using current time");
+                            importedSessionStartTime = 0;
+                        }
+                    }
+                }
             } else if (content.trim().startsWith("[")) {
                 // Old format - just an array
                 tracksArray = new JSONArray(content);
@@ -18204,11 +18361,16 @@ public class VideoAnnotationTool {
                 trackOptimized.put(trackId, trackObj.optBoolean("optimized", false));
                 trackSelected.put(trackId, trackObj.optBoolean("selected", true));
                 
-                // Import time tracking data - validate non-negative
+                // Import time tracking data - validate non-negative and reasonable range
+                // Max reasonable time: 30 days in milliseconds (prevents overflow issues)
+                final long MAX_REASONABLE_TIME_MS = 30L * 24 * 60 * 60 * 1000;
                 long timeMs = trackObj.optLong("time_ms", 0L);
                 if (timeMs < 0) {
                     System.err.println("Warning: Negative time_ms for track " + trackId + ", treating as 0");
                     timeMs = 0L;
+                } else if (timeMs > MAX_REASONABLE_TIME_MS) {
+                    System.err.println("Warning: Unreasonably large time_ms (" + timeMs + ") for track " + trackId + ", capping to 30 days");
+                    timeMs = MAX_REASONABLE_TIME_MS;
                 }
                 trackTotalTime.put(trackId, timeMs);
                 trackStartTime.put(trackId, 0L);
@@ -18386,6 +18548,16 @@ public class VideoAnnotationTool {
         }
         
         trackCounter = maxTrackNum + 1;
+        
+        // Restore session start time from import, or start fresh session
+        // If we have a valid imported session start time, use it to preserve session duration
+        // Otherwise, mark the import time as the start of a new session
+        if (importedSessionStartTime > 0) {
+            sessionStartTime = importedSessionStartTime;
+            System.out.println("Restored session start time from import");
+        } else if (sessionStartTime == 0 && importedCount > 0) {
+            sessionStartTime = System.currentTimeMillis();
+        }
         
         if (skippedCount > 0) {
             System.out.println("Import complete: " + importedCount + " tracks imported, " + skippedCount + " skipped due to errors");
