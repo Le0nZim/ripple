@@ -189,3 +189,4 @@ MIT License. See [LICENSE](LICENSE).
 - [RAFT](https://github.com/princeton-vl/RAFT) - Optical flow
 - [LocoTrack](https://github.com/cvlab-kaist/locotrack) - Point tracking
 - [TrackPy](https://soft-matter.github.io/trackpy/v0.7/) - Particle tracking
+- [TAP-Vid](https://github.com/google-deepmind/tapnet/blob/main/tapnet/tapvid/README.md) - Track Assist
