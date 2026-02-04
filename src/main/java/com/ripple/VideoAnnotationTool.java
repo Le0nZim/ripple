@@ -32,6 +32,7 @@ import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.json.JSONException;
@@ -106,6 +107,15 @@ public class VideoAnnotationTool {
      */
     private static String getDefaultFlowMethod() {
         return isCpuOnly ? Constants.FLOW_METHOD_DIS : Constants.FLOW_METHOD_RAFT;
+    }
+    
+    /**
+     * Get the current flow method from config, ensuring it's normalized to internal name.
+     * Handles legacy display names like "DIS (Fast)" by converting to "dis".
+     */
+    private String getConfiguredFlowMethod() {
+        String method = config.getProperty("flow.method", getDefaultFlowMethod());
+        return mapDisplayToMethod(method);
     }
     
     /**
@@ -369,7 +379,14 @@ public class VideoAnnotationTool {
     private String currentVideoPath = null;         // Original video path (for display/export)
     private String workingVideoPath = null;         // Path used for backend operations (may be compressed temp file)
     private String tempCompressedVideoPath = null;  // Path to temporary compressed video file (to clean up on exit)
-    private File lastOpenedVideoDirectory = null;   // Remember last directory for file explorer (persists across sessions)
+    
+    // Remember last directory for each file operation type (persists across operations within session)
+    private File lastOpenedVideoDirectory = null;   // Open Video file explorer
+    private File lastExportVideoDirectory = null;   // Export Video with tracks
+    private File lastExportAnnotationsDirectory = null;  // Export annotations
+    private File lastImportAnnotationsDirectory = null;  // Import annotations
+    private File lastSaveWeightsDirectory = null;   // Save fine-tuned weights
+    
     private ImagePlus flowVisualization = null;
     private boolean showingFlowViz = false;
     
@@ -399,6 +416,7 @@ public class VideoAnnotationTool {
     private JButton playButton = null;              // Play button (disable in preview)
     private JTextField fpsField = null;             // FPS input (disable in preview)
     private JButton openButton = null;              // Open File button (disable in preview)
+    private JButton exportVideoButton = null;       // Export Video button (disable in preview)
     private JButton importButton = null;            // Import button (disable in preview)
     private JButton exportButton = null;            // Export button (disable in preview)
     private JButton helpButton = null;              // Help button (disable in preview)
@@ -406,7 +424,17 @@ public class VideoAnnotationTool {
     private JButton fineTuneButton = null;          // Fine-Tune LocoTrack button (GPU only, disable in preview)
     private boolean hideTracksInPreview = false;    // Flag to hide tracks during preview
     
-    // Zoom controls in toolbar
+    // Video pane overlay controls (positioned on top of the video area)
+    private JPanel videoOverlayPanel = null;        // Container for overlay controls using JLayeredPane
+    private JPanel cursorOverlayPanel = null;       // Top-left: cursor size and shape controls
+    private JPanel zoomOverlayPanel = null;         // Bottom-right: zoom and pixel value controls
+    private JSlider cursorSizeSlider = null;        // Slider for cursor size
+    private JLabel cursorSizeValueLabel = null;     // Label showing cursor size value
+    private JCheckBox circleCheckbox = null;        // Circle mode checkbox
+    private JCheckBox opaqueCheckbox = null;        // Opaque mode checkbox
+    private JCheckBox persistentCheckbox = null;    // Persistent mode checkbox
+    
+    // Zoom controls (in video overlay)
     private JLabel zoomLabel = null;                // Shows current zoom level (e.g., "100%")
     private JButton zoomInButton = null;            // Zoom in button
     private JButton zoomOutButton = null;           // Zoom out button
@@ -672,6 +700,9 @@ public class VideoAnnotationTool {
     private JButton occlusionModeAddButton = null;         // Add/End occlusion segment button (changes state)
     private int frameBeforeOcclusionMode = 1;              // Frame that was shown before entering occlusion mode
     
+    // Batch operation buttons in tracks header
+    private JButton batchCompleteBtn = null;               // Mark selected tracks complete button (disabled when all selected are complete)
+    
     // Trim mode state (in-place range slider for trimming)
     private boolean trimModeActive = false;           // Whether trim mode is currently active
     private String trimModeTrackId = null;            // Track being trimmed
@@ -764,6 +795,14 @@ public class VideoAnnotationTool {
     private JLabel pixelValueLabel;
     private JSlider frameSlider;
     private JPanel frameNavPanel;  // Reference to frame navigation panel for trim mode modifications
+    
+    // Slider zoom state - allows viewing a subset of frames for finer navigation
+    private int sliderZoomStart = 1;      // First visible frame in zoomed view (1-indexed)
+    private int sliderZoomEnd = 1;        // Last visible frame in zoomed view (1-indexed)
+    private boolean sliderZoomed = false; // Whether slider is currently zoomed
+    private JButton sliderZoomInButton;   // Zoom in button
+    private JButton sliderZoomOutButton;  // Zoom out / reset button
+    private JLabel sliderZoomLabel;       // Shows current zoom range
 
     private JPanel annotationPanel;
     private JScrollPane annotationScrollPane;  // Scroll pane for track list (for programmatic scrolling)
@@ -782,7 +821,8 @@ public class VideoAnnotationTool {
         Map<String, Color> trackColors;
         Map<String, List<Anchor>> trackAnchors;  // Changed from List<Point>
         Map<String, Boolean> trackOptimized;
-        Map<String, Boolean> trackSelected;
+        // NOTE: trackSelected and selectedTrackId are NOT saved in undo state
+        // Selection is UI navigation, not data - undoing shouldn't change selection
         Map<String, Long> trackTotalTime;  // Time tracking
         Map<String, Long> trackStartTime;  // Time tracking
         Map<String, Boolean> trackCompleted;  // Completion state
@@ -795,16 +835,15 @@ public class VideoAnnotationTool {
         // Trajectory smoothing state
         Map<String, Boolean> trackSmoothing;  // Whether smoothing is enabled for each track
         Map<String, Map<Integer, Point>> trackOriginalAnnotations;  // Original (unsmoothed) coordinates
-        String selectedTrackId;
         int trackCounter;
         int colorIndex;
         boolean correctionMode;
+        String operationDescription;  // Description of what operation this state was saved before
 
         AnnotationState(Map<String, Map<Integer, Point>> tracks, 
                        Map<String, Color> colors,
                        Map<String, List<Anchor>> anchors,  // Changed parameter type
                        Map<String, Boolean> optimized,
-                       Map<String, Boolean> selected,
                        Map<String, Long> totalTime,
                        Map<String, Long> startTime,
                        Map<String, Boolean> completed,
@@ -814,15 +853,14 @@ public class VideoAnnotationTool {
                        Map<String, List<int[]>> visibleSegments,
                        Map<String, Boolean> smoothing,
                        Map<String, Map<Integer, Point>> originalAnnotations,
-                       String selectedId, 
                        int counter,
                        int colorIdx, 
-                       boolean corrMode) {
+                       boolean corrMode,
+                       String opDescription) {
             this.trackAnnotations = deepCopyTracks(tracks);
             this.trackColors = new HashMap<>(colors);
             this.trackAnchors = deepCopyAnchors(anchors);  // Changed method call
             this.trackOptimized = new HashMap<>(optimized);
-            this.trackSelected = new HashMap<>(selected);
             this.trackTotalTime = new HashMap<>(totalTime);
             this.trackStartTime = new HashMap<>(startTime);
             this.trackCompleted = new HashMap<>(completed);
@@ -832,10 +870,10 @@ public class VideoAnnotationTool {
             this.trackVisibleSegments = deepCopyVisibleSegments(visibleSegments);
             this.trackSmoothing = new HashMap<>(smoothing);
             this.trackOriginalAnnotations = deepCopyTracks(originalAnnotations);
-            this.selectedTrackId = selectedId;
             this.trackCounter = counter;
             this.colorIndex = colorIdx;
             this.correctionMode = corrMode;
+            this.operationDescription = opDescription;
         }
 
         private static Map<String, Map<Integer, Point>> deepCopyTracks(Map<String, Map<Integer, Point>> original) {
@@ -886,15 +924,28 @@ public class VideoAnnotationTool {
         }
     }
 
-    private void saveState() {
+    /**
+     * Save current state to undo stack with a description.
+     * Call this BEFORE making any undoable changes.
+     * @param description A brief description of the operation about to be performed
+     */
+    private void saveState(String description) {
         undoStack.push(new AnnotationState(trackAnnotations, trackColors, trackAnchors,
-                                           trackOptimized, trackSelected,
+                                           trackOptimized,
                                            trackTotalTime, trackStartTime, trackCompleted,
                                            trackUntrimmedAnnotations, trackUntrimmedAnchors, trackTrimRange,
                                            trackVisibleSegments,
                                            trackSmoothing, trackOriginalAnnotations,
-                                           selectedTrackId, trackCounter, colorIndex, correctionMode));
+                                           trackCounter, colorIndex, correctionMode, description));
         redoStack.clear();
+    }
+    
+    /**
+     * Save current state to undo stack (legacy method without description).
+     * Prefer using saveState(String description) for better debugging.
+     */
+    private void saveState() {
+        saveState("Unknown operation");
     }
 
     private void undo() {
@@ -911,15 +962,18 @@ public class VideoAnnotationTool {
             pauseTrackTimer(selectedTrackId);
         }
         
+        // Save current state to redo stack (for redo operation)
         redoStack.push(new AnnotationState(trackAnnotations, trackColors, trackAnchors,
-                                           trackOptimized, trackSelected,
+                                           trackOptimized,
                                            trackTotalTime, trackStartTime, trackCompleted,
                                            trackUntrimmedAnnotations, trackUntrimmedAnchors, trackTrimRange,
                                            trackVisibleSegments,
                                            trackSmoothing, trackOriginalAnnotations,
-                                           selectedTrackId, trackCounter, colorIndex, correctionMode));
+                                           trackCounter, colorIndex, correctionMode, "Redo point"));
         
         AnnotationState state = undoStack.pop();
+        
+        // Restore data state (but NOT selection state - selection is UI navigation, not data)
         trackAnnotations.clear();
         trackAnnotations.putAll(state.trackAnnotations);
         trackColors.clear();
@@ -928,8 +982,7 @@ public class VideoAnnotationTool {
         trackAnchors.putAll(state.trackAnchors);
         trackOptimized.clear();
         trackOptimized.putAll(state.trackOptimized);
-        trackSelected.clear();
-        trackSelected.putAll(state.trackSelected);
+        // NOTE: trackSelected is NOT restored - selection changes are not undoable
         trackTotalTime.clear();
         trackTotalTime.putAll(state.trackTotalTime);
         trackStartTime.clear();
@@ -948,10 +1001,21 @@ public class VideoAnnotationTool {
         trackSmoothing.putAll(state.trackSmoothing);
         trackOriginalAnnotations.clear();
         trackOriginalAnnotations.putAll(state.trackOriginalAnnotations);
-        selectedTrackId = state.selectedTrackId;
+        // NOTE: selectedTrackId is NOT restored - selection is not undoable
+        // But if the selected track was deleted, we need to clear selection
+        if (selectedTrackId != null && !trackAnnotations.containsKey(selectedTrackId)) {
+            selectedTrackId = null;
+            // Select first available track if any
+            if (!trackAnnotations.isEmpty()) {
+                selectedTrackId = getSortedTrackIds().get(0);
+            }
+        }
         trackCounter = state.trackCounter;
         colorIndex = state.colorIndex;
         correctionMode = state.correctionMode;
+        
+        // Show what was undone
+        setStatus("Undo: " + state.operationDescription);
         
         loadSliceImage();
         refreshAnnotationList();
@@ -972,15 +1036,18 @@ public class VideoAnnotationTool {
             pauseTrackTimer(selectedTrackId);
         }
         
+        // Save current state to undo stack
         undoStack.push(new AnnotationState(trackAnnotations, trackColors, trackAnchors,
-                                           trackOptimized, trackSelected,
+                                           trackOptimized,
                                            trackTotalTime, trackStartTime, trackCompleted,
                                            trackUntrimmedAnnotations, trackUntrimmedAnchors, trackTrimRange,
                                            trackVisibleSegments,
                                            trackSmoothing, trackOriginalAnnotations,
-                                           selectedTrackId, trackCounter, colorIndex, correctionMode));
+                                           trackCounter, colorIndex, correctionMode, "Undo point"));
         
         AnnotationState state = redoStack.pop();
+        
+        // Restore data state (but NOT selection state - selection is UI navigation, not data)
         trackAnnotations.clear();
         trackAnnotations.putAll(state.trackAnnotations);
         trackColors.clear();
@@ -989,8 +1056,7 @@ public class VideoAnnotationTool {
         trackAnchors.putAll(state.trackAnchors);
         trackOptimized.clear();
         trackOptimized.putAll(state.trackOptimized);
-        trackSelected.clear();
-        trackSelected.putAll(state.trackSelected);
+        // NOTE: trackSelected is NOT restored - selection changes are not undoable
         trackTotalTime.clear();
         trackTotalTime.putAll(state.trackTotalTime);
         trackStartTime.clear();
@@ -1009,10 +1075,20 @@ public class VideoAnnotationTool {
         trackSmoothing.putAll(state.trackSmoothing);
         trackOriginalAnnotations.clear();
         trackOriginalAnnotations.putAll(state.trackOriginalAnnotations);
-        selectedTrackId = state.selectedTrackId;
+        // NOTE: selectedTrackId is NOT restored - selection is not undoable
+        // But if the selected track was deleted, we need to handle it
+        if (selectedTrackId != null && !trackAnnotations.containsKey(selectedTrackId)) {
+            selectedTrackId = null;
+            if (!trackAnnotations.isEmpty()) {
+                selectedTrackId = getSortedTrackIds().get(0);
+            }
+        }
         trackCounter = state.trackCounter;
         colorIndex = state.colorIndex;
         correctionMode = state.correctionMode;
+        
+        // Show what was redone
+        setStatus("Redo: " + state.operationDescription);
         
         loadSliceImage();
         refreshAnnotationList();
@@ -1844,6 +1920,8 @@ public class VideoAnnotationTool {
             if (!trackTotalTime.containsKey(trackId)) {
                 trackTotalTime.put(trackId, 0L);
             }
+            // Start the live time update timer to refresh time badges
+            startLiveTimeUpdateTimer();
         }
     }
     
@@ -1957,19 +2035,27 @@ public class VideoAnnotationTool {
             "not visible (e.g., behind another object or out of frame).\n\n" +
             "If the object is always visible, click No to mark complete.",
             "Mark Occlusion Segments?",
-            JOptionPane.YES_NO_OPTION,
+            JOptionPane.YES_NO_CANCEL_OPTION,
             JOptionPane.QUESTION_MESSAGE);
         
         if (choice == JOptionPane.YES_OPTION) {
             // Enter occlusion mode to define segments
             enterOcclusionMode(trackId, trackMinFrame, trackMaxFrame);
-        } else {
+        } else if (choice == JOptionPane.NO_OPTION) {
             // Mark complete without occlusions (object always visible)
             trackCompleted.put(trackId, true);
             refreshAnnotationList();
             imageLabel.repaint();
             long totalTime = trackTotalTime.getOrDefault(trackId, 0L);
             setStatus(trackId + " marked complete - fully visible (" + formatTime(totalTime) + ")");
+            
+            // Process next pending track if doing batch completion
+            SwingUtilities.invokeLater(() -> processNextPendingCompleteTrack());
+        } else {
+            // User cancelled (closed dialog or clicked Cancel) - skip this track and continue to next
+            setStatus("Skipped " + trackId);
+            // Process next pending track if doing batch completion
+            SwingUtilities.invokeLater(() -> processNextPendingCompleteTrack());
         }
     }
     
@@ -1980,7 +2066,7 @@ public class VideoAnnotationTool {
      * @param trimEnd The end frame (0-indexed, inclusive)
      */
     private void applyTrackTrim(String trackId, int trimStart, int trimEnd) {
-        saveState(); // Save state for undo
+        saveState("Trim " + trackId); // Save state for undo
         
         Map<Integer, Point> frameMap = trackAnnotations.get(trackId);
         List<Anchor> anchors = trackAnchors.get(trackId);
@@ -2079,7 +2165,7 @@ public class VideoAnnotationTool {
      * @param trackId The track ID
      */
     private void resumeTrackEditing(String trackId) {
-        saveState(); // Save state for undo
+        saveState("Resume editing " + trackId); // Save state for undo
         
         // Pause timer for the previously selected track before switching
         if (selectedTrackId != null && !selectedTrackId.equals(trackId)) {
@@ -2215,6 +2301,144 @@ public class VideoAnnotationTool {
             pageLabel.setText(String.format("Frame: %d / %d", currentSlice, totalSlices));
             loadSliceImageFast();
         }
+    }
+    
+    /**
+     * Zoom in the slider timeline, centered on the current frame.
+     * Halves the visible range each time for finer navigation.
+     */
+    private void zoomSliderIn() {
+        if (totalSlices <= 1) return;
+        
+        // Initialize zoom if not already zoomed
+        if (!sliderZoomed) {
+            sliderZoomStart = 1;
+            sliderZoomEnd = totalSlices;
+        }
+        
+        int currentRange = sliderZoomEnd - sliderZoomStart;
+        int minRange = Math.max(10, totalSlices / 50);  // Minimum ~10 frames or 2% of total
+        
+        if (currentRange <= minRange) return;  // Already at max zoom
+        
+        // Calculate new range (half the current)
+        int newRange = Math.max(minRange, currentRange / 2);
+        int center = currentSlice;  // Center on current frame
+        
+        // Calculate new start and end
+        int newStart = center - newRange / 2;
+        int newEnd = newStart + newRange;
+        
+        // Clamp to valid range
+        if (newStart < 1) {
+            newStart = 1;
+            newEnd = 1 + newRange;
+        }
+        if (newEnd > totalSlices) {
+            newEnd = totalSlices;
+            newStart = Math.max(1, totalSlices - newRange);
+        }
+        
+        sliderZoomStart = newStart;
+        sliderZoomEnd = newEnd;
+        sliderZoomed = true;
+        
+        updateSliderZoomRange();
+    }
+    
+    /**
+     * Zoom out the slider timeline, doubling the visible range.
+     */
+    private void zoomSliderOut() {
+        if (totalSlices <= 1 || !sliderZoomed) return;
+        
+        int currentRange = sliderZoomEnd - sliderZoomStart;
+        int newRange = currentRange * 2;
+        
+        // If new range covers all frames, reset to full view
+        if (newRange >= totalSlices - 1) {
+            resetSliderZoom();
+            return;
+        }
+        
+        int center = (sliderZoomStart + sliderZoomEnd) / 2;
+        
+        // Calculate new start and end
+        int newStart = center - newRange / 2;
+        int newEnd = newStart + newRange;
+        
+        // Clamp to valid range
+        if (newStart < 1) {
+            newStart = 1;
+            newEnd = 1 + newRange;
+        }
+        if (newEnd > totalSlices) {
+            newEnd = totalSlices;
+            newStart = Math.max(1, totalSlices - newRange);
+        }
+        
+        sliderZoomStart = newStart;
+        sliderZoomEnd = newEnd;
+        
+        updateSliderZoomRange();
+    }
+    
+    /**
+     * Reset slider zoom to show all frames.
+     */
+    private void resetSliderZoom() {
+        sliderZoomed = false;
+        sliderZoomStart = 1;
+        sliderZoomEnd = totalSlices;
+        
+        if (frameSlider != null && totalSlices > 1) {
+            frameSlider.setMinimum(1);
+            frameSlider.setMaximum(totalSlices);
+            frameSlider.setValue(currentSlice);
+            frameSlider.repaint();
+        }
+        
+        if (sliderZoomLabel != null) {
+            sliderZoomLabel.setVisible(false);
+        }
+    }
+    
+    /**
+     * Update the slider to show the current zoom range.
+     */
+    private void updateSliderZoomRange() {
+        if (frameSlider == null || totalSlices <= 1) return;
+        
+        if (sliderZoomed) {
+            // Update slider range to zoom window
+            frameSlider.setMinimum(sliderZoomStart);
+            frameSlider.setMaximum(sliderZoomEnd);
+            
+            // Ensure current value is within range
+            if (currentSlice < sliderZoomStart) {
+                frameSlider.setValue(sliderZoomStart);
+            } else if (currentSlice > sliderZoomEnd) {
+                frameSlider.setValue(sliderZoomEnd);
+            } else {
+                frameSlider.setValue(currentSlice);
+            }
+            
+            // Update zoom label
+            if (sliderZoomLabel != null) {
+                sliderZoomLabel.setText(String.format("[%d-%d]", sliderZoomStart, sliderZoomEnd));
+                sliderZoomLabel.setVisible(true);
+            }
+        } else {
+            frameSlider.setMinimum(1);
+            frameSlider.setMaximum(totalSlices);
+            frameSlider.setValue(currentSlice);
+            
+            if (sliderZoomLabel != null) {
+                sliderZoomLabel.setVisible(false);
+            }
+        }
+        
+        frameSlider.repaint();
     }
     
     /**
@@ -2774,7 +2998,7 @@ public class VideoAnnotationTool {
         String trackId = occlusionModeTrackId;
         
         // Save state for undo
-        saveState();
+        saveState("Mark occlusions for " + trackId);
         
         // Store the segments (now these are OCCLUSION segments, not visible segments)
         if (occlusionModeSegments.isEmpty()) {
@@ -2802,6 +3026,9 @@ public class VideoAnnotationTool {
         } else {
             setStatus(trackId + " marked complete - fully visible (" + formatTime(totalTime) + ")");
         }
+        
+        // Process next pending track if doing batch completion
+        SwingUtilities.invokeLater(() -> processNextPendingCompleteTrack());
     }
     
     /**
@@ -2829,6 +3056,9 @@ public class VideoAnnotationTool {
         exitOcclusionMode();
         
         setStatus("Occlusion editing cancelled");
+        
+        // Process next pending track if doing batch completion
+        SwingUtilities.invokeLater(() -> processNextPendingCompleteTrack());
     }
     
     /**
@@ -3022,7 +3252,11 @@ public class VideoAnnotationTool {
         final String fileExtension = useTurbo ? ".pth" : ".ckpt";
         final String fileDescription = useTurbo ? "LoRA Adapter (*.pth)" : "PyTorch Checkpoint (*.ckpt)";
         
-        JFileChooser fileChooser = new JFileChooser(weightsDir);
+        // Use last save weights directory if available, otherwise use weightsDir
+        File startDir = (lastSaveWeightsDirectory != null && lastSaveWeightsDirectory.exists()) 
+            ? lastSaveWeightsDirectory : baseWeightsDir;
+        
+        JFileChooser fileChooser = new JFileChooser(startDir);
         fileChooser.setDialogTitle(useTurbo ? "Save LoRA Adapter" : "Save Fine-Tuned Weights");
         fileChooser.setFileFilter(new javax.swing.filechooser.FileFilter() {
             @Override
@@ -3040,7 +3274,7 @@ public class VideoAnnotationTool {
         String suggestedName = useTurbo 
             ? "locotrack_" + modelType + "_adapter_" + videoName + ".pth"
             : "locotrack_" + modelType + "_finetuned_" + videoName + ".ckpt";
-        fileChooser.setSelectedFile(new File(weightsDir, suggestedName));
+        fileChooser.setSelectedFile(new File(startDir, suggestedName));
         
         int result = fileChooser.showSaveDialog(frame);
         if (result != JFileChooser.APPROVE_OPTION) {
@@ -3049,6 +3283,10 @@ public class VideoAnnotationTool {
         }
         
         File outputWeightsFile = fileChooser.getSelectedFile();
+        // Remember this directory for next save weights operation
+        if (outputWeightsFile.getParentFile() != null && outputWeightsFile.getParentFile().exists()) {
+            lastSaveWeightsDirectory = outputWeightsFile.getParentFile();
+        }
         if (!outputWeightsFile.getName().endsWith(fileExtension)) {
             outputWeightsFile = new File(outputWeightsFile.getAbsolutePath() + fileExtension);
         }
@@ -3426,6 +3664,7 @@ public class VideoAnnotationTool {
         
         // Disable toolbar buttons (except Adjust Brightness)
         if (openButton != null) openButton.setEnabled(false);
+        if (exportVideoButton != null) exportVideoButton.setEnabled(false);
         if (importButton != null) importButton.setEnabled(false);
         if (exportButton != null) exportButton.setEnabled(false);
         if (helpButton != null) helpButton.setEnabled(false);
@@ -3491,6 +3730,7 @@ public class VideoAnnotationTool {
         
         // Re-enable toolbar buttons
         if (openButton != null) openButton.setEnabled(true);
+        if (exportVideoButton != null) exportVideoButton.setEnabled(true);
         if (importButton != null) importButton.setEnabled(true);
         if (exportButton != null) exportButton.setEnabled(true);
         if (helpButton != null) helpButton.setEnabled(true);
@@ -3611,6 +3851,7 @@ public class VideoAnnotationTool {
         
         // Re-enable toolbar buttons
         if (openButton != null) openButton.setEnabled(true);
+        if (exportVideoButton != null) exportVideoButton.setEnabled(true);
         if (importButton != null) importButton.setEnabled(true);
         if (exportButton != null) exportButton.setEnabled(true);
         if (helpButton != null) helpButton.setEnabled(true);
@@ -3650,7 +3891,52 @@ public class VideoAnnotationTool {
         
         if ("single-seed".equalsIgnoreCase(newMode)) {
             // Switching from multi-seed to single-seed
-            // Count unoptimized tracks
+            
+            // First, clean up uninitialized tracks (tracks with only a seed point, no propagation)
+            // These are tracks that were created but never had rough track computed
+            List<String> uninitializedTracks = new ArrayList<>();
+            for (String trackId : trackAnnotations.keySet()) {
+                Map<Integer, Point> points = trackAnnotations.get(trackId);
+                List<Anchor> anchors = trackAnchors.get(trackId);
+                
+                // An uninitialized track in multi-seed mode is one that:
+                // 1. Has no points at all, OR
+                // 2. Has only 1 anchor and only 1 annotation point (just the seed, never propagated)
+                if (points == null || points.isEmpty()) {
+                    uninitializedTracks.add(trackId);
+                } else if (anchors != null && anchors.size() == 1 && points.size() == 1) {
+                    // Only one anchor and one point - this is just a seed, never propagated
+                    uninitializedTracks.add(trackId);
+                }
+            }
+            
+            // Remove uninitialized tracks silently
+            for (String trackId : uninitializedTracks) {
+                if (trackId.equals(selectedTrackId)) {
+                    pauseTrackTimer(selectedTrackId);
+                    selectedTrackId = null;
+                }
+                trackAnnotations.remove(trackId);
+                trackColors.remove(trackId);
+                trackAnchors.remove(trackId);
+                trackOptimized.remove(trackId);
+                trackSelected.remove(trackId);
+                trackTotalTime.remove(trackId);
+                trackStartTime.remove(trackId);
+                trackCompleted.remove(trackId);
+                trackUntrimmedAnnotations.remove(trackId);
+                trackUntrimmedAnchors.remove(trackId);
+                trackTrimRange.remove(trackId);
+                trackSmoothing.remove(trackId);
+                trackOriginalAnnotations.remove(trackId);
+                trackOcclusionSegments.remove(trackId);
+            }
+            
+            if (!uninitializedTracks.isEmpty()) {
+                System.out.println("Cleaned up " + uninitializedTracks.size() + " uninitialized track(s) during mode switch");
+            }
+            
+            // Count remaining unoptimized tracks (tracks with points but not yet optimized)
             long unoptimizedCount = trackAnnotations.keySet().stream()
                 .filter(trackId -> !trackOptimized.getOrDefault(trackId, false))
                 .count();
@@ -3677,7 +3963,7 @@ public class VideoAnnotationTool {
                 );
                 
                 if (choice == 1) { // Remove Unoptimized
-                    saveState();
+                    saveState("Remove unoptimized tracks");
                     List<String> toRemove = trackAnnotations.keySet().stream()
                         .filter(trackId -> !trackOptimized.getOrDefault(trackId, false))
                         .collect(java.util.stream.Collectors.toList());
@@ -4017,6 +4303,9 @@ public class VideoAnnotationTool {
         } catch (Exception e) {
             e.printStackTrace();
         }
+        
+        // Set tooltip delay to 400ms for all buttons
+        javax.swing.ToolTipManager.sharedInstance().setInitialDelay(400);
         
         frame = new JFrame("RIPPLE \u2014 Video Annotation Tool");
         frame.setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);  // Handle closing manually with confirmation
@@ -4717,7 +5006,43 @@ public class VideoAnnotationTool {
         scrollPane.setBorder(BorderFactory.createEmptyBorder());
         scrollPane.getViewport().setBackground(PRIMARY_DARK);
         scrollPane.setBackground(PRIMARY_DARK);
-        centerPanel.add(scrollPane, BorderLayout.CENTER);
+        styleScrollPane(scrollPane);
+        
+        // Create video overlay panel using JLayeredPane for non-intrusive controls
+        JLayeredPane videoLayeredPane = new JLayeredPane();
+        videoLayeredPane.setLayout(null); // Manual positioning for overlay controls
+        
+        // Add scroll pane as the base layer
+        scrollPane.setBounds(0, 0, 800, 600);
+        videoLayeredPane.add(scrollPane, JLayeredPane.DEFAULT_LAYER);
+        
+        // Create cursor controls overlay (top-left, semi-transparent)
+        cursorOverlayPanel = createCursorOverlayPanel();
+        cursorOverlayPanel.setBounds(8, 8, cursorOverlayPanel.getPreferredSize().width, cursorOverlayPanel.getPreferredSize().height);
+        videoLayeredPane.add(cursorOverlayPanel, JLayeredPane.PALETTE_LAYER);
+        
+        // Create zoom controls overlay (bottom-right, semi-transparent)
+        zoomOverlayPanel = createZoomOverlayPanel();
+        zoomOverlayPanel.setBounds(600, 500, zoomOverlayPanel.getPreferredSize().width, zoomOverlayPanel.getPreferredSize().height);
+        videoLayeredPane.add(zoomOverlayPanel, JLayeredPane.PALETTE_LAYER);
+        
+        // Handle resize to reposition overlay panels
+        videoLayeredPane.addComponentListener(new ComponentAdapter() {
+            @Override
+            public void componentResized(ComponentEvent e) {
+                int w = videoLayeredPane.getWidth();
+                int h = videoLayeredPane.getHeight();
+                scrollPane.setBounds(0, 0, w, h);
+                // Keep cursor controls at top-left with margin
+                cursorOverlayPanel.setBounds(8, 8, cursorOverlayPanel.getPreferredSize().width, cursorOverlayPanel.getPreferredSize().height);
+                // Keep zoom controls at bottom-right with margin
+                int zoomW = zoomOverlayPanel.getPreferredSize().width;
+                int zoomH = zoomOverlayPanel.getPreferredSize().height;
+                zoomOverlayPanel.setBounds(w - zoomW - 8, h - zoomH - 8, zoomW, zoomH);
+            }
+        });
+        
+        centerPanel.add(videoLayeredPane, BorderLayout.CENTER);
         
         // Frame navigation panel with professional styling
         frameNavPanel = new JPanel(new BorderLayout(12, 0)) {
@@ -5019,8 +5344,123 @@ public class VideoAnnotationTool {
         // Set preferred height to accommodate custom graphics (track markers, frame numbers)
         frameSlider.setPreferredSize(new Dimension(100, 50));
         
+        // Add mouse wheel zoom support to slider
+        frameSlider.addMouseWheelListener(e -> {
+            if (totalSlices <= 1) return;
+            
+            if (e.isControlDown()) {
+                // Ctrl+wheel = zoom in/out centered on current frame
+                int rotation = e.getWheelRotation();
+                if (rotation < 0) {
+                    zoomSliderIn();
+                } else {
+                    zoomSliderOut();
+                }
+                e.consume();
+            } else if (sliderZoomed) {
+                // If zoomed, wheel without Ctrl scrolls the zoom window
+                int rotation = e.getWheelRotation();
+                int range = sliderZoomEnd - sliderZoomStart;
+                int shift = Math.max(1, range / 10) * rotation;
+                
+                int newStart = sliderZoomStart + shift;
+                int newEnd = sliderZoomEnd + shift;
+                
+                // Clamp to valid range
+                if (newStart < 1) {
+                    newStart = 1;
+                    newEnd = 1 + range;
+                }
+                if (newEnd > totalSlices) {
+                    newEnd = totalSlices;
+                    newStart = Math.max(1, totalSlices - range);
+                }
+                
+                sliderZoomStart = newStart;
+                sliderZoomEnd = newEnd;
+                updateSliderZoomRange();
+                e.consume();
+            }
+        });
+        
+        // Create zoom controls panel (right side of slider)
+        JPanel sliderZoomPanel = new JPanel();
+        sliderZoomPanel.setLayout(new BoxLayout(sliderZoomPanel, BoxLayout.X_AXIS));
+        sliderZoomPanel.setOpaque(false);
+        
+        sliderZoomLabel = new JLabel("");
+        sliderZoomLabel.setFont(new Font("Segoe UI", Font.PLAIN, 10));
+        sliderZoomLabel.setForeground(TEXT_SECONDARY);
+        sliderZoomLabel.setVisible(false);
+        
+        sliderZoomInButton = new JButton("+") {
+            @Override
+            protected void paintComponent(Graphics g) {
+                Graphics2D g2d = (Graphics2D) g.create();
+                g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                if (getModel().isPressed()) {
+                    g2d.setColor(ACCENT_BLUE.darker());
+                } else if (getModel().isRollover()) {
+                    g2d.setColor(ACCENT_BLUE);
+                } else {
+                    g2d.setColor(new Color(60, 60, 65));
+                }
+                g2d.fillRoundRect(0, 0, getWidth(), getHeight(), 6, 6);
+                g2d.dispose();
+                super.paintComponent(g);
+            }
+        };
+        sliderZoomInButton.setFont(new Font("Segoe UI", Font.BOLD, 14));
+        sliderZoomInButton.setForeground(TEXT_PRIMARY);
+        sliderZoomInButton.setPreferredSize(new Dimension(28, 28));
+        sliderZoomInButton.setMinimumSize(new Dimension(28, 28));
+        sliderZoomInButton.setMaximumSize(new Dimension(28, 28));
+        sliderZoomInButton.setBorder(BorderFactory.createEmptyBorder());
+        sliderZoomInButton.setFocusPainted(false);
+        sliderZoomInButton.setContentAreaFilled(false);
+        sliderZoomInButton.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        sliderZoomInButton.setToolTipText("Zoom in timeline (Ctrl+Scroll)");
+        sliderZoomInButton.addActionListener(e -> zoomSliderIn());
+        
+        sliderZoomOutButton = new JButton("−") {
+            @Override
+            protected void paintComponent(Graphics g) {
+                Graphics2D g2d = (Graphics2D) g.create();
+                g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                if (getModel().isPressed()) {
+                    g2d.setColor(ACCENT_BLUE.darker());
+                } else if (getModel().isRollover()) {
+                    g2d.setColor(ACCENT_BLUE);
+                } else {
+                    g2d.setColor(new Color(60, 60, 65));
+                }
+                g2d.fillRoundRect(0, 0, getWidth(), getHeight(), 6, 6);
+                g2d.dispose();
+                super.paintComponent(g);
+            }
+        };
+        sliderZoomOutButton.setFont(new Font("Segoe UI", Font.BOLD, 14));
+        sliderZoomOutButton.setForeground(TEXT_PRIMARY);
+        sliderZoomOutButton.setPreferredSize(new Dimension(28, 28));
+        sliderZoomOutButton.setMinimumSize(new Dimension(28, 28));
+        sliderZoomOutButton.setMaximumSize(new Dimension(28, 28));
+        sliderZoomOutButton.setBorder(BorderFactory.createEmptyBorder());
+        sliderZoomOutButton.setFocusPainted(false);
+        sliderZoomOutButton.setContentAreaFilled(false);
+        sliderZoomOutButton.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        sliderZoomOutButton.setToolTipText("Zoom out timeline (Ctrl+Scroll)");
+        sliderZoomOutButton.addActionListener(e -> zoomSliderOut());
+        
+        sliderZoomPanel.add(Box.createHorizontalStrut(6));
+        sliderZoomPanel.add(sliderZoomLabel);
+        sliderZoomPanel.add(Box.createHorizontalStrut(4));
+        sliderZoomPanel.add(sliderZoomOutButton);
+        sliderZoomPanel.add(Box.createHorizontalStrut(2));
+        sliderZoomPanel.add(sliderZoomInButton);
+        
         frameNavPanel.add(pageLabel, BorderLayout.WEST);
         frameNavPanel.add(frameSlider, BorderLayout.CENTER);
+        frameNavPanel.add(sliderZoomPanel, BorderLayout.EAST);
         
         centerPanel.add(frameNavPanel, BorderLayout.SOUTH);
         
@@ -5062,8 +5502,9 @@ public class VideoAnnotationTool {
                 pageLabel.setText(String.format("Frame: %d / %d", currentSlice, totalSlices));
                 
                 if (frameSlider.getValueIsAdjusting()) {
-                    // While dragging: minimal update - just change slice and repaint
+                    // While dragging: update image and coordinate display
                     loadSliceImageFast();
+                    refreshAnnotationList(); // Update coordinates while dragging
                 } else {
                     // On release: do full update including annotation list
                     loadSliceImage();
@@ -5078,17 +5519,15 @@ public class VideoAnnotationTool {
         rightSplitPane.setDividerLocation(0.75); // Center panel gets 75% of space initially
         rightSplitPane.setResizeWeight(1.0); // Center panel grows/shrinks
         rightSplitPane.setContinuousLayout(true);
-        rightSplitPane.setBorder(null);
         rightSplitPane.setOneTouchExpandable(true); // Add one-touch expand buttons on divider
-        rightSplitPane.setDividerSize(8); // Slightly larger divider for easier dragging
+        styleSplitPane(rightSplitPane);
         
         leftSplitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, leftConfigPanel, rightSplitPane);
         leftSplitPane.setDividerLocation(configPanelWidth);
         leftSplitPane.setResizeWeight(0.0); // Left panel stays fixed size
         leftSplitPane.setContinuousLayout(true);
-        leftSplitPane.setBorder(null);
         leftSplitPane.setOneTouchExpandable(true); // Add one-touch expand buttons on divider
-        leftSplitPane.setDividerSize(8); // Slightly larger divider for easier dragging
+        styleSplitPane(leftSplitPane);
         
         // Enforce maximum size for left config panel (can only shrink, not expand beyond default)
         leftSplitPane.addPropertyChangeListener(JSplitPane.DIVIDER_LOCATION_PROPERTY, evt -> {
@@ -5409,274 +5848,159 @@ public class VideoAnnotationTool {
             return false;
         });
 
-        // Controls - Professional toolbar with solid background
-        // Use BoxLayout to prevent wrapping - components stay in a single row
+        // Controls - Redesigned modern toolbar with grouped sections
         JPanel controlPanel = new JPanel() {
             @Override
             protected void paintComponent(Graphics g) {
                 super.paintComponent(g);
-                Graphics2D g2d = (Graphics2D) g;
-                g2d.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
-                // Solid background color based on theme
-                g2d.setColor(PANEL_DARK);
+                Graphics2D g2d = (Graphics2D) g.create();
+                g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                // Subtle gradient background
+                GradientPaint gradient = new GradientPaint(0, 0, new Color(35, 35, 40), 0, getHeight(), new Color(28, 28, 32));
+                g2d.setPaint(gradient);
                 g2d.fillRect(0, 0, getWidth(), getHeight());
+                // Top highlight line
+                g2d.setColor(new Color(60, 60, 65));
+                g2d.drawLine(0, 0, getWidth(), 0);
+                g2d.dispose();
             }
             
             @Override
             public Dimension getPreferredSize() {
-                // Calculate the width needed for all components in a single row
                 Dimension pref = super.getPreferredSize();
-                // Force a fixed height to prevent vertical growth
-                return new Dimension(pref.width, 52);
+                return new Dimension(pref.width, 48);
             }
         };
         controlPanel.setLayout(new BoxLayout(controlPanel, BoxLayout.X_AXIS));
-        controlPanel.setBorder(BorderFactory.createCompoundBorder(
-            BorderFactory.createMatteBorder(1, 0, 0, 0, BORDER_DARK),
-            BorderFactory.createEmptyBorder(6, 15, 6, 15)
-        ));
+        controlPanel.setBorder(BorderFactory.createEmptyBorder(4, 8, 4, 8));
         controlPanel.setOpaque(false);
         
-        // Create styled buttons (using class fields for preview mode disable/enable)
-        openButton = createStyledButton("Open File", "open");
-        JButton adjustButton = createStyledButton("Adjust Brightness", "brightness");
-        importButton = createStyledButton("Import", "import");
-        exportButton = createStyledButton("Export", "export");
-        helpButton = createStyledButton("Help", "help");
+        // Create styled buttons with new grouped style
+        openButton = createToolbarButton("Open", "open", "Open video file (Ctrl+O)");
+        exportVideoButton = createToolbarButton("Export", "export", "Export video with track overlays");
+        JButton adjustButton = createToolbarButton("Brightness", "brightness", "Adjust brightness & contrast");
+        importButton = createToolbarButton("Import", "import", "Import annotations from JSON");
+        exportButton = createToolbarButton("Save", "export", "Save annotations to JSON");
+        helpButton = createToolbarButton("?", null, "Help & keyboard shortcuts");
+        helpButton.setFont(new Font("Segoe UI", Font.BOLD, 14));
         
-        gotoFrameField = createStyledTextField("1", 4);
-        gotoFrameButton = createStyledButton("Go To");
+        // Frame navigation controls - compact text field
+        gotoFrameField = createCompactTextField("1", 3);
+        gotoFrameButton = createToolbarButton("Go", null, "Jump to frame");
 
-        fpsField = createStyledTextField("1", 3);
-        playButton = createStyledButton("Play", "play");
+        // Playback controls - compact text field
+        fpsField = createCompactTextField("1", 2);
+        playButton = createToolbarButton("▶", null, "Play/Pause (Space)");
+        playButton.setFont(new Font("Dialog", Font.BOLD, 14));
+        // Ensure button is wide enough for both ▶ and ❚❚ symbols
+        Dimension playSize = new Dimension(60, 28);
+        playButton.setMinimumSize(playSize);
+        playButton.setPreferredSize(playSize);
+        playButton.setMaximumSize(playSize);
 
-        flowVizToggle = createStyledButton("Flow Viz", "flow");
+        // Flow visualization
+        flowVizToggle = createToolbarButton("Flow", "flow", "Toggle optical flow visualization");
         flowVizToggle.setEnabled(false);
-        flowVizToggle.setToolTipText("Toggle optical flow visualization");
 
-        pixelValueLabel = new JLabel("Pixel: N/A");
-        pixelValueLabel.setFont(new Font("Consolas", Font.PLAIN, 12));
-        pixelValueLabel.setBorder(BorderFactory.createCompoundBorder(
-            BorderFactory.createLineBorder(BORDER_DARK, 1),
-            BorderFactory.createEmptyBorder(4, 10, 4, 10)
-        ));
-        pixelValueLabel.setBackground(SECONDARY_DARK);
-        pixelValueLabel.setForeground(ACCENT_BLUE);
-        pixelValueLabel.setOpaque(true);
-
-        // Add components with horizontal struts for spacing (BoxLayout doesn't use FlowLayout gaps)
-        controlPanel.add(Box.createHorizontalStrut(5));
-        controlPanel.add(openButton);
-        controlPanel.add(Box.createHorizontalStrut(8));
-        controlPanel.add(adjustButton);
-        controlPanel.add(Box.createHorizontalStrut(8));
-        controlPanel.add(createSeparator());
-        controlPanel.add(Box.createHorizontalStrut(8));
-        controlPanel.add(importButton);
-        controlPanel.add(Box.createHorizontalStrut(8));
-        controlPanel.add(exportButton);
-        controlPanel.add(Box.createHorizontalStrut(8));
-        controlPanel.add(createSeparator());
-        controlPanel.add(Box.createHorizontalStrut(8));
-        controlPanel.add(helpButton);
-        controlPanel.add(Box.createHorizontalStrut(8));
-        controlPanel.add(createSeparator());
-        controlPanel.add(Box.createHorizontalStrut(8));
-        controlPanel.add(createStyledLabel("Frame:"));
-        controlPanel.add(Box.createHorizontalStrut(4));
-        controlPanel.add(gotoFrameField);
-        controlPanel.add(Box.createHorizontalStrut(4));
-        controlPanel.add(gotoFrameButton);
-        controlPanel.add(Box.createHorizontalStrut(8));
-        controlPanel.add(createSeparator());
-        controlPanel.add(Box.createHorizontalStrut(8));
-        controlPanel.add(createStyledLabel("FPS:"));
-        controlPanel.add(Box.createHorizontalStrut(4));
-        controlPanel.add(fpsField);
-        controlPanel.add(Box.createHorizontalStrut(4));
-        controlPanel.add(playButton);
-        controlPanel.add(Box.createHorizontalStrut(8));
-        controlPanel.add(createSeparator());
-        controlPanel.add(Box.createHorizontalStrut(8));
-        controlPanel.add(flowVizToggle);
-        controlPanel.add(Box.createHorizontalStrut(8));
+        // === BUILD TOOLBAR WITH GROUPED SECTIONS ===
         
-        // Fine-Tune button (GPU only) - prominent placement for LocoTrack fine-tuning
+        // File operations group
+        JPanel fileGroup = createToolbarGroup("FILE");
+        fileGroup.add(openButton);
+        fileGroup.add(Box.createHorizontalStrut(2));
+        fileGroup.add(exportVideoButton);
+        fileGroup.add(Box.createHorizontalStrut(2));
+        fileGroup.add(adjustButton);
+        controlPanel.add(fileGroup);
+        controlPanel.add(Box.createHorizontalStrut(6));
+        controlPanel.add(createToolbarDivider());
+        controlPanel.add(Box.createHorizontalStrut(6));
+        
+        // Data I/O group
+        JPanel dataGroup = createToolbarGroup("DATA");
+        dataGroup.add(importButton);
+        dataGroup.add(Box.createHorizontalStrut(2));
+        dataGroup.add(exportButton);
+        controlPanel.add(dataGroup);
+        controlPanel.add(Box.createHorizontalStrut(6));
+        controlPanel.add(createToolbarDivider());
+        controlPanel.add(Box.createHorizontalStrut(6));
+        
+        // Navigation group
+        JPanel navGroup = createToolbarGroup("FRAME");
+        navGroup.add(gotoFrameField);
+        navGroup.add(Box.createHorizontalStrut(2));
+        navGroup.add(gotoFrameButton);
+        controlPanel.add(navGroup);
+        controlPanel.add(Box.createHorizontalStrut(6));
+        controlPanel.add(createToolbarDivider());
+        controlPanel.add(Box.createHorizontalStrut(6));
+        
+        // Playback group
+        JPanel playGroup = createToolbarGroup("PLAY");
+        JLabel fpsLabel = new JLabel("FPS");
+        fpsLabel.setFont(new Font("Segoe UI", Font.PLAIN, 9));
+        fpsLabel.setForeground(TEXT_SECONDARY);
+        playGroup.add(fpsLabel);
+        playGroup.add(Box.createHorizontalStrut(2));
+        playGroup.add(fpsField);
+        playGroup.add(Box.createHorizontalStrut(3));
+        playGroup.add(playButton);
+        controlPanel.add(playGroup);
+        controlPanel.add(Box.createHorizontalStrut(6));
+        controlPanel.add(createToolbarDivider());
+        controlPanel.add(Box.createHorizontalStrut(6));
+        
+        // Analysis group
+        JPanel analysisGroup = createToolbarGroup("ANALYSIS");
+        analysisGroup.add(flowVizToggle);
+        
+        // Fine-Tune button (GPU only)
         if (isGpuAvailable) {
-            fineTuneButton = createStyledButton("Fine-Tune", "train");
-            fineTuneButton.setBackground(new Color(139, 69, 19));  // Saddle brown for distinction
-            fineTuneButton.setToolTipText("Fine-tune LocoTrack model on completed annotations (GPU required)");
-            fineTuneButton.setEnabled(false);  // Enable when tracks are ready
+            fineTuneButton = createToolbarButton("Train", "train", "Fine-tune LocoTrack model (GPU)");
+            fineTuneButton.setBackground(new Color(60, 45, 30));
+            fineTuneButton.setEnabled(false);
             fineTuneButton.addActionListener(e -> startLocoTrackFineTuning());
-            controlPanel.add(fineTuneButton);
-            controlPanel.add(Box.createHorizontalStrut(8));
+            analysisGroup.add(Box.createHorizontalStrut(2));
+            analysisGroup.add(fineTuneButton);
         }
+        controlPanel.add(analysisGroup);
         
-        controlPanel.add(createSeparator());
-        controlPanel.add(Box.createHorizontalStrut(8));
-        JLabel cursorSizeLabel = createStyledLabel("Cursor:");
-        cursorSizeLabel.setToolTipText("Hover cursor size in pixels (odd numbers only)");
-        controlPanel.add(cursorSizeLabel);
-        controlPanel.add(Box.createHorizontalStrut(4));
-        // Slider uses internal range 1-25, mapped to odd values 3, 5, 7, ..., 51
-        int initialSliderValue = (hoverCursorSize - 1) / 2;  // Convert odd size to slider index
-        JSlider cursorSizeSlider = new JSlider(1, 25, initialSliderValue);
-        cursorSizeSlider.setPreferredSize(new Dimension(100, 20));
-        cursorSizeSlider.setMaximumSize(new Dimension(100, 20));
-        cursorSizeSlider.setToolTipText("Adjust the size of the hover cursor (odd numbers: 3x3 to 51x51)");
-        cursorSizeSlider.setOpaque(false);
-        JLabel cursorSizeValueLabel = createStyledLabel(hoverCursorSize + "x" + hoverCursorSize);
-        cursorSizeValueLabel.setPreferredSize(new Dimension(50, 20));
-        cursorSizeSlider.addChangeListener(e -> {
-            // Convert slider value (1-25) to odd cursor size (3, 5, 7, ..., 51)
-            hoverCursorSize = cursorSizeSlider.getValue() * 2 + 1;
-            cursorSizeValueLabel.setText(hoverCursorSize + "x" + hoverCursorSize);
-            imageLabel.repaint();
-        });
-        controlPanel.add(cursorSizeSlider);
-        controlPanel.add(Box.createHorizontalStrut(4));
-        controlPanel.add(cursorSizeValueLabel);
-        controlPanel.add(Box.createHorizontalStrut(8));
-        
-        // Cursor shape options
-        JCheckBox circleCheckbox = createStyledCheckbox("Circle");
-        circleCheckbox.setSelected(cursorCircleMode);
-        circleCheckbox.setToolTipText("Use circle shape instead of square");
-        circleCheckbox.addActionListener(e -> {
-            cursorCircleMode = circleCheckbox.isSelected();
-            imageLabel.repaint();
-        });
-        controlPanel.add(circleCheckbox);
-        controlPanel.add(Box.createHorizontalStrut(4));
-        
-        JCheckBox opaqueCheckbox = createStyledCheckbox("Opaque");
-        opaqueCheckbox.setSelected(cursorOpaqueMode);
-        opaqueCheckbox.setToolTipText("Fill the cursor shape with color");
-        opaqueCheckbox.addActionListener(e -> {
-            cursorOpaqueMode = opaqueCheckbox.isSelected();
-            imageLabel.repaint();
-        });
-        controlPanel.add(opaqueCheckbox);
-        controlPanel.add(Box.createHorizontalStrut(4));
-        
-        JCheckBox persistentCheckbox = createStyledCheckbox("Persistent");
-        persistentCheckbox.setSelected(cursorPersistentMode);
-        persistentCheckbox.setToolTipText("Apply cursor shape to all track points, not just selected track");
-        persistentCheckbox.addActionListener(e -> {
-            cursorPersistentMode = persistentCheckbox.isSelected();
-            imageLabel.repaint();
-        });
-        controlPanel.add(persistentCheckbox);
-        controlPanel.add(Box.createHorizontalStrut(12));
-        controlPanel.add(pixelValueLabel);
-        controlPanel.add(Box.createHorizontalStrut(8));
-        controlPanel.add(createSeparator());
-        controlPanel.add(Box.createHorizontalStrut(8));
-        
-        // Zoom controls
-        JLabel zoomLabelText = createStyledLabel("Zoom:");
-        zoomLabelText.setToolTipText("Current zoom level (Ctrl+scroll to zoom)");
-        controlPanel.add(zoomLabelText);
-        controlPanel.add(Box.createHorizontalStrut(4));
-        
-        zoomLabel = new JLabel("100%");
-        zoomLabel.setFont(new Font("Consolas", Font.BOLD, 12));
-        zoomLabel.setBorder(BorderFactory.createCompoundBorder(
-            BorderFactory.createLineBorder(BORDER_DARK, 1),
-            BorderFactory.createEmptyBorder(4, 8, 4, 8)
-        ));
-        zoomLabel.setBackground(SECONDARY_DARK);
-        zoomLabel.setForeground(ACCENT_BLUE);
-        zoomLabel.setOpaque(true);
-        zoomLabel.setPreferredSize(new Dimension(60, 24));
-        zoomLabel.setHorizontalAlignment(SwingConstants.CENTER);
-        zoomLabel.setToolTipText("Current zoom level");
-        controlPanel.add(zoomLabel);
-        controlPanel.add(Box.createHorizontalStrut(4));
-        
-        zoomOutButton = createStyledButton("-");
-        zoomOutButton.setPreferredSize(new Dimension(40, 28));
-        zoomOutButton.setMinimumSize(new Dimension(40, 28));
-        zoomOutButton.setToolTipText("Zoom Out (or Ctrl+scroll down)");
-        zoomOutButton.addActionListener(e -> {
-            if (currentImage == null) return;
-            // Zoom centered on viewport center
-            Point center = new Point(imageLabel.getWidth() / 2, imageLabel.getHeight() / 2);
-            zoomCenteredAt(center, 0.8);
-            updateZoomLabel();
-        });
-        controlPanel.add(zoomOutButton);
-        controlPanel.add(Box.createHorizontalStrut(2));
-        
-        zoomInButton = createStyledButton("+");
-        zoomInButton.setPreferredSize(new Dimension(40, 28));
-        zoomInButton.setMinimumSize(new Dimension(40, 28));
-        zoomInButton.setToolTipText("Zoom In (or Ctrl+scroll up)");
-        zoomInButton.addActionListener(e -> {
-            if (currentImage == null) return;
-            // Zoom centered on viewport center
-            Point center = new Point(imageLabel.getWidth() / 2, imageLabel.getHeight() / 2);
-            zoomCenteredAt(center, 1.25);
-            updateZoomLabel();
-        });
-        controlPanel.add(zoomInButton);
-        controlPanel.add(Box.createHorizontalStrut(4));
-        
-        zoomFitButton = createStyledButton("Fit");
-        zoomFitButton.setPreferredSize(new Dimension(50, 28));
-        zoomFitButton.setMinimumSize(new Dimension(50, 28));
-        zoomFitButton.setToolTipText("Fit image to window");
-        zoomFitButton.addActionListener(e -> {
-            if (currentImage == null) return;
-            fitImageToWindow();
-            updateZoomLabel();
-        });
-        controlPanel.add(zoomFitButton);
-        controlPanel.add(Box.createHorizontalStrut(4));
-        
-        zoomResetButton = createStyledButton("1:1");
-        zoomResetButton.setPreferredSize(new Dimension(50, 28));
-        zoomResetButton.setMinimumSize(new Dimension(50, 28));
-        zoomResetButton.setToolTipText("Reset to 100% zoom (actual pixels)");
-        zoomResetButton.addActionListener(e -> {
-            if (currentImage == null) return;
-            resetZoomToActual();
-            updateZoomLabel();
-        });
-        controlPanel.add(zoomResetButton);
-        
+        // Spacer to push help to the right
         controlPanel.add(Box.createHorizontalGlue());
-        controlPanel.add(Box.createHorizontalStrut(10));
-        // Status bar with professional dark styling
-        statusLabel = new JLabel("  ● Ready");
-        statusLabel.setBorder(BorderFactory.createEmptyBorder(8, 15, 8, 15));
-        statusLabel.setOpaque(true);
-        statusLabel.setBackground(PRIMARY_DARK);
-        statusLabel.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        
+        // Help button (right-aligned)
+        controlPanel.add(helpButton);
+        controlPanel.add(Box.createHorizontalStrut(4));
+        
+        // Status indicator (compact, right-aligned)
+        statusLabel = new JLabel("● Ready");
+        statusLabel.setFont(new Font("Segoe UI", Font.PLAIN, 11));
         statusLabel.setForeground(ACCENT_GREEN);
+        statusLabel.setBorder(BorderFactory.createEmptyBorder(0, 8, 0, 4));
+        controlPanel.add(statusLabel);
         
         // Wrap control panel in a scroll pane for horizontal scrolling when window is narrow
-        // This prevents the toolbar from growing vertically and blocking window resize
         JScrollPane controlScrollPane = new JScrollPane(controlPanel);
         controlScrollPane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_AS_NEEDED);
         controlScrollPane.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_NEVER);
         controlScrollPane.setBorder(null);
         controlScrollPane.setBackground(PANEL_DARK);
         controlScrollPane.getViewport().setBackground(PANEL_DARK);
-        // Set a fixed preferred height so toolbar doesn't grow
-        controlScrollPane.setPreferredSize(new Dimension(100, controlPanel.getPreferredSize().height + 5));
+        controlScrollPane.setPreferredSize(new Dimension(100, 50));
         controlScrollPane.setMinimumSize(new Dimension(100, 50));
+        styleScrollPane(controlScrollPane);
         
         JPanel bottomPanel = new JPanel(new BorderLayout());
         bottomPanel.setBackground(PRIMARY_DARK);
         bottomPanel.add(controlScrollPane, BorderLayout.CENTER);
-        bottomPanel.add(statusLabel, BorderLayout.SOUTH);
         frame.add(bottomPanel, BorderLayout.SOUTH);
 
         rowHeight = openButton.getPreferredSize().height;
 
         // Listeners
         openButton.addActionListener(e -> openTiff(pageLabel));
+        exportVideoButton.addActionListener(e -> showExportVideoDialog());
         adjustButton.addActionListener(e -> adjustBrightness());
         importButton.addActionListener(e -> importAnnotations());
         exportButton.addActionListener(e -> exportAnnotations());
@@ -5765,7 +6089,7 @@ public class VideoAnnotationTool {
                 
                 int delay = 1000 / fps;
 
-                if (playButton.getText().contains("Play") || playButton.getText().equals("Play")) {
+                if (playButton.getText().equals("▶")) {
                     if (playTimer != null && playTimer.isRunning()) {
                         playTimer.stop();
                     }
@@ -5777,7 +6101,7 @@ public class VideoAnnotationTool {
                         public void actionPerformed(ActionEvent evt) {
                             if (slice >= totalSlices) {
                                 ((Timer) evt.getSource()).stop();
-                                playButton.setText("Play");
+                                playButton.setText("▶");
                                 return;
                             }
                             slice++;
@@ -5789,12 +6113,12 @@ public class VideoAnnotationTool {
                         }
                     });
                     playTimer.start();
-                    playButton.setText("Pause");
+                    playButton.setText("❚❚");
                 } else { 
                     if (playTimer != null && playTimer.isRunning()) {
                         playTimer.stop();
                     }
-                    playButton.setText("Play");
+                    playButton.setText("▶");
                 }
             } catch (NumberFormatException ex) {
                 JOptionPane.showMessageDialog(frame, "Invalid FPS value", "Error", JOptionPane.ERROR_MESSAGE);
@@ -5944,8 +6268,9 @@ public class VideoAnnotationTool {
         // Create custom tabbed pane with side tabs
         JSplitPane contentPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT);
         contentPane.setBackground(PRIMARY_DARK);
-        contentPane.setDividerSize(1);
         contentPane.setBorder(null);
+        styleSplitPane(contentPane);
+        contentPane.setDividerSize(4); // Thinner for dialog
         
         // Left side: Tab list (vertical navigation)
         JPanel tabListPanel = new JPanel();
@@ -6044,6 +6369,7 @@ public class VideoAnnotationTool {
         tabListScroll.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
         tabListScroll.getViewport().setBackground(new Color(25, 30, 38));
         tabListScroll.setPreferredSize(new Dimension(180, 0));
+        styleScrollPane(tabListScroll);
         
         contentPanel.add(cardPanel, BorderLayout.CENTER);
         
@@ -6113,6 +6439,7 @@ public class VideoAnnotationTool {
         scrollPane.getViewport().setBackground(PANEL_DARK);
         scrollPane.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
         scrollPane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
+        styleScrollPane(scrollPane);
         
         // Scroll to top when shown
         SwingUtilities.invokeLater(() -> scrollPane.getVerticalScrollBar().setValue(0));
@@ -6270,6 +6597,7 @@ public class VideoAnnotationTool {
     /**
      * Build expected filename suffix based on current configuration settings.
      * This helps match cached files with the user's current settings.
+     * IMPORTANT: Must match _build_flow_filename in Python's tracking_server.py
      */
     private String buildExpectedFlowFileSuffix(String method) {
         if ("raft".equals(method)) {
@@ -6280,46 +6608,415 @@ public class VideoAnnotationTool {
             String kernel = config.getProperty("locotrack.kernel", "gaussian_rbf");
             String flowSmooth = config.getProperty("locotrack.flow.smoothing", "15.0");
             String temporal = config.getProperty("locotrack.temporal.smooth", "0.1");
+            boolean medianFilter = Boolean.parseBoolean(config.getProperty("locotrack.dog.median.filter", "false"));
+            boolean subpixel = Boolean.parseBoolean(config.getProperty("locotrack.dog.subpixel", "true"));
             
             // Build expected pattern (matching _build_flow_filename in Python)
-            return String.format("_locotrack_r%.1f_t%.2f_k%s_fs%.0f_ts%.2f",
+            // Format: _locotrack_r{R}_t{T}_k{K}_fs{FS}_ts{TS}_seed{N}[_med][_nosp]
+            // Note: currentSlice is 1-indexed, Python uses 0-indexed
+            int seedFrame = (currentSlice > 0) ? (currentSlice - 1) : 0;
+            StringBuilder suffix = new StringBuilder();
+            suffix.append(String.format("_locotrack_r%.1f_t%.2f_k%s_fs%.0f_ts%.2f_seed%d",
                 Double.parseDouble(radius),
                 Double.parseDouble(threshold),
                 kernel.length() >= 3 ? kernel.substring(0, 3) : kernel,
                 Double.parseDouble(flowSmooth),
-                Double.parseDouble(temporal));
+                Double.parseDouble(temporal),
+                seedFrame));
+            if (medianFilter) {
+                suffix.append("_med");
+            }
+            if (!subpixel) {
+                suffix.append("_nosp");
+            }
+            return suffix.toString();
         } else if ("trackpy".equals(method)) {
-            // Trackpy uses native detection (diameter, minmass)
-            String diameter = config.getProperty("trackpy.diameter", "11");
-            String minmass = config.getProperty("trackpy.minmass", "0");
+            // Trackpy uses DoG detection with Python defaults since Java doesn't send radius/threshold
+            // Format: _trackpy_r{R}_t{T}_sr{SR}_m{M}_k{K}_fs{FS}_sf{SF}[_med][_nosp]
+            // IMPORTANT: Python uses defaults radius=2.5, threshold=0.0 when Java only sends diameter
             String searchRange = config.getProperty("trackpy.search.range", "15");
             String memory = config.getProperty("trackpy.memory", "5");
             String kernel = config.getProperty("trackpy.kernel", "gaussian_rbf");
             String flowSmooth = config.getProperty("trackpy.flow.smoothing", "15");
+            String smoothFactor = config.getProperty("trackpy.smooth.factor", "0.1");
             
-            return String.format("_trackpy_d%s_mm%s_sr%s_m%s_k%s_fs%.0f",
-                diameter, minmass,
-                searchRange, memory,
+            // Use Python's default values since Java doesn't send radius/threshold to Python
+            double radius = 2.5;  // Python default
+            double threshold = 0.0;  // Python default
+            
+            // Format search_range to match Python's output:
+            // If config has "15.0", Python receives float 15.0 and prints "15.0"
+            // If config has "15", Python receives int 15 and prints "15"
+            String searchRangeFmt = searchRange;
+            try {
+                // If it's a clean integer like "15", keep as "15"
+                // If it's "15.0", Python would print "15.0"
+                double srVal = Double.parseDouble(searchRange);
+                if (srVal == Math.floor(srVal) && !searchRange.contains(".")) {
+                    searchRangeFmt = String.valueOf((int) srVal);
+                } else {
+                    // Keep as-is, Python will use float format
+                    searchRangeFmt = searchRange;
+                }
+            } catch (NumberFormatException e) {
+                // Keep as string
+            }
+            
+            // Build DoG-style suffix (matching Python's actual output)
+            return String.format("_trackpy_r%.1f_t%.2f_sr%s_m%s_k%s_fs%.0f_sf%.2f",
+                radius,
+                threshold,
+                searchRangeFmt,
+                memory,
                 kernel.length() >= 3 ? kernel.substring(0, 3) : kernel,
-                Double.parseDouble(flowSmooth));
+                Double.parseDouble(flowSmooth),
+                Double.parseDouble(smoothFactor));
+        } else if ("dis".equals(method)) {
+            String dsFactor = config.getProperty("dis.downsample.factor", "2");
+            return "_dis_ds" + dsFactor;
         }
         return "_" + method;
     }
     
     /**
      * Check if a cached file matches the current configuration settings.
+     * For LocoTrack, we ignore the seed frame since users may want to use
+     * flow computed from any seed frame.
      */
     private boolean flowFileMatchesCurrentSettings(File flowFile, String method) {
         String filename = flowFile.getName();
-        String expectedSuffix = buildExpectedFlowFileSuffix(method);
         
-        // For RAFT, any file starting with the method is considered a match
+        // For RAFT, any file with the method is considered a match
         if ("raft".equals(method)) {
             return filename.contains("_raft");
         }
         
+        if ("locotrack".equals(method)) {
+            // Check core parameters (ignoring seed frame which varies)
+            String radius = config.getProperty("locotrack.dog.radius", "2.5");
+            String threshold = config.getProperty("locotrack.dog.threshold", "0.0");
+            String kernel = config.getProperty("locotrack.kernel", "gaussian_rbf");
+            String flowSmooth = config.getProperty("locotrack.flow.smoothing", "15.0");
+            String temporal = config.getProperty("locotrack.temporal.smooth", "0.1");
+            boolean medianFilter = Boolean.parseBoolean(config.getProperty("locotrack.dog.median.filter", "false"));
+            boolean subpixel = Boolean.parseBoolean(config.getProperty("locotrack.dog.subpixel", "true"));
+            
+            // Build pattern WITHOUT seed frame (so any seed frame matches)
+            String corePattern = String.format("_locotrack_r%.1f_t%.2f_k%s_fs%.0f_ts%.2f",
+                Double.parseDouble(radius),
+                Double.parseDouble(threshold),
+                kernel.length() >= 3 ? kernel.substring(0, 3) : kernel,
+                Double.parseDouble(flowSmooth),
+                Double.parseDouble(temporal));
+            
+            if (!filename.contains(corePattern)) {
+                return false;
+            }
+            
+            // Check optional flags
+            boolean fileHasMed = filename.contains("_med");
+            boolean fileHasNosp = filename.contains("_nosp");
+            
+            if (medianFilter != fileHasMed) return false;
+            if (!subpixel != fileHasNosp) return false;
+            
+            return true;
+        }
+        
+        if ("trackpy".equals(method)) {
+            // Trackpy can have either DoG format or legacy format
+            // Check if file is DoG format (has _r and _t patterns)
+            boolean isDoGFile = filename.matches(".*_trackpy_.*_r[\\d.]+_t[\\d.]+.*");
+            boolean isLegacyFile = filename.matches(".*_trackpy_.*_d\\d+_mm\\d+.*");
+            
+            // For search_range matching, need to handle both int and float formats
+            // Config may have "15" or "15.0", and Python preserves that format in filename
+            String searchRange = config.getProperty("trackpy.search.range", "15");
+            String memory = config.getProperty("trackpy.memory", "5");
+            String kernel = config.getProperty("trackpy.kernel", "gaussian_rbf");
+            String kernelAbbrev = kernel.length() >= 3 ? kernel.substring(0, 3) : kernel;
+            
+            // Check common parameters - use regex for search_range to handle both 15 and 15.0
+            java.util.regex.Pattern srPattern = java.util.regex.Pattern.compile("_sr([\\d.]+)_");
+            java.util.regex.Matcher srMatcher = srPattern.matcher(filename);
+            if (!srMatcher.find()) return false;
+            try {
+                double fileSr = Double.parseDouble(srMatcher.group(1));
+                double configSr = Double.parseDouble(searchRange);
+                if (Math.abs(fileSr - configSr) > 0.1) return false;
+            } catch (NumberFormatException e) {
+                return false;
+            }
+            
+            if (!filename.contains("_m" + memory + "_")) return false;
+            if (!filename.contains("_k" + kernelAbbrev + "_")) return false;
+            
+            return true; // If common params match, consider it a match
+        }
+        
+        if ("dis".equals(method)) {
+            String dsFactor = config.getProperty("dis.downsample.factor", "2");
+            return filename.contains("_dis_ds" + dsFactor);
+        }
+        
         // For other methods, check if filename contains the expected parameter pattern
+        String expectedSuffix = buildExpectedFlowFileSuffix(method);
         return filename.contains(expectedSuffix);
+    }
+    
+    /**
+     * Show a dialog allowing the user to select from multiple cached optical flow files.
+     * Displays detailed parameter information for each file to help the user choose.
+     * 
+     * @param cachedFiles List of compatible cached flow files (must not be empty)
+     * @param flowMethod The current flow method (e.g., "locotrack", "trackpy", "raft")
+     * @param matchingFile The file that matches current settings (may be null)
+     * @return The selected file, or null if the user cancelled
+     */
+    private File showFlowFileSelectionDialog(java.util.List<File> cachedFiles, String flowMethod, File matchingFile) {
+        if (cachedFiles.isEmpty()) {
+            return null;
+        }
+        
+        // If only one file, just return it directly
+        if (cachedFiles.size() == 1) {
+            return cachedFiles.get(0);
+        }
+        
+        // Build array of display items for the list
+        String[] fileDescriptions = new String[cachedFiles.size()];
+        int preselectedIndex = 0;
+        
+        for (int i = 0; i < cachedFiles.size(); i++) {
+            File f = cachedFiles.get(i);
+            boolean isMatch = flowFileMatchesCurrentSettings(f, flowMethod);
+            StringBuilder desc = new StringBuilder();
+            
+            // Mark the file that matches current settings
+            if (isMatch) {
+                desc.append("✓ ");
+                preselectedIndex = i;
+            } else {
+                desc.append("   ");
+            }
+            
+            // Add detailed description with parameters
+            desc.append(describeFlowFileDetailed(f, flowMethod));
+            
+            if (isMatch) {
+                desc.append("  ← matches current settings");
+            }
+            
+            fileDescriptions[i] = desc.toString();
+        }
+        
+        // If we have a matching file, preselect it
+        if (matchingFile != null) {
+            for (int i = 0; i < cachedFiles.size(); i++) {
+                if (cachedFiles.get(i).equals(matchingFile)) {
+                    preselectedIndex = i;
+                    break;
+                }
+            }
+        }
+        
+        // Create JList for selection
+        JList<String> fileList = new JList<>(fileDescriptions);
+        fileList.setSelectedIndex(preselectedIndex);
+        fileList.setSelectionMode(javax.swing.ListSelectionModel.SINGLE_SELECTION);
+        fileList.setFont(new Font("Monospaced", Font.PLAIN, 12));
+        fileList.setBackground(PANEL_DARK);
+        fileList.setForeground(TEXT_PRIMARY);
+        fileList.setSelectionBackground(ACCENT_BLUE);
+        fileList.setSelectionForeground(Color.WHITE);
+        
+        // Custom cell renderer for better visual styling
+        fileList.setCellRenderer(new javax.swing.DefaultListCellRenderer() {
+            @Override
+            public Component getListCellRendererComponent(JList<?> list, Object value,
+                    int index, boolean isSelected, boolean cellHasFocus) {
+                JLabel label = (JLabel) super.getListCellRendererComponent(
+                    list, value, index, isSelected, cellHasFocus);
+                label.setBorder(BorderFactory.createEmptyBorder(4, 8, 4, 8));
+                if (!isSelected) {
+                    label.setBackground(PANEL_DARK);
+                    label.setForeground(TEXT_PRIMARY);
+                }
+                return label;
+            }
+        });
+        
+        JScrollPane scrollPane = new JScrollPane(fileList);
+        scrollPane.setPreferredSize(new Dimension(600, Math.min(200, cachedFiles.size() * 30 + 20)));
+        scrollPane.setBorder(BorderFactory.createLineBorder(ACCENT_BLUE, 1));
+        styleScrollPane(scrollPane);
+        
+        // Build the dialog panel
+        JPanel panel = new JPanel(new BorderLayout(10, 10));
+        panel.setBackground(PANEL_DARK);
+        
+        // Header with instructions
+        JLabel headerLabel = new JLabel("<html><body style='width: 550px;'>" +
+            "<b>Select which cached optical flow file to load:</b><br>" +
+            "<span style='color: #9AA0A6; font-size: 11px;'>Files with ✓ match your current settings. " +
+            "Parameters are shown for each file to help you choose.</span>" +
+            "</body></html>");
+        headerLabel.setForeground(TEXT_PRIMARY);
+        headerLabel.setBorder(BorderFactory.createEmptyBorder(0, 0, 10, 0));
+        panel.add(headerLabel, BorderLayout.NORTH);
+        
+        panel.add(scrollPane, BorderLayout.CENTER);
+        
+        // Method/resolution info at bottom
+        StringBuilder infoText = new StringBuilder();
+        infoText.append("Current method: ").append(flowMethod.toUpperCase());
+        if (imp != null) {
+            infoText.append(" | Working resolution: ").append(imp.getWidth()).append("x").append(imp.getHeight());
+        }
+        JLabel infoLabel = new JLabel(infoText.toString());
+        infoLabel.setForeground(TEXT_SECONDARY);
+        infoLabel.setFont(new Font("Segoe UI", Font.ITALIC, 11));
+        infoLabel.setBorder(BorderFactory.createEmptyBorder(10, 0, 0, 0));
+        panel.add(infoLabel, BorderLayout.SOUTH);
+        
+        // Show dialog
+        int result = JOptionPane.showConfirmDialog(
+            frame,
+            panel,
+            "Select Optical Flow File",
+            JOptionPane.OK_CANCEL_OPTION,
+            JOptionPane.PLAIN_MESSAGE
+        );
+        
+        if (result == JOptionPane.OK_OPTION) {
+            int selectedIndex = fileList.getSelectedIndex();
+            if (selectedIndex >= 0 && selectedIndex < cachedFiles.size()) {
+                return cachedFiles.get(selectedIndex);
+            }
+        }
+        
+        return null; // User cancelled
+    }
+    
+    /**
+     * Extract detailed human-readable description of settings from a flow filename.
+     * Provides more parameter details than describeFlowFile for the selection dialog.
+     */
+    private String describeFlowFileDetailed(File flowFile, String method) {
+        String filename = flowFile.getName();
+        StringBuilder desc = new StringBuilder();
+        
+        // Extract resolution if present
+        int[] resolution = extractResolutionFromFlowFile(flowFile);
+        if (resolution != null) {
+            desc.append(String.format("[%dx%d] ", resolution[0], resolution[1]));
+        } else {
+            desc.append("[full-res] ");
+        }
+        
+        // Extract and format parameters based on method
+        if ("locotrack".equals(method)) {
+            // Pattern: _locotrack[_WxH]_r{radius}_t{threshold}_k{kernel}_fs{flowSmooth}_ts{temporal}_seed{N}[_med][_nosp]
+            java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(
+                "_locotrack(?:_\\d+x\\d+)?_r([\\d.]+)_t([\\d.]+)_k(\\w+)_fs([\\d.]+)_ts([\\d.]+)(?:_seed(\\d+)|_seeds([\\d_]+))?");
+            java.util.regex.Matcher matcher = pattern.matcher(filename);
+            if (matcher.find()) {
+                desc.append("radius=").append(matcher.group(1));
+                desc.append(", threshold=").append(matcher.group(2));
+                desc.append(", kernel=").append(expandKernelName(matcher.group(3)));
+                desc.append(", flow_smooth=").append(matcher.group(4));
+                desc.append(", temporal=").append(matcher.group(5));
+                if (matcher.group(6) != null) {
+                    desc.append(", seed=").append(matcher.group(6));
+                } else if (matcher.group(7) != null) {
+                    desc.append(", seeds=").append(matcher.group(7).replace("_", ","));
+                }
+                // Check optional flags
+                if (filename.contains("_med")) desc.append(", median");
+                if (filename.contains("_nosp")) desc.append(", no-subpixel");
+                if (filename.contains("_inv")) desc.append(", inverted");
+            } else {
+                desc.append("(default parameters)");
+            }
+        } else if ("trackpy".equals(method)) {
+            // Try DoG format first: _trackpy[_WxH]_r{R}_t{T}_sr{SR}_m{M}_k{K}_fs{FS}_sf{SF}
+            // Note: sr can be int or float (e.g., _sr15_ or _sr15.0_)
+            java.util.regex.Pattern dogPattern = java.util.regex.Pattern.compile(
+                "_trackpy(?:_\\d+x\\d+)?_r([\\d.]+)_t([\\d.]+)_sr([\\d.]+)_m(\\d+)_k(\\w+)_fs([\\d.]+)(?:_sf([\\d.]+))?");
+            java.util.regex.Matcher dogMatcher = dogPattern.matcher(filename);
+            
+            // Try legacy format: _trackpy[_WxH]_d{D}_mm{MM}_sr{SR}_m{M}_k{K}_fs{FS}
+            java.util.regex.Pattern legacyPattern = java.util.regex.Pattern.compile(
+                "_trackpy(?:_\\d+x\\d+)?_d(\\d+)_mm(\\d+)_sr([\\d.]+)_m(\\d+)_k(\\w+)_fs([\\d.]+)");
+            java.util.regex.Matcher legacyMatcher = legacyPattern.matcher(filename);
+            
+            if (dogMatcher.find()) {
+                desc.append("radius=").append(dogMatcher.group(1));
+                desc.append(", threshold=").append(dogMatcher.group(2));
+                desc.append(", search_range=").append(dogMatcher.group(3));
+                desc.append(", memory=").append(dogMatcher.group(4));
+                desc.append(", kernel=").append(expandKernelName(dogMatcher.group(5)));
+                desc.append(", flow_smooth=").append(dogMatcher.group(6));
+                if (dogMatcher.group(7) != null) {
+                    desc.append(", smooth_factor=").append(dogMatcher.group(7));
+                }
+                if (filename.contains("_med")) desc.append(", median");
+                if (filename.contains("_nosp")) desc.append(", no-subpixel");
+                if (filename.contains("_inv")) desc.append(", inverted");
+            } else if (legacyMatcher.find()) {
+                desc.append("diameter=").append(legacyMatcher.group(1));
+                desc.append(", minmass=").append(legacyMatcher.group(2));
+                desc.append(", search_range=").append(legacyMatcher.group(3));
+                desc.append(", memory=").append(legacyMatcher.group(4));
+                desc.append(", kernel=").append(expandKernelName(legacyMatcher.group(5)));
+                desc.append(", flow_smooth=").append(legacyMatcher.group(6));
+            } else {
+                desc.append("(default parameters)");
+            }
+        } else if ("raft".equals(method)) {
+            // RAFT has fewer parameters encoded in filename
+            if (filename.contains("_small")) {
+                desc.append("model=small");
+            } else {
+                desc.append("model=standard");
+            }
+        } else if ("dis".equals(method)) {
+            java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("_dis_ds(\\d+)");
+            java.util.regex.Matcher matcher = pattern.matcher(filename);
+            if (matcher.find()) {
+                desc.append("downsample=").append(matcher.group(1));
+            } else {
+                desc.append("(default parameters)");
+            }
+        } else {
+            desc.append("(").append(method).append(")");
+        }
+        
+        // Add file size and date
+        long sizeKB = flowFile.length() / 1024;
+        String sizeStr = sizeKB > 1024 ? String.format("%.1fMB", sizeKB / 1024.0) : sizeKB + "KB";
+        java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("MMM dd HH:mm");
+        String dateStr = sdf.format(new java.util.Date(flowFile.lastModified()));
+        
+        desc.append(" [").append(sizeStr).append(", ").append(dateStr).append("]");
+        
+        return desc.toString();
+    }
+    
+    /**
+     * Expand abbreviated kernel names to full names for display.
+     */
+    private String expandKernelName(String abbrev) {
+        if (abbrev == null) return "unknown";
+        switch (abbrev.toLowerCase()) {
+            case "gau": return "gaussian_rbf";
+            case "lin": return "linear";
+            case "mul": return "multiquadric";
+            case "inv": return "inverse_mq";
+            case "thi": return "thin_plate";
+            case "cub": return "cubic";
+            default: return abbrev;
+        }
     }
     
     /**
@@ -6454,7 +7151,7 @@ public class VideoAnnotationTool {
         
         // Check if optical flow is computed
         if (!opticalFlowComputed) {
-            String flowMethod = config.getProperty("flow.method", getDefaultFlowMethod());
+            String flowMethod = getConfiguredFlowMethod();
             java.util.List<File> allCachedFiles = findCachedFlowFiles(currentVideoPath, flowMethod);
             
             // CRITICAL: Filter by resolution to prevent using wrong-resolution flow data
@@ -6523,8 +7220,16 @@ public class VideoAnnotationTool {
                 );
                 
                 if (choice == 0) { // Load Existing
-                    // Prefer a cached file that matches current settings; otherwise newest compatible.
-                    File fileToLoad = (matchingFile != null) ? matchingFile : compatibleFiles.get(0);
+                    // If multiple files available, let user choose; otherwise use best match
+                    File fileToLoad;
+                    if (compatibleFiles.size() > 1) {
+                        fileToLoad = showFlowFileSelectionDialog(compatibleFiles, flowMethod, matchingFile);
+                        if (fileToLoad == null) {
+                            return; // User cancelled selection
+                        }
+                    } else {
+                        fileToLoad = (matchingFile != null) ? matchingFile : compatibleFiles.get(0);
+                    }
                     loadExistingOpticalFlow(fileToLoad);
                     return;
                 } else if (choice == 1) { // Recalculate
@@ -6759,6 +7464,9 @@ public class VideoAnnotationTool {
         refreshAnnotationList();
         imageLabel.repaint();
         
+        // Scroll the track list to show the selected/deselected track
+        scrollToTrack(trackAtPoint);
+        
         // Provide feedback
         String action = !currentlySelected ? "Selected" : "Deselected";
         int selectedCount = (int) trackSelected.values().stream().filter(v -> v).count();
@@ -6785,7 +7493,7 @@ public class VideoAnnotationTool {
                 JOptionPane.YES_NO_OPTION);
             
             if (confirm == JOptionPane.YES_OPTION) {
-                saveState();
+                saveState("Replace " + selectedTrackId);
                 frameMap.clear();
                 trackAnchors.get(selectedTrackId).clear();
                 trackOptimized.put(selectedTrackId, false);
@@ -6794,7 +7502,7 @@ public class VideoAnnotationTool {
                 return;
             }
         } else {
-            saveState();
+            saveState("Create new annotation point");
         }
         
         // Use current frame for initialization (0-indexed internally, 1-indexed in UI)
@@ -6852,7 +7560,7 @@ public class VideoAnnotationTool {
     }
 
     private void handleCorrectionClick(int imgX, int imgY) {
-        saveState();
+        saveState("Add/move anchor point");
         
         // Frame is 1-indexed in display, 0-indexed internally
         int frameIndex = currentSlice - 1;
@@ -7389,7 +8097,7 @@ public class VideoAnnotationTool {
         setStatus("Optimizing " + unoptimizedCount + " unoptimized track(s)...");
         
         // Save state for undo before batch optimization
-        saveState();
+        saveState("Batch optimize tracks");
         
         // Cancellation flag
         final AtomicBoolean cancelled = new AtomicBoolean(false);
@@ -8588,7 +9296,7 @@ public class VideoAnnotationTool {
                     JSONArray optimizedTracks = resp.getJSONArray("optimized_tracks");
                     int updatedCount = 0;
                     
-                    saveState(); // For undo
+                    saveState("Apply optimization results"); // For undo
                     
                     for (int i = 0; i < optimizedTracks.length(); i++) {
                         JSONObject trackObj = optimizedTracks.getJSONObject(i);
@@ -8780,7 +9488,7 @@ public class VideoAnnotationTool {
                 String outputDir = getOutputDirectory();
                 
                 // Flow method and locotrack settings (TrackMate-style DoG parameters)
-                String flowMethod = config.getProperty("flow.method", getDefaultFlowMethod());
+                String flowMethod = getConfiguredFlowMethod();
                 
                 // Clear previous flow cache and GPU models before computing new flow
                 // This ensures we don't have stale data from a different method
@@ -9129,6 +9837,14 @@ public class VideoAnnotationTool {
         imp = newImp;
         totalSlices = imp.getStackSize();
         
+        // Reset slider zoom state for new video resolution
+        sliderZoomed = false;
+        sliderZoomStart = 1;
+        sliderZoomEnd = totalSlices;
+        if (sliderZoomLabel != null) {
+            sliderZoomLabel.setVisible(false);
+        }
+        
         // Save compressed video to temp file for backend
         workingVideoPath = saveCompressedVideoToTemp(imp, currentVideoPath);
         if (workingVideoPath == null) {
@@ -9257,7 +9973,7 @@ public class VideoAnnotationTool {
         elapsedTimer.start();
         
         // Get flow method for correct logging
-        final String flowMethod = config.getProperty("flow.method", getDefaultFlowMethod());
+        final String flowMethod = getConfiguredFlowMethod();
         final String flowMethodUpper = flowMethod.toUpperCase();
 
         // Choose which cached flow file to load from disk.
@@ -10350,7 +11066,7 @@ public class VideoAnnotationTool {
             return;
         }
         
-        final String flowMethod = config.getProperty("flow.method", getDefaultFlowMethod());
+        final String flowMethod = getConfiguredFlowMethod();
         setStatus("Generating optical flow visualization (method: " + flowMethod + ")...");
         
         // Cancellation flag
@@ -10617,7 +11333,7 @@ public class VideoAnnotationTool {
             return;
         }
         
-        String flowMethod = config.getProperty("flow.method", getDefaultFlowMethod());
+        String flowMethod = getConfiguredFlowMethod();
         java.util.List<File> allCachedFiles = findCachedFlowFiles(currentVideoPath, flowMethod);
         
         // CRITICAL: Filter by resolution to prevent using wrong-resolution flow data
@@ -10683,7 +11399,16 @@ public class VideoAnnotationTool {
             );
             
             if (choice == 0) { // Load Existing
-                File fileToLoad = (matchingFile != null) ? matchingFile : cachedFiles.get(0);
+                // If multiple files available, let user choose; otherwise use best match
+                File fileToLoad;
+                if (cachedFiles.size() > 1) {
+                    fileToLoad = showFlowFileSelectionDialog(cachedFiles, flowMethod, matchingFile);
+                    if (fileToLoad == null) {
+                        return; // User cancelled selection
+                    }
+                } else {
+                    fileToLoad = (matchingFile != null) ? matchingFile : cachedFiles.get(0);
+                }
                 loadExistingOpticalFlow(fileToLoad);
             } else if (choice == 1) { // Recalculate
                 int confirmResult = JOptionPane.showConfirmDialog(frame,
@@ -10730,7 +11455,7 @@ public class VideoAnnotationTool {
         String outputDir = getOutputDirectory();
         String videoName = new File(currentVideoPath).getName();
         String baseName = videoName.replaceFirst("\\.[^.]+$", "");
-        String currentMethod = config.getProperty("flow.method", getDefaultFlowMethod());
+        String currentMethod = getConfiguredFlowMethod();
         
         File dir = new File(outputDir);
         int workingWidth = imp.getWidth();
@@ -11166,9 +11891,8 @@ public class VideoAnnotationTool {
         fgbc.gridx = 1; fgbc.weightx = 0.7;
         // Only show available methods based on execution mode
         String[] advFlowMethods = isCpuOnly ? new String[]{"dis", "trackpy"} : new String[]{"raft", "dis", "locotrack", "trackpy"};
-        String advDefaultMethod = isCpuOnly ? "dis" : "raft";
         JComboBox<String> flowMethodCombo = createConfigComboBox(advFlowMethods);
-        flowMethodCombo.setSelectedItem(config.getProperty("flow.method", advDefaultMethod));
+        flowMethodCombo.setSelectedItem(getConfiguredFlowMethod()); // Use normalized method name
         flowContent.add(flowMethodCombo, fgbc);
         frow++;
         
@@ -11996,7 +12720,8 @@ public class VideoAnnotationTool {
         scrollPane.setBorder(null);
         scrollPane.getViewport().setBackground(SECONDARY_DARK);
         scrollPane.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
-        scrollPane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
+        scrollPane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_AS_NEEDED);
+        styleScrollPane(scrollPane);
         configDialog.add(scrollPane, BorderLayout.CENTER);
         
         JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 12, 12));
@@ -12163,24 +12888,27 @@ public class VideoAnnotationTool {
         configurationSection.setPreferredSize(new Dimension(configPanelWidth, 0));
         configurationSection.setMinimumSize(new Dimension(40, 0)); // Allow collapse to 40px
         
-        // Header panel with title
+        // Header panel with title - modern gradient style
         JPanel headerPanel = new JPanel(new BorderLayout()) {
             @Override
             protected void paintComponent(Graphics g) {
                 super.paintComponent(g);
-                Graphics2D g2d = (Graphics2D) g;
-                g2d.setColor(PANEL_DARK);
+                Graphics2D g2d = (Graphics2D) g.create();
+                g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                GradientPaint gradient = new GradientPaint(0, 0, new Color(40, 40, 45), 0, getHeight(), new Color(35, 35, 40));
+                g2d.setPaint(gradient);
                 g2d.fillRect(0, 0, getWidth(), getHeight());
+                // Bottom accent line
+                g2d.setColor(ACCENT_BLUE);
+                g2d.fillRect(0, getHeight() - 2, getWidth(), 2);
+                g2d.dispose();
             }
         };
         headerPanel.setOpaque(false);
-        headerPanel.setBorder(BorderFactory.createCompoundBorder(
-            BorderFactory.createMatteBorder(0, 0, 1, 0, BORDER_DARK),
-            BorderFactory.createEmptyBorder(12, 18, 12, 18)
-        ));
+        headerPanel.setBorder(BorderFactory.createEmptyBorder(12, 16, 14, 16));
         
-        JLabel configTitle = new JLabel("Configuration", SwingConstants.LEFT);
-        configTitle.setFont(new Font("Segoe UI Semibold", Font.BOLD, 16));
+        JLabel configTitle = new JLabel("SETTINGS");
+        configTitle.setFont(new Font("Segoe UI", Font.BOLD, 13));
         configTitle.setForeground(TEXT_PRIMARY);
         
         headerPanel.add(configTitle, BorderLayout.CENTER);
@@ -12192,22 +12920,24 @@ public class VideoAnnotationTool {
         mainPanel.setBorder(BorderFactory.createEmptyBorder(10, 12, 10, 12));
         
         // =====================================================================
-        // SECTION: Optical Flow Actions
+        // SECTION 1: Quick Actions (always visible, most common operations)
         // =====================================================================
-        JPanel actionsSection = createCollapsibleSection("Optical Flow Actions", true);
+        JPanel actionsSection = createCollapsibleSection("Quick Actions", true);
         JPanel actionsContent = (JPanel) ((BorderLayout) actionsSection.getLayout()).getLayoutComponent(BorderLayout.CENTER);
         actionsContent.setLayout(new BoxLayout(actionsContent, BoxLayout.Y_AXIS));
         
-        JButton recalculateFlowBtn = createStyledButton("Recalculate Optical Flow", null);
+        JButton recalculateFlowBtn = createAccentButton("Recalculate Motion Field", null);
         recalculateFlowBtn.setMaximumSize(new Dimension(Integer.MAX_VALUE, 32));
         recalculateFlowBtn.setAlignmentX(Component.LEFT_ALIGNMENT);
+        recalculateFlowBtn.setToolTipText("Recompute motion tracking data for the current video");
         recalculateFlowBtn.addActionListener(e -> recalculateOpticalFlow());
         actionsContent.add(recalculateFlowBtn);
         actionsContent.add(Box.createVerticalStrut(6));
         
-        JButton switchFlowBtn = createStyledButton("Switch Flow Method", null);
+        JButton switchFlowBtn = createStyledButton("Change Tracking Method", null);
         switchFlowBtn.setMaximumSize(new Dimension(Integer.MAX_VALUE, 32));
         switchFlowBtn.setAlignmentX(Component.LEFT_ALIGNMENT);
+        switchFlowBtn.setToolTipText("Switch to a different tracking algorithm");
         switchFlowBtn.addActionListener(e -> switchFlowMethod());
         actionsContent.add(switchFlowBtn);
         
@@ -12215,46 +12945,51 @@ public class VideoAnnotationTool {
         mainPanel.add(Box.createVerticalStrut(8));
         
         // =====================================================================
-        // SECTION: Optical Flow Settings
+        // SECTION 2: Tracking Method (simplified view for biologists)
         // =====================================================================
-        JPanel flowSection = createCollapsibleSection("Optical Flow Settings", true);
-        JPanel flowContent = (JPanel) ((BorderLayout) flowSection.getLayout()).getLayoutComponent(BorderLayout.CENTER);
-        GridBagConstraints fgbc = new GridBagConstraints();
-        fgbc.insets = new Insets(3, 3, 3, 3);
-        fgbc.fill = GridBagConstraints.HORIZONTAL;
-        fgbc.anchor = GridBagConstraints.WEST;
-        int frow = 0;
+        JPanel methodSection = createCollapsibleSection("Tracking Method", true);
+        JPanel methodContent = (JPanel) ((BorderLayout) methodSection.getLayout()).getLayoutComponent(BorderLayout.CENTER);
+        GridBagConstraints mgbc = new GridBagConstraints();
+        mgbc.insets = new Insets(4, 4, 4, 4);
+        mgbc.fill = GridBagConstraints.HORIZONTAL;
+        mgbc.anchor = GridBagConstraints.WEST;
+        int mrow = 0;
         
-        fgbc.gridx = 0; fgbc.gridy = frow; fgbc.weightx = 0.3;
-        JLabel flowMethodLabel = createConfigLabel("Flow Method:");
-        flowMethodLabel.setToolTipText("Method for computing optical flow");
-        flowContent.add(flowMethodLabel, fgbc);
-        fgbc.gridx = 1; fgbc.weightx = 0.7;
+        // Main method selection with user-friendly names
+        mgbc.gridx = 0; mgbc.gridy = mrow; mgbc.weightx = 0.35;
+        JLabel methodLabel = createConfigLabel("Method:");
+        methodLabel.setToolTipText("Choose how points are tracked across frames");
+        methodContent.add(methodLabel, mgbc);
+        mgbc.gridx = 1; mgbc.weightx = 0.65;
         
-        // Build flow method list based on execution mode
-        // GPU mode: all methods available
-        // CPU mode: only DIS and TrackPy available
+        // Build flow method list based on execution mode with friendly names
         String[] availableFlowMethods;
         String defaultFlowMethod;
         if (isCpuOnly) {
-            availableFlowMethods = new String[]{"dis", "trackpy"};
-            defaultFlowMethod = "dis";
+            availableFlowMethods = new String[]{"DIS (Fast)", "Trackpy (Particles)"};
+            defaultFlowMethod = "DIS (Fast)";
         } else {
-            availableFlowMethods = new String[]{"raft", "dis", "locotrack", "trackpy"};
-            defaultFlowMethod = "raft";
+            availableFlowMethods = new String[]{"RAFT (Original)", "DIS (Fast)", "LocoTrack (Points)", "Trackpy (Particles)"};
+            defaultFlowMethod = "RAFT (Original)";
         }
         cfgFlowMethodCombo = createModernComboBox(availableFlowMethods);
-        String savedMethod = config.getProperty("flow.method", defaultFlowMethod);
-        // Ensure saved method is available in current mode
-        if (isCpuOnly && isGpuOnlyFlowMethod(savedMethod)) {
-            savedMethod = defaultFlowMethod;
-        }
-        cfgFlowMethodCombo.setSelectedItem(savedMethod);
-        flowContent.add(cfgFlowMethodCombo, fgbc);
-        frow++;
         
-        // Low-memory mode checkbox (applies to all flow methods)
-        fgbc.gridx = 0; fgbc.gridy = frow; fgbc.gridwidth = 2; fgbc.weightx = 1.0;
+        // Map saved internal name to display name
+        String savedMethod = config.getProperty("flow.method", isCpuOnly ? "dis" : "raft");
+        if (isCpuOnly && isGpuOnlyFlowMethod(savedMethod)) {
+            savedMethod = "dis";
+        }
+        String displayMethod = mapMethodToDisplay(savedMethod);
+        cfgFlowMethodCombo.setSelectedItem(displayMethod);
+        cfgFlowMethodCombo.setToolTipText("<html><b>RAFT:</b> Original deep learning method (GPU required)<br>" +
+            "<b>DIS:</b> Fast CPU-based dense motion<br>" +
+            "<b>LocoTrack:</b> AI point tracker with auto-detection (GPU required)<br>" +
+            "<b>Trackpy:</b> Traditional particle tracking for blobs</html>");
+        methodContent.add(cfgFlowMethodCombo, mgbc);
+        mrow++;
+        
+        // Low-memory mode checkbox
+        mgbc.gridx = 0; mgbc.gridy = mrow; mgbc.gridwidth = 2; mgbc.weightx = 1.0;
         String cfgFlowIncrementalConfig = config.getProperty("flow.incremental.allocation", "auto");
         boolean cfgFlowDefaultIncremental;
         if ("auto".equalsIgnoreCase(cfgFlowIncrementalConfig)) {
@@ -12262,23 +12997,36 @@ public class VideoAnnotationTool {
         } else {
             cfgFlowDefaultIncremental = Boolean.parseBoolean(cfgFlowIncrementalConfig);
         }
-        cfgFlowIncrementalAllocCheckbox = createStyledCheckbox("Low-memory mode (incremental allocation)");
+        cfgFlowIncrementalAllocCheckbox = createStyledCheckbox("Low-memory mode");
         cfgFlowIncrementalAllocCheckbox.setSelected(cfgFlowDefaultIncremental);
-        cfgFlowIncrementalAllocCheckbox.setToolTipText("<html>Enable for systems with less than 32GB RAM.<br>" +
-            "Uses incremental allocation that allows the OS to swap older<br>" +
-            "flow data to disk, preventing out-of-memory errors.<br>" +
-            "<b>Pros:</b> Prevents OOM on low-memory systems<br>" +
-            "<b>Cons:</b> May run slightly slower due to memory management<br>" +
-            "<b>Auto:</b> Enabled by default if system has &lt; 32GB RAM</html>");
-        flowContent.add(cfgFlowIncrementalAllocCheckbox, fgbc);
-        frow++;
-        fgbc.gridwidth = 1;
+        cfgFlowIncrementalAllocCheckbox.setToolTipText("<html>Enable if you have less than 32GB RAM.<br>Prevents out-of-memory errors on large videos.</html>");
+        methodContent.add(cfgFlowIncrementalAllocCheckbox, mgbc);
+        mrow++;
+        mgbc.gridwidth = 1;
+        
+        // Auto compute checkbox
+        mgbc.gridx = 0; mgbc.gridy = mrow; mgbc.gridwidth = 2;
+        cfgAutoComputeCheck = createStyledCheckbox("Auto-compute on video load");
+        cfgAutoComputeCheck.setSelected(Boolean.parseBoolean(config.getProperty("auto.compute.optical.flow", "true")));
+        cfgAutoComputeCheck.setToolTipText("Automatically compute motion field when opening a video");
+        methodContent.add(cfgAutoComputeCheck, mgbc);
+        mrow++;
+        mgbc.gridwidth = 1;
+        
+        mainPanel.add(methodSection);
+        mainPanel.add(Box.createVerticalStrut(8));
+        
+        // =====================================================================
+        // SECTION 3: Advanced Method Settings (collapsed by default)
+        // =====================================================================
+        JPanel advancedSection = createCollapsibleSection("Advanced Settings", false);
+        JPanel advancedContent = (JPanel) ((BorderLayout) advancedSection.getLayout()).getLayoutComponent(BorderLayout.CENTER);
+        advancedContent.setLayout(new BoxLayout(advancedContent, BoxLayout.Y_AXIS));
         
         // --- RAFT Settings Panel (only shown in GPU mode) ---
         JPanel raftPanel = null;
         if (!isCpuOnly) {
-            fgbc.gridx = 0; fgbc.gridy = frow; fgbc.gridwidth = 2;
-            raftPanel = createMethodSettingsPanel("RAFT Settings");
+            raftPanel = createMethodSettingsPanel("RAFT Options");
             GridBagConstraints rgbc = new GridBagConstraints();
             rgbc.insets = new Insets(3, 3, 3, 3);
             rgbc.fill = GridBagConstraints.HORIZONTAL;
@@ -12288,16 +13036,16 @@ public class VideoAnnotationTool {
             rgbc.gridx = 1; rgbc.weightx = 0.6;
             cfgRaftModelCombo = createModernComboBox(new String[]{"large", "small"});
             cfgRaftModelCombo.setSelectedItem(config.getProperty("raft.model.size", "large"));
+            cfgRaftModelCombo.setToolTipText("Large = more accurate, Small = faster");
             raftPanel.add(cfgRaftModelCombo, rgbc);
             
-            flowContent.add(raftPanel, fgbc);
-            frow++;
-            fgbc.gridwidth = 1;
+            raftPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
+            advancedContent.add(raftPanel);
+            advancedContent.add(Box.createVerticalStrut(6));
         }
         
         // --- DIS Settings Panel ---
-        fgbc.gridx = 0; fgbc.gridy = frow; fgbc.gridwidth = 2;
-        JPanel disPanel = createMethodSettingsPanel("DIS Settings (CPU)");
+        JPanel disPanel = createMethodSettingsPanel("DIS Options");
         GridBagConstraints dgbc = new GridBagConstraints();
         dgbc.insets = new Insets(3, 3, 3, 3);
         dgbc.fill = GridBagConstraints.HORIZONTAL;
@@ -12308,61 +13056,67 @@ public class VideoAnnotationTool {
         cfgDisDownsampleSpinner = new JSpinner(new SpinnerNumberModel(
             Integer.parseInt(config.getProperty("dis.downsample.factor", "2")), 1, 8, 1));
         styleSpinner(cfgDisDownsampleSpinner);
+        cfgDisDownsampleSpinner.setToolTipText("Higher = faster but less precise");
         disPanel.add(cfgDisDownsampleSpinner, dgbc);
         
-        flowContent.add(disPanel, fgbc);
-        frow++;
-        fgbc.gridwidth = 1;
+        disPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        advancedContent.add(disPanel);
+        advancedContent.add(Box.createVerticalStrut(6));
         
         // --- LocoTrack/DoG Settings Panel (only shown in GPU mode) ---
         JPanel locotrackPanel = null;
         if (!isCpuOnly) {
-            fgbc.gridx = 0; fgbc.gridy = frow; fgbc.gridwidth = 2;
-            locotrackPanel = createMethodSettingsPanel("LocoTrack/DoG Settings");
+            locotrackPanel = createMethodSettingsPanel("LocoTrack Options");
             GridBagConstraints tgbc = new GridBagConstraints();
             tgbc.insets = new Insets(2, 3, 2, 3);
             tgbc.fill = GridBagConstraints.HORIZONTAL;
             
             tgbc.gridx = 0; tgbc.gridy = 0; tgbc.weightx = 0.4;
-            locotrackPanel.add(createConfigLabel("Radius (px):"), tgbc);
+            locotrackPanel.add(createConfigLabel("Spot Radius:"), tgbc);
             tgbc.gridx = 1; tgbc.weightx = 0.6;
             cfgRadiusSpinner = new JSpinner(new SpinnerNumberModel(
                 Double.parseDouble(config.getProperty("locotrack.dog.radius", "2.5")), 0.5, 100.0, 0.5));
             styleSpinner(cfgRadiusSpinner);
+            cfgRadiusSpinner.setToolTipText("Expected radius of objects in pixels");
             locotrackPanel.add(cfgRadiusSpinner, tgbc);
             
             tgbc.gridx = 0; tgbc.gridy = 1;
-            locotrackPanel.add(createConfigLabel("Threshold:"), tgbc);
+            locotrackPanel.add(createConfigLabel("Detection Threshold:"), tgbc);
             tgbc.gridx = 1;
             cfgDogThresholdSpinner = new JSpinner(new SpinnerNumberModel(
                 Double.parseDouble(config.getProperty("locotrack.dog.threshold", "0.0")), 0.0, 1000.0, 1.0));
             styleSpinner(cfgDogThresholdSpinner);
+            cfgDogThresholdSpinner.setToolTipText("Minimum intensity for spot detection (0 = auto)");
             locotrackPanel.add(cfgDogThresholdSpinner, tgbc);
             
             tgbc.gridx = 0; tgbc.gridy = 2; tgbc.gridwidth = 2;
-            cfgMedianFilterCheckbox = createStyledCheckbox("Median filter");
+            cfgMedianFilterCheckbox = createStyledCheckbox("Apply noise filter");
             cfgMedianFilterCheckbox.setSelected(Boolean.parseBoolean(config.getProperty("locotrack.dog.median.filter", "false")));
+            cfgMedianFilterCheckbox.setToolTipText("Reduces noise before detection");
             locotrackPanel.add(cfgMedianFilterCheckbox, tgbc);
             
             tgbc.gridy = 3;
-            cfgSubpixelCheckbox = createStyledCheckbox("Sub-pixel localization");
+            cfgSubpixelCheckbox = createStyledCheckbox("Sub-pixel precision");
             cfgSubpixelCheckbox.setSelected(Boolean.parseBoolean(config.getProperty("locotrack.dog.subpixel", "true")));
+            cfgSubpixelCheckbox.setToolTipText("More accurate positioning (recommended)");
             locotrackPanel.add(cfgSubpixelCheckbox, tgbc);
             tgbc.gridwidth = 1;
             
             tgbc.gridx = 0; tgbc.gridy = 4;
-            locotrackPanel.add(createConfigLabel("Occlusion:"), tgbc);
+            locotrackPanel.add(createConfigLabel("Occlusion Sensitivity:"), tgbc);
             tgbc.gridx = 1;
             cfgOcclusionSpinner = new JSpinner(new SpinnerNumberModel(
                 Double.parseDouble(config.getProperty("locotrack.occlusion.threshold", "0.5")), 0.0, 1.0, 0.05));
             styleSpinner(cfgOcclusionSpinner);
+            cfgOcclusionSpinner.setToolTipText("How aggressively to detect when objects disappear");
             locotrackPanel.add(cfgOcclusionSpinner, tgbc);
             
             tgbc.gridx = 0; tgbc.gridy = 5;
-            locotrackPanel.add(createConfigLabel("Kernel:"), tgbc);
+            locotrackPanel.add(createConfigLabel("Interpolation:"), tgbc);
             tgbc.gridx = 1;
             cfgLocotrackKernelCombo = createModernComboBox(new String[]{"gaussian_rbf", "gaussian", "thin_plate_spline", "idw", "wendland", "multiquadric"});
             cfgLocotrackKernelCombo.setSelectedItem(config.getProperty("locotrack.kernel", "gaussian_rbf"));
+            cfgLocotrackKernelCombo.setToolTipText("Mathematical method for smooth motion estimation");
             locotrackPanel.add(cfgLocotrackKernelCombo, tgbc);
             
             // Preview Detection button for LocoTrack/DoG
@@ -12405,53 +13159,57 @@ public class VideoAnnotationTool {
             locotrackPanel.add(cfgLocoPreviewBtn, tgbc);
             tgbc.gridwidth = 1;
             
-            flowContent.add(locotrackPanel, fgbc);
-            frow++;
-            fgbc.gridwidth = 1;
-        } // end if (!isCpuOnly) for LocoTrack panel
+            locotrackPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
+            advancedContent.add(locotrackPanel);
+            advancedContent.add(Box.createVerticalStrut(6));
+        }
         
         // --- Trackpy Settings Panel ---
-        fgbc.gridx = 0; fgbc.gridy = frow; fgbc.gridwidth = 2;
-        JPanel trackpyPanel = createMethodSettingsPanel("Trackpy Settings");
+        JPanel trackpyPanel = createMethodSettingsPanel("Trackpy Options");
         GridBagConstraints tpgbc = new GridBagConstraints();
         tpgbc.insets = new Insets(2, 3, 2, 3);
         tpgbc.fill = GridBagConstraints.HORIZONTAL;
         
         tpgbc.gridx = 0; tpgbc.gridy = 0; tpgbc.weightx = 0.4;
-        trackpyPanel.add(createConfigLabel("Diameter:"), tpgbc);
+        trackpyPanel.add(createConfigLabel("Particle Size:"), tpgbc);
         tpgbc.gridx = 1; tpgbc.weightx = 0.6;
         cfgTpDiameterSpinner = new JSpinner(new SpinnerNumberModel(
             Integer.parseInt(config.getProperty("trackpy.diameter", "11")), 3, 101, 2));
         styleSpinner(cfgTpDiameterSpinner);
+        cfgTpDiameterSpinner.setToolTipText("Expected particle diameter in pixels (must be odd)");
         trackpyPanel.add(cfgTpDiameterSpinner, tpgbc);
         
         tpgbc.gridx = 0; tpgbc.gridy = 1;
-        trackpyPanel.add(createConfigLabel("Min Mass:"), tpgbc);
+        trackpyPanel.add(createConfigLabel("Min Brightness:"), tpgbc);
         tpgbc.gridx = 1;
         cfgTpMinmassSpinner = new JSpinner(new SpinnerNumberModel(
             Double.parseDouble(config.getProperty("trackpy.minmass", "0")), 0.0, 100000.0, 100.0));
         styleSpinner(cfgTpMinmassSpinner);
+        cfgTpMinmassSpinner.setToolTipText("Minimum total brightness of a particle (0 = auto)");
         trackpyPanel.add(cfgTpMinmassSpinner, tpgbc);
         
         tpgbc.gridx = 0; tpgbc.gridy = 2;
-        trackpyPanel.add(createConfigLabel("Search Range:"), tpgbc);
+        trackpyPanel.add(createConfigLabel("Max Movement:"), tpgbc);
         tpgbc.gridx = 1;
         cfgSearchRangeSpinner = new JSpinner(new SpinnerNumberModel(
             Double.parseDouble(config.getProperty("trackpy.search.range", "15")), 1, 100, 1));
         styleSpinner(cfgSearchRangeSpinner);
+        cfgSearchRangeSpinner.setToolTipText("Maximum pixels a particle can move between frames");
         trackpyPanel.add(cfgSearchRangeSpinner, tpgbc);
         
         tpgbc.gridx = 0; tpgbc.gridy = 3;
-        trackpyPanel.add(createConfigLabel("Memory:"), tpgbc);
+        trackpyPanel.add(createConfigLabel("Gap Tolerance:"), tpgbc);
         tpgbc.gridx = 1;
         cfgMemorySpinner = new JSpinner(new SpinnerNumberModel(
             Integer.parseInt(config.getProperty("trackpy.memory", "5")), 0, 50, 1));
         styleSpinner(cfgMemorySpinner);
+        cfgMemorySpinner.setToolTipText("How many frames a particle can disappear and reappear");
         trackpyPanel.add(cfgMemorySpinner, tpgbc);
         
         tpgbc.gridx = 0; tpgbc.gridy = 4; tpgbc.gridwidth = 2;
-        cfgRequirePersistentCheck = createStyledCheckbox("Require persistent");
+        cfgRequirePersistentCheck = createStyledCheckbox("Filter short trajectories");
         cfgRequirePersistentCheck.setSelected(Boolean.parseBoolean(config.getProperty("trackpy.require.persistent", "false")));
+        cfgRequirePersistentCheck.setToolTipText("Only keep particles that appear in multiple frames");
         trackpyPanel.add(cfgRequirePersistentCheck, tpgbc);
         tpgbc.gridwidth = 1;
         
@@ -12461,36 +13219,37 @@ public class VideoAnnotationTool {
         cfgSmoothFactorSpinner = new JSpinner(new SpinnerNumberModel(
             Double.parseDouble(config.getProperty("trackpy.smooth.factor", "0.1")), 0.0, 1.0, 0.05));
         styleSpinner(cfgSmoothFactorSpinner);
+        cfgSmoothFactorSpinner.setToolTipText("Trajectory smoothness (0 = raw, 1 = very smooth)");
         trackpyPanel.add(cfgSmoothFactorSpinner, tpgbc);
         
         tpgbc.gridx = 0; tpgbc.gridy = 6;
-        trackpyPanel.add(createConfigLabel("Flow Smooth:"), tpgbc);
+        trackpyPanel.add(createConfigLabel("Motion Smooth:"), tpgbc);
         tpgbc.gridx = 1;
         cfgFlowSmoothingSpinner = new JSpinner(new SpinnerNumberModel(
             Double.parseDouble(config.getProperty("trackpy.flow.smoothing", "15")), 1, 100, 1));
         styleSpinner(cfgFlowSmoothingSpinner);
+        cfgFlowSmoothingSpinner.setToolTipText("Spatial smoothing of motion field");
         trackpyPanel.add(cfgFlowSmoothingSpinner, tpgbc);
         
         tpgbc.gridx = 0; tpgbc.gridy = 7;
-        trackpyPanel.add(createConfigLabel("Kernel:"), tpgbc);
+        trackpyPanel.add(createConfigLabel("Interpolation:"), tpgbc);
         tpgbc.gridx = 1;
-        // In CPU mode, hide GPU-only kernels (gaussian, idw, wendland use PyTorch GPU)
         String[] availableKernels = isCpuOnly 
             ? new String[]{"gaussian_rbf", "thin_plate_spline", "multiquadric"}
             : new String[]{"gaussian_rbf", "gaussian", "thin_plate_spline", "idw", "wendland", "multiquadric"};
         cfgKernelCombo = createModernComboBox(availableKernels);
         String savedKernel = config.getProperty("trackpy.kernel", "gaussian_rbf");
-        // Ensure saved kernel is available in current mode
         if (isCpuOnly && isGpuOnlyKernel(savedKernel)) {
             savedKernel = "gaussian_rbf";
         }
         cfgKernelCombo.setSelectedItem(savedKernel);
+        cfgKernelCombo.setToolTipText("Mathematical method for smooth motion estimation");
         trackpyPanel.add(cfgKernelCombo, tpgbc);
         
         // Preview Trajectories button for Trackpy
         tpgbc.gridx = 0; tpgbc.gridy = 8; tpgbc.gridwidth = 2;
         JButton cfgTrackpyPreviewBtn = createAccentButton("Preview Trajectories", null);
-        cfgTrackpyPreviewBtn.setToolTipText("Preview trackpy trajectories with free frame navigation");
+        cfgTrackpyPreviewBtn.setToolTipText("Preview detected particle trajectories");
         cfgTrackpyPreviewBtn.addActionListener(e -> {
             if (currentVideoPath == null) {
                 JOptionPane.showMessageDialog(frame, "Please load a video first.", "No Video", JOptionPane.WARNING_MESSAGE);
@@ -12535,53 +13294,118 @@ public class VideoAnnotationTool {
         trackpyPanel.add(cfgTrackpyPreviewBtn, tpgbc);
         tpgbc.gridwidth = 1;
         
-        flowContent.add(trackpyPanel, fgbc);
-        frow++;
-        fgbc.gridwidth = 1;
+        trackpyPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        advancedContent.add(trackpyPanel);
         
-        // Capture final references for lambda (needed for CPU mode where some panels may be null)
+        // Capture final references for lambda
         final JPanel finalRaftPanel = raftPanel;
         final JPanel finalLocotrackPanel = locotrackPanel;
         
         // Show/hide panels based on flow method selection
-        Runnable updateFlowPanels = () -> {
-            String method = (String) cfgFlowMethodCombo.getSelectedItem();
-            // Only show panels if they exist (GPU-only panels are null in CPU mode)
+        Runnable updateMethodPanels = () -> {
+            String displayName = (String) cfgFlowMethodCombo.getSelectedItem();
+            String method = mapDisplayToMethod(displayName);
             if (finalRaftPanel != null) finalRaftPanel.setVisible("raft".equals(method));
             disPanel.setVisible("dis".equals(method));
             if (finalLocotrackPanel != null) finalLocotrackPanel.setVisible("locotrack".equals(method));
             trackpyPanel.setVisible("trackpy".equals(method));
-            flowSection.revalidate();
-            flowSection.repaint();
+            advancedSection.revalidate();
+            advancedSection.repaint();
         };
-        cfgFlowMethodCombo.addActionListener(e -> updateFlowPanels.run());
-        updateFlowPanels.run();
+        cfgFlowMethodCombo.addActionListener(e -> updateMethodPanels.run());
+        updateMethodPanels.run();
         
-        // Auto compute checkbox
-        fgbc.gridx = 0; fgbc.gridy = frow; fgbc.gridwidth = 2;
-        cfgAutoComputeCheck = createStyledCheckbox("Auto-prompt optical flow on load");
-        cfgAutoComputeCheck.setSelected(Boolean.parseBoolean(config.getProperty("auto.compute.optical.flow", "true")));
-        flowContent.add(cfgAutoComputeCheck, fgbc);
-        
-        mainPanel.add(flowSection);
+        mainPanel.add(advancedSection);
         mainPanel.add(Box.createVerticalStrut(8));
         
         // =====================================================================
-        // SECTION: Track Optimization Settings
+        // SECTION 4: Track Refinement (correction & optimization settings)
         // =====================================================================
-        JPanel blobSection = createCollapsibleSection("Track Optimization", false);
-        JPanel blobContent = (JPanel) ((BorderLayout) blobSection.getLayout()).getLayoutComponent(BorderLayout.CENTER);
-        GridBagConstraints bgbc = new GridBagConstraints();
-        bgbc.insets = new Insets(3, 3, 3, 3);
-        bgbc.fill = GridBagConstraints.HORIZONTAL;
-        bgbc.anchor = GridBagConstraints.WEST;
+        JPanel refinementSection = createCollapsibleSection("Track Refinement", false);
+        JPanel refinementContent = (JPanel) ((BorderLayout) refinementSection.getLayout()).getLayoutComponent(BorderLayout.CENTER);
+        GridBagConstraints rgbc = new GridBagConstraints();
+        rgbc.insets = new Insets(3, 3, 3, 3);
+        rgbc.fill = GridBagConstraints.HORIZONTAL;
+        rgbc.anchor = GridBagConstraints.WEST;
+        int rrow = 0;
         
-        bgbc.gridx = 0; bgbc.gridy = 0; bgbc.gridwidth = 2;
-        cfgBlobDetectionCheckbox = createStyledCheckbox("Use Blob Detection for Rough Track");
+        // Tracking mode
+        rgbc.gridx = 0; rgbc.gridy = rrow; rgbc.weightx = 0.35;
+        refinementContent.add(createConfigLabel("Seed Mode:"), rgbc);
+        rgbc.gridx = 1; rgbc.weightx = 0.65;
+        cfgTrackingModeCombo = createModernComboBox(new String[]{"single-seed", "multi-seed"});
+        cfgTrackingModeCombo.setSelectedItem(config.getProperty("tracking.mode", "single-seed"));
+        cfgTrackingModeCombo.setToolTipText("<html><b>Single-seed:</b> One click per track<br><b>Multi-seed:</b> Multiple clicks define anchor points</html>");
+        refinementContent.add(cfgTrackingModeCombo, rgbc);
+        rrow++;
+        
+        // Correction method
+        rgbc.gridx = 0; rgbc.gridy = rrow; rgbc.weightx = 0.35;
+        refinementContent.add(createConfigLabel("Correction Style:"), rgbc);
+        rgbc.gridx = 1; rgbc.weightx = 0.65;
+        cfgCorrectionMethodCombo = createModernComboBox(new String[]{"Full-Blend", "Corridor-DP", "Blob-Assisted"});
+        String savedCorrectionMethod = config.getProperty("correction.method", "full_blend");
+        if (savedCorrectionMethod.equals("blob_assisted")) {
+            cfgCorrectionMethodCombo.setSelectedItem("Blob-Assisted");
+        } else if (savedCorrectionMethod.equals("corridor_dp")) {
+            cfgCorrectionMethodCombo.setSelectedItem("Corridor-DP");
+        } else {
+            cfgCorrectionMethodCombo.setSelectedItem("Full-Blend");
+        }
+        cfgCorrectionMethodCombo.setToolTipText("<html><b>Full-Blend:</b> Smooth motion-based correction<br>" +
+            "<b>Corridor-DP:</b> Optimal path search for drifting tracks<br>" +
+            "<b>Blob-Assisted:</b> Snaps to detected particles</html>");
+        refinementContent.add(cfgCorrectionMethodCombo, rgbc);
+        rrow++;
+        
+        // Local correction mode
+        rgbc.gridx = 0; rgbc.gridy = rrow; rgbc.gridwidth = 2;
+        cfgLocalCorrectionCheckbox = createStyledCheckbox("Local correction only");
+        cfgLocalCorrectionCheckbox.setSelected(Boolean.parseBoolean(config.getProperty("correction.local.mode", "false")));
+        cfgLocalCorrectionCheckbox.setToolTipText("Corrections only affect nearby frames, not the whole track");
+        refinementContent.add(cfgLocalCorrectionCheckbox, rgbc);
+        rgbc.gridwidth = 1;
+        rrow++;
+        
+        // Local window size
+        rgbc.gridx = 0; rgbc.gridy = rrow; rgbc.weightx = 0.35;
+        JLabel windowLabel = createConfigLabel("Local Window:");
+        refinementContent.add(windowLabel, rgbc);
+        rgbc.gridx = 1; rgbc.weightx = 0.65;
+        cfgLocalWindowSpinner = new JSpinner(new SpinnerNumberModel(
+            Integer.parseInt(config.getProperty("correction.local.window", "11")), 5, 51, 2));
+        styleSpinner(cfgLocalWindowSpinner);
+        cfgLocalWindowSpinner.setToolTipText("Number of frames affected by a local correction");
+        refinementContent.add(cfgLocalWindowSpinner, rgbc);
+        rrow++;
+        
+        windowLabel.setEnabled(cfgLocalCorrectionCheckbox.isSelected());
+        cfgLocalWindowSpinner.setEnabled(cfgLocalCorrectionCheckbox.isSelected());
+        cfgLocalCorrectionCheckbox.addActionListener(e -> {
+            windowLabel.setEnabled(cfgLocalCorrectionCheckbox.isSelected());
+            cfgLocalWindowSpinner.setEnabled(cfgLocalCorrectionCheckbox.isSelected());
+        });
+        
+        // Linear interpolation threshold
+        rgbc.gridx = 0; rgbc.gridy = rrow; rgbc.weightx = 0.35;
+        JLabel linearInterpLabel = createConfigLabel("Short Gap Interp:");
+        refinementContent.add(linearInterpLabel, rgbc);
+        rgbc.gridx = 1; rgbc.weightx = 0.65;
+        cfgLinearInterpThresholdSpinner = new JSpinner(new SpinnerNumberModel(
+            Integer.parseInt(config.getProperty("correction.linear.interp.threshold", "0")), 0, 100, 1));
+        styleSpinner(cfgLinearInterpThresholdSpinner);
+        cfgLinearInterpThresholdSpinner.setToolTipText("<html>If anchors are within N frames, use simple linear interpolation<br>instead of motion-based tracking. 0 = disabled.</html>");
+        refinementContent.add(cfgLinearInterpThresholdSpinner, rgbc);
+        rrow++;
+        
+        // Blob detection for rough tracks
+        rgbc.gridx = 0; rgbc.gridy = rrow; rgbc.gridwidth = 2;
+        cfgBlobDetectionCheckbox = createStyledCheckbox("Use blob snapping for rough tracks");
         cfgBlobDetectionCheckbox.setSelected(Boolean.parseBoolean(config.getProperty("dis.use.blob.detection", "false")));
-        cfgBlobDetectionCheckbox.setToolTipText("<html>Use blob detection to refine rough track propagation.<br>Combines flow prediction with local blob search.</html>");
-        blobContent.add(cfgBlobDetectionCheckbox, bgbc);
-        bgbc.gridwidth = 1;
+        cfgBlobDetectionCheckbox.setToolTipText("Snap points to nearest detected particle during initial propagation");
+        refinementContent.add(cfgBlobDetectionCheckbox, rgbc);
+        rgbc.gridwidth = 1;
+        rrow++;
         
         // Blob parameters panel
         cfgBlobParamsPanel = new JPanel(new GridBagLayout());
@@ -12597,269 +13421,36 @@ public class VideoAnnotationTool {
         cfgBlobSearchRadiusSpinner = new JSpinner(new SpinnerNumberModel(
             Integer.parseInt(config.getProperty("dis.blob.search.radius", "15")), 5, 50, 1));
         styleSpinner(cfgBlobSearchRadiusSpinner);
+        cfgBlobSearchRadiusSpinner.setToolTipText("How far to look for nearby particles");
         cfgBlobParamsPanel.add(cfgBlobSearchRadiusSpinner, bpgbc);
         
         bpgbc.gridx = 0; bpgbc.gridy = 1;
-        cfgBlobParamsPanel.add(createConfigLabel("Blob Radius (px):"), bpgbc);
+        cfgBlobParamsPanel.add(createConfigLabel("Blob Radius:"), bpgbc);
         bpgbc.gridx = 1;
         cfgBlobRadiusSpinner = new JSpinner(new SpinnerNumberModel(
             Double.parseDouble(config.getProperty("dis.blob.radius", "5.0")), 1.0, 50.0, 0.5));
         styleSpinner(cfgBlobRadiusSpinner);
+        cfgBlobRadiusSpinner.setToolTipText("Expected size of particles to detect");
         cfgBlobParamsPanel.add(cfgBlobRadiusSpinner, bpgbc);
         
-        bgbc.gridx = 0; bgbc.gridy = 1; bgbc.gridwidth = 2;
-        blobContent.add(cfgBlobParamsPanel, bgbc);
+        rgbc.gridx = 0; rgbc.gridy = rrow; rgbc.gridwidth = 2;
+        refinementContent.add(cfgBlobParamsPanel, rgbc);
         
         cfgBlobParamsPanel.setVisible(cfgBlobDetectionCheckbox.isSelected());
         cfgBlobDetectionCheckbox.addActionListener(e -> {
             cfgBlobParamsPanel.setVisible(cfgBlobDetectionCheckbox.isSelected());
-            blobSection.revalidate();
+            refinementSection.revalidate();
         });
         
-        // Correction Method dropdown (first item in section)
-        bgbc.gridx = 0; bgbc.gridy = 2; bgbc.gridwidth = 1; bgbc.weightx = 0.4;
-        blobContent.add(createConfigLabel("Correction Method:"), bgbc);
-        bgbc.gridx = 1; bgbc.weightx = 0.6;
-        // All correction methods are CPU-based (Corridor-DP uses dynamic programming on CPU)
-        cfgCorrectionMethodCombo = createModernComboBox(new String[]{"Full-Blend", "Corridor-DP", "Blob-Assisted"});
-        String savedCorrectionMethod = config.getProperty("correction.method", "full_blend");
-        if (savedCorrectionMethod.equals("blob_assisted")) {
-            cfgCorrectionMethodCombo.setSelectedItem("Blob-Assisted");
-        } else if (savedCorrectionMethod.equals("corridor_dp")) {
-            cfgCorrectionMethodCombo.setSelectedItem("Corridor-DP");
-        } else {
-            cfgCorrectionMethodCombo.setSelectedItem("Full-Blend");
-        }
-        cfgCorrectionMethodCombo.setToolTipText("<html><b>Full-Blend:</b> Pure optical flow with bidirectional blending.<br>" +
-            "<b>Corridor-DP:</b> Dynamic programming with adaptive corridor search (original RAFT_v4).<br>" +
-            "<b>Blob-Assisted:</b> Flow + blob detection for particle-like objects.</html>");
-        blobContent.add(cfgCorrectionMethodCombo, bgbc);
-        
-        // Linear Interpolation Threshold (applies to Full-Blend and Corridor-DP)
-        // If two anchors are within N frames, use linear interpolation instead of optical flow
-        bgbc.gridx = 0; bgbc.gridy = 3; bgbc.gridwidth = 1; bgbc.weightx = 0.4;
-        JLabel linearInterpLabel = createConfigLabel("Lin. Interp. Threshold:");
-        blobContent.add(linearInterpLabel, bgbc);
-        bgbc.gridx = 1; bgbc.weightx = 0.6;
-        cfgLinearInterpThresholdSpinner = new JSpinner(new SpinnerNumberModel(
-            Integer.parseInt(config.getProperty("correction.linear.interp.threshold", "0")), 0, 100, 1));
-        styleSpinner(cfgLinearInterpThresholdSpinner);
-        cfgLinearInterpThresholdSpinner.setToolTipText("<html>If two anchors are within N frames, use linear interpolation<br>" +
-            "instead of optical flow. Helps avoid jitter from unreliable flow.<br>" +
-            "<b>0:</b> Disabled (always use optical flow)<br>" +
-            "<b>5-10:</b> Recommended for noisy/jittery flow conditions</html>");
-        blobContent.add(cfgLinearInterpThresholdSpinner, bgbc);
-        bgbc.gridwidth = 2;
-        
-        // Corridor-DP parameters panel (shows when Corridor-DP is selected)
-        JPanel corridorParamsPanel = new JPanel(new GridBagLayout());
-        corridorParamsPanel.setBackground(PANEL_DARK);
-        corridorParamsPanel.setBorder(BorderFactory.createEmptyBorder(4, 16, 4, 4));
-        GridBagConstraints cpgbc = new GridBagConstraints();
-        cpgbc.insets = new Insets(2, 3, 2, 3);
-        cpgbc.fill = GridBagConstraints.HORIZONTAL;
-        
-        // Row 0: Label and dropdown
-        cpgbc.gridx = 0; cpgbc.gridy = 0; cpgbc.weightx = 0.35;
-        corridorParamsPanel.add(createConfigLabel("Corridor:"), cpgbc);
-        cpgbc.gridx = 1; cpgbc.weightx = 0.65;
-        String[] corridorOptions = {"Adaptive", "Full Frame", "Custom"};
-        JComboBox<String> corridorWidthCombo = createModernComboBox(corridorOptions);
-        corridorParamsPanel.add(corridorWidthCombo, cpgbc);
-        
-        // Row 1: Custom input panel (hidden by default) - contains text field + size label
-        JPanel customInputPanel = new JPanel(new GridBagLayout());
-        customInputPanel.setBackground(PANEL_DARK);
-        customInputPanel.setVisible(false);
-        GridBagConstraints cipgbc = new GridBagConstraints();
-        cipgbc.insets = new Insets(2, 3, 2, 3);
-        cipgbc.fill = GridBagConstraints.HORIZONTAL;
-        
-        cipgbc.gridx = 0; cipgbc.gridy = 0; cipgbc.weightx = 0.35;
-        customInputPanel.add(createConfigLabel("Size (px):"), cipgbc);
-        
-        cipgbc.gridx = 1; cipgbc.weightx = 0.35;
-        JTextField corridorCustomField = new JTextField("50", 5);
-        corridorCustomField.setBackground(SECONDARY_BG);
-        corridorCustomField.setForeground(ACCENT_BLUE);
-        corridorCustomField.setCaretColor(ACCENT_BLUE);
-        corridorCustomField.setBorder(BorderFactory.createCompoundBorder(
-            BorderFactory.createLineBorder(BORDER_COLOR, 1),
-            BorderFactory.createEmptyBorder(2, 4, 2, 4)));
-        customInputPanel.add(corridorCustomField, cipgbc);
-        
-        cipgbc.gridx = 2; cipgbc.weightx = 0.3;
-        JLabel corridorSizeLabel = new JLabel("");
-        corridorSizeLabel.setForeground(TEXT_SECONDARY_COLOR);
-        corridorSizeLabel.setFont(corridorSizeLabel.getFont().deriveFont(Font.ITALIC, 11f));
-        customInputPanel.add(corridorSizeLabel, cipgbc);
-        
-        cpgbc.gridx = 0; cpgbc.gridy = 1; cpgbc.gridwidth = 2; cpgbc.weightx = 1.0;
-        corridorParamsPanel.add(customInputPanel, cpgbc);
-        cpgbc.gridwidth = 1;
-        
-        // Helper to update the size display
-        Runnable updateCorridorSizeDisplay = () -> {
-            String selected = (String) corridorWidthCombo.getSelectedItem();
-            if ("Adaptive".equals(selected)) {
-                // Show estimated size based on current video (1/10 of resolution)
-                if (imp != null) {
-                    int w = imp.getWidth();
-                    int h = imp.getHeight();
-                    int adaptiveSize = Math.max(w, h) / 10;
-                    corridorSizeLabel.setText("≈ " + adaptiveSize + " px");
-                } else {
-                    corridorSizeLabel.setText("(1/10 res)");
-                }
-            } else if ("Full Frame".equals(selected)) {
-                if (imp != null) {
-                    int w = imp.getWidth();
-                    int h = imp.getHeight();
-                    corridorSizeLabel.setText(w + "×" + h);
-                } else {
-                    corridorSizeLabel.setText("(full)");
-                }
-            } else if ("Custom".equals(selected)) {
-                try {
-                    int customVal = Integer.parseInt(corridorCustomField.getText().trim());
-                    corridorSizeLabel.setText(customVal + "×" + customVal);
-                } catch (NumberFormatException ex) {
-                    corridorSizeLabel.setText("?");
-                }
-            }
-        };
-        
-        // Load saved value
-        String savedCorridorWidth = config.getProperty("corridor.width", "adaptive");
-        if (savedCorridorWidth.equals("0") || savedCorridorWidth.equals("full")) {
-            corridorWidthCombo.setSelectedItem("Full Frame");
-            customInputPanel.setVisible(false);
-        } else if (savedCorridorWidth.equals("adaptive")) {
-            corridorWidthCombo.setSelectedItem("Adaptive");
-            customInputPanel.setVisible(false);
-        } else {
-            // It's a custom number
-            corridorWidthCombo.setSelectedItem("Custom");
-            corridorCustomField.setText(savedCorridorWidth);
-            customInputPanel.setVisible(true);
-        }
-        updateCorridorSizeDisplay.run();
-        
-        corridorWidthCombo.setToolTipText("<html><b>Adaptive:</b> Uses 1/10 of video resolution as corridor width.<br>" +
-            "<b>Full Frame:</b> Searches entire frame (slower but more accurate).<br>" +
-            "<b>Custom:</b> Specify your own corridor width in pixels.</html>");
-        
-        // Handle dropdown changes
-        corridorWidthCombo.addActionListener(e -> {
-            if (isUpdatingConfigPanel) return;
-            String selected = (String) corridorWidthCombo.getSelectedItem();
-            if ("Full Frame".equals(selected)) {
-                config.setProperty("corridor.width", "0");
-                customInputPanel.setVisible(false);
-            } else if ("Custom".equals(selected)) {
-                customInputPanel.setVisible(true);
-                String customVal = corridorCustomField.getText().trim();
-                if (!customVal.isEmpty()) {
-                    config.setProperty("corridor.width", customVal);
-                }
-            } else {
-                config.setProperty("corridor.width", "adaptive");
-                customInputPanel.setVisible(false);
-            }
-            updateCorridorSizeDisplay.run();
-            corridorParamsPanel.revalidate();
-            saveConfig();
-        });
-        
-        // Handle custom field changes
-        corridorCustomField.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
-            private void update() {
-                if (isUpdatingConfigPanel) return;
-                if ("Custom".equals(corridorWidthCombo.getSelectedItem())) {
-                    String val = corridorCustomField.getText().trim();
-                    try {
-                        int intVal = Integer.parseInt(val);
-                        if (intVal > 0) {
-                            config.setProperty("corridor.width", val);
-                            saveConfig();
-                        }
-                    } catch (NumberFormatException ex) {
-                        // Ignore invalid input
-                    }
-                    updateCorridorSizeDisplay.run();
-                }
-            }
-            public void insertUpdate(javax.swing.event.DocumentEvent e) { update(); }
-            public void removeUpdate(javax.swing.event.DocumentEvent e) { update(); }
-            public void changedUpdate(javax.swing.event.DocumentEvent e) { update(); }
-        });
-        
-        bgbc.gridx = 0; bgbc.gridy = 4; bgbc.gridwidth = 2;
-        blobContent.add(corridorParamsPanel, bgbc);
-        
-        // Show/hide corridor params based on correction method
-        corridorParamsPanel.setVisible("Corridor-DP".equals(cfgCorrectionMethodCombo.getSelectedItem()));
-        cfgCorrectionMethodCombo.addActionListener(e -> {
-            String selectedMethod = (String) cfgCorrectionMethodCombo.getSelectedItem();
-            corridorParamsPanel.setVisible("Corridor-DP".equals(selectedMethod));
-            blobSection.revalidate();
-        });
-        
-        mainPanel.add(blobSection);
+        mainPanel.add(refinementSection);
         mainPanel.add(Box.createVerticalStrut(8));
         
         // =====================================================================
-        // SECTION: Tracking Settings
+        // SECTION 5: Segmentation Overlay (SAT, with clearer naming)
         // =====================================================================
-        JPanel trackSection = createCollapsibleSection("Tracking Settings", true);
-        JPanel trackContent = (JPanel) ((BorderLayout) trackSection.getLayout()).getLayoutComponent(BorderLayout.CENTER);
-        GridBagConstraints trgbc = new GridBagConstraints();
-        trgbc.insets = new Insets(3, 3, 3, 3);
-        trgbc.fill = GridBagConstraints.HORIZONTAL;
-        trgbc.anchor = GridBagConstraints.WEST;
-        int trow = 0;
-        
-        trgbc.gridx = 0; trgbc.gridy = trow; trgbc.weightx = 0.3;
-        trackContent.add(createConfigLabel("Tracking Mode:"), trgbc);
-        trgbc.gridx = 1; trgbc.weightx = 0.7;
-        cfgTrackingModeCombo = createModernComboBox(new String[]{"single-seed", "multi-seed"});
-        cfgTrackingModeCombo.setSelectedItem(config.getProperty("tracking.mode", "single-seed"));
-        trackContent.add(cfgTrackingModeCombo, trgbc);
-        trow++;
-        
-        trgbc.gridx = 0; trgbc.gridy = trow; trgbc.gridwidth = 2;
-        cfgLocalCorrectionCheckbox = createStyledCheckbox("Use Local Correction Mode");
-        cfgLocalCorrectionCheckbox.setSelected(Boolean.parseBoolean(config.getProperty("correction.local.mode", "false")));
-        cfgLocalCorrectionCheckbox.setToolTipText("<html>Corrections only affect a local window around the correction point.</html>");
-        trackContent.add(cfgLocalCorrectionCheckbox, trgbc);
-        trgbc.gridwidth = 1;
-        trow++;
-        
-        trgbc.gridx = 0; trgbc.gridy = trow; trgbc.weightx = 0.3;
-        JLabel windowLabel = createConfigLabel("Correction Window:");
-        trackContent.add(windowLabel, trgbc);
-        trgbc.gridx = 1; trgbc.weightx = 0.7;
-        cfgLocalWindowSpinner = new JSpinner(new SpinnerNumberModel(
-            Integer.parseInt(config.getProperty("correction.local.window", "11")), 5, 51, 2));
-        styleSpinner(cfgLocalWindowSpinner);
-        trackContent.add(cfgLocalWindowSpinner, trgbc);
-        
-        windowLabel.setEnabled(cfgLocalCorrectionCheckbox.isSelected());
-        cfgLocalWindowSpinner.setEnabled(cfgLocalCorrectionCheckbox.isSelected());
-        cfgLocalCorrectionCheckbox.addActionListener(e -> {
-            windowLabel.setEnabled(cfgLocalCorrectionCheckbox.isSelected());
-            cfgLocalWindowSpinner.setEnabled(cfgLocalCorrectionCheckbox.isSelected());
-        });
-        
-        mainPanel.add(trackSection);
-        mainPanel.add(Box.createVerticalStrut(8));
-        
-        // =====================================================================
-        // SECTION: Segmentation-Assisted Tracking (SAT)
-        // =====================================================================
-        JPanel satSection = createCollapsibleSection("Segmentation-Assisted Tracking", true);
-        JPanel satContent = (JPanel) ((BorderLayout) satSection.getLayout()).getLayoutComponent(BorderLayout.CENTER);
-        satContent.setLayout(new BoxLayout(satContent, BoxLayout.Y_AXIS));
+        JPanel segmentSection = createCollapsibleSection("Segmentation Overlay", false);
+        JPanel segmentContent = (JPanel) ((BorderLayout) segmentSection.getLayout()).getLayoutComponent(BorderLayout.CENTER);
+        segmentContent.setLayout(new BoxLayout(segmentContent, BoxLayout.Y_AXIS));
         
         // SAT Enable checkbox
         JPanel satEnablePanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
@@ -12867,42 +13458,75 @@ public class VideoAnnotationTool {
         satEnablePanel.setAlignmentX(Component.LEFT_ALIGNMENT);
         satEnablePanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 30));
         satCheckbox.setAlignmentX(Component.LEFT_ALIGNMENT);
+        satCheckbox.setText("Enable SAT");
+        satCheckbox.setToolTipText("Segmentation-Assisted Tracking: help tracking with threshold masks");
         satEnablePanel.add(satCheckbox);
         satEnablePanel.add(Box.createHorizontalStrut(10));
         satAdjustButton.setAlignmentX(Component.LEFT_ALIGNMENT);
+        satAdjustButton.setText("Adjust Threshold");
         satEnablePanel.add(satAdjustButton);
-        satContent.add(satEnablePanel);
-        satContent.add(Box.createVerticalStrut(6));
+        segmentContent.add(satEnablePanel);
+        segmentContent.add(Box.createVerticalStrut(6));
         
         // Show Mask checkbox
         showMaskCheckbox.setAlignmentX(Component.LEFT_ALIGNMENT);
-        satContent.add(showMaskCheckbox);
-        satContent.add(Box.createVerticalStrut(4));
+        showMaskCheckbox.setText("Show threshold mask");
+        showMaskCheckbox.setToolTipText("Overlay the binary segmentation mask on the video");
+        segmentContent.add(showMaskCheckbox);
+        segmentContent.add(Box.createVerticalStrut(4));
         
         // Show Regions checkbox
         showRegionsCheckbox.setAlignmentX(Component.LEFT_ALIGNMENT);
-        satContent.add(showRegionsCheckbox);
+        showRegionsCheckbox.setText("Show region boundaries");
+        showRegionsCheckbox.setToolTipText("Draw boundaries around detected regions");
+        segmentContent.add(showRegionsCheckbox);
         
-        mainPanel.add(satSection);
+        mainPanel.add(segmentSection);
         mainPanel.add(Box.createVerticalStrut(8));
         
-        // Add change listeners to auto-save configuration when any setting changes
+        // Add change listeners to auto-save configuration
         addConfigPanelChangeListeners();
         
-        // Scroll pane for content
+        // Scroll pane for content with modern styling
         JScrollPane scrollPane = new JScrollPane(mainPanel);
-        scrollPane.setBorder(null);
-        scrollPane.getViewport().setBackground(SECONDARY_DARK);
         scrollPane.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
         scrollPane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_AS_NEEDED);
-        scrollPane.getVerticalScrollBar().setUnitIncrement(16);
-        scrollPane.getHorizontalScrollBar().setUnitIncrement(16);
+        styleScrollPane(scrollPane);
         
         configurationContent = mainPanel;
         configurationSection.add(headerPanel, BorderLayout.NORTH);
         configurationSection.add(scrollPane, BorderLayout.CENTER);
         
         return configurationSection;
+    }
+    
+    /**
+     * Maps internal flow method names to user-friendly display names.
+     * Also handles legacy display names that might be in old configs.
+     */
+    private String mapMethodToDisplay(String method) {
+        if (method == null) return "RAFT (Original)";
+        String lower = method.toLowerCase();
+        // Handle both internal names and legacy display names
+        if (lower.equals("raft") || lower.startsWith("raft ")) return "RAFT (Original)";
+        if (lower.equals("dis") || lower.startsWith("dis ")) return "DIS (Fast)";
+        if (lower.equals("locotrack") || lower.startsWith("locotrack ")) return "LocoTrack (Points)";
+        if (lower.equals("trackpy") || lower.startsWith("trackpy ")) return "Trackpy (Particles)";
+        return method;
+    }
+    
+    /**
+     * Maps user-friendly display names back to internal method names.
+     * Also normalizes legacy display names or corrupted config values.
+     */
+    private String mapDisplayToMethod(String display) {
+        if (display == null) return "raft";
+        String lower = display.toLowerCase();
+        if (lower.equals("raft") || lower.startsWith("raft ")) return "raft";
+        if (lower.equals("dis") || lower.startsWith("dis ")) return "dis";
+        if (lower.equals("locotrack") || lower.startsWith("locotrack ")) return "locotrack";
+        if (lower.equals("trackpy") || lower.startsWith("trackpy ")) return "trackpy";
+        return display.toLowerCase();
     }
     
     /**
@@ -12947,100 +13571,125 @@ public class VideoAnnotationTool {
      * This panel is collapsible and resizable.
      */
     private JPanel createAnnotationPanel() {
-        // Main container panel
-        annotationSection = new JPanel(new BorderLayout());
-        annotationSection.setBackground(SECONDARY_DARK);
-        annotationSection.setBorder(BorderFactory.createMatteBorder(0, 1, 0, 0, BORDER_DARK));
-        annotationSection.setPreferredSize(new Dimension(annotationPanelWidth, 0));
-        annotationSection.setMinimumSize(new Dimension(40, 0)); // Allow collapse to 40px
-        
-        // Header panel with title
-        JPanel headerPanel = new JPanel(new BorderLayout()) {
+        // Main container panel with gradient background
+        annotationSection = new JPanel(new BorderLayout()) {
             @Override
             protected void paintComponent(Graphics g) {
                 super.paintComponent(g);
-                Graphics2D g2d = (Graphics2D) g;
-                g2d.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
-                g2d.setColor(PANEL_DARK);
+                Graphics2D g2d = (Graphics2D) g.create();
+                g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                // Subtle gradient background
+                GradientPaint gradient = new GradientPaint(0, 0, new Color(32, 32, 36), 0, getHeight(), new Color(26, 26, 30));
+                g2d.setPaint(gradient);
                 g2d.fillRect(0, 0, getWidth(), getHeight());
+                g2d.dispose();
+            }
+        };
+        annotationSection.setOpaque(false);
+        annotationSection.setBorder(BorderFactory.createMatteBorder(0, 1, 0, 0, new Color(50, 50, 55)));
+        annotationSection.setPreferredSize(new Dimension(annotationPanelWidth, 0));
+        annotationSection.setMinimumSize(new Dimension(40, 0));
+        
+        // Modern header panel
+        JPanel headerPanel = new JPanel(new BorderLayout(8, 0)) {
+            @Override
+            protected void paintComponent(Graphics g) {
+                super.paintComponent(g);
+                Graphics2D g2d = (Graphics2D) g.create();
+                g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                // Header gradient
+                GradientPaint gradient = new GradientPaint(0, 0, new Color(40, 40, 45), 0, getHeight(), new Color(35, 35, 40));
+                g2d.setPaint(gradient);
+                g2d.fillRect(0, 0, getWidth(), getHeight());
+                // Bottom accent line
+                g2d.setColor(ACCENT_BLUE);
+                g2d.fillRect(0, getHeight() - 2, getWidth(), 2);
+                g2d.dispose();
             }
         };
         headerPanel.setOpaque(false);
-        headerPanel.setBorder(BorderFactory.createCompoundBorder(
-            BorderFactory.createMatteBorder(0, 0, 1, 0, BORDER_DARK),
-            BorderFactory.createEmptyBorder(12, 18, 12, 18)
-        ));
+        headerPanel.setBorder(BorderFactory.createEmptyBorder(12, 16, 14, 16));
         
-        JLabel annotationTitle = new JLabel("Tracks", SwingConstants.LEFT);
-        annotationTitle.setFont(new Font("Segoe UI Semibold", Font.BOLD, 16));
+        // Title with track count
+        JLabel annotationTitle = new JLabel("TRACKS");
+        annotationTitle.setFont(new Font("Segoe UI", Font.BOLD, 13));
         annotationTitle.setForeground(TEXT_PRIMARY);
         
-        // Batch operations toolbar
-        JPanel batchToolbar = new JPanel(new FlowLayout(FlowLayout.RIGHT, 2, 0));
+        // Batch operations toolbar - compact pill buttons
+        JPanel batchToolbar = new JPanel(new FlowLayout(FlowLayout.RIGHT, 3, 0));
         batchToolbar.setOpaque(false);
         
-        JButton selectAllBtn = new JButton("All");
-        selectAllBtn.setFont(new Font("SansSerif", Font.PLAIN, 9));
-        selectAllBtn.setMargin(new Insets(2, 4, 2, 4));
-        selectAllBtn.setToolTipText("Select all tracks");
+        JButton selectAllBtn = createPillButton("All", "Select all tracks", new Color(70, 130, 180));
         selectAllBtn.addActionListener(e -> selectAllTracks());
         
-        JButton deselectAllBtn = new JButton("None");
-        deselectAllBtn.setFont(new Font("SansSerif", Font.PLAIN, 9));
-        deselectAllBtn.setMargin(new Insets(2, 4, 2, 4));
-        deselectAllBtn.setToolTipText("Deselect all tracks");
+        JButton deselectAllBtn = createPillButton("None", "Deselect all", new Color(100, 100, 105));
         deselectAllBtn.addActionListener(e -> deselectAllTracks());
         
-        JButton completeBtn = new JButton("Done");
-        completeBtn.setFont(new Font("SansSerif", Font.PLAIN, 9));
-        completeBtn.setMargin(new Insets(2, 4, 2, 4));
-        completeBtn.setForeground(new Color(76, 175, 80));
-        completeBtn.setToolTipText("Mark selected tracks as complete");
-        completeBtn.addActionListener(e -> markSelectedTracksComplete());
+        batchCompleteBtn = createPillButton("✓", "Mark selected complete", ACCENT_GREEN);
+        batchCompleteBtn.setFont(new Font("Segoe UI", Font.BOLD, 12));
+        batchCompleteBtn.addActionListener(e -> markSelectedTracksComplete());
         
-        JButton removeSelBtn = new JButton("Del");
-        removeSelBtn.setFont(new Font("SansSerif", Font.PLAIN, 9));
-        removeSelBtn.setMargin(new Insets(2, 4, 2, 4));
-        removeSelBtn.setForeground(new Color(244, 67, 54));
-        removeSelBtn.setToolTipText("Remove selected tracks");
+        JButton removeSelBtn = createPillButton("−", "Delete selected", ACCENT_RED);
+        removeSelBtn.setFont(new Font("Segoe UI", Font.BOLD, 14));
         removeSelBtn.addActionListener(e -> removeSelectedTracks());
         
-        JButton removeAllBtn = new JButton("Clear");
-        removeAllBtn.setFont(new Font("SansSerif", Font.PLAIN, 9));
-        removeAllBtn.setMargin(new Insets(2, 4, 2, 4));
-        removeAllBtn.setForeground(new Color(244, 67, 54));
-        removeAllBtn.setToolTipText("Remove ALL tracks");
+        JButton removeAllBtn = createPillButton("Clear", "Delete ALL tracks", new Color(180, 60, 60));
         removeAllBtn.addActionListener(e -> removeAllTracks());
         
         batchToolbar.add(selectAllBtn);
         batchToolbar.add(deselectAllBtn);
-        batchToolbar.add(completeBtn);
+        batchToolbar.add(Box.createHorizontalStrut(6));
+        batchToolbar.add(batchCompleteBtn);
         batchToolbar.add(removeSelBtn);
+        batchToolbar.add(Box.createHorizontalStrut(6));
         batchToolbar.add(removeAllBtn);
         
-        headerPanel.add(annotationTitle, BorderLayout.CENTER);
-        headerPanel.add(batchToolbar, BorderLayout.WEST);
+        headerPanel.add(annotationTitle, BorderLayout.WEST);
+        headerPanel.add(batchToolbar, BorderLayout.EAST);
         
-        annotationPanel = new JPanel();
+        // Tracks list panel - use custom panel that supports proper scrolling
+        annotationPanel = new JPanel() {
+            @Override
+            public Dimension getPreferredSize() {
+                // Calculate preferred size based on children
+                Dimension d = super.getPreferredSize();
+                // Ensure minimum width for horizontal scroll to work
+                int minWidth = 200;
+                for (Component c : getComponents()) {
+                    minWidth = Math.max(minWidth, c.getPreferredSize().width);
+                }
+                return new Dimension(Math.max(d.width, minWidth), d.height);
+            }
+        };
         annotationPanel.setLayout(new BoxLayout(annotationPanel, BoxLayout.Y_AXIS));
-        annotationPanel.setBackground(SECONDARY_DARK);
-        annotationScrollPane = new JScrollPane(annotationPanel);  // Store in class field for programmatic scrolling
-        annotationScrollPane.setPreferredSize(new Dimension(annotationPanelWidth, 0));
+        annotationPanel.setOpaque(false);
+        annotationPanel.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
+        
+        annotationScrollPane = new JScrollPane(annotationPanel);
         annotationScrollPane.setBorder(null);
-        annotationScrollPane.setBackground(SECONDARY_DARK);
-        annotationScrollPane.getViewport().setBackground(SECONDARY_DARK);
+        annotationScrollPane.setOpaque(false);
+        annotationScrollPane.getViewport().setOpaque(false);
         annotationScrollPane.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
         annotationScrollPane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_AS_NEEDED);
-        annotationScrollPane.getVerticalScrollBar().setUnitIncrement(16);
-        annotationScrollPane.getHorizontalScrollBar().setUnitIncrement(16);
+        styleScrollPane(annotationScrollPane);
         
         annotationSection.add(headerPanel, BorderLayout.NORTH);
-        annotationSection.add(annotationScrollPane, BorderLayout.CENTER);;
+        annotationSection.add(annotationScrollPane, BorderLayout.CENTER);
         
-        // Multi-seed mode: Add "Run Track Optimization" button at the bottom
-        JPanel optimizationButtonPanel = new JPanel(new FlowLayout(FlowLayout.CENTER, 10, 12));
-        optimizationButtonPanel.setBackground(PANEL_DARK);
-        optimizationButtonPanel.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, BORDER_DARK));
+        // Bottom optimization button panel
+        JPanel optimizationButtonPanel = new JPanel(new FlowLayout(FlowLayout.CENTER, 10, 10)) {
+            @Override
+            protected void paintComponent(Graphics g) {
+                super.paintComponent(g);
+                Graphics2D g2d = (Graphics2D) g.create();
+                g2d.setColor(new Color(35, 35, 40));
+                g2d.fillRect(0, 0, getWidth(), getHeight());
+                g2d.setColor(new Color(50, 50, 55));
+                g2d.drawLine(0, 0, getWidth(), 0);
+                g2d.dispose();
+            }
+        };
+        optimizationButtonPanel.setOpaque(false);
         
         JButton runOptimizationButton = createAccentButton("Run Track Optimization", "play");
         runOptimizationButton.setToolTipText("Optimize all selected tracks using optical flow");
@@ -13051,6 +13700,68 @@ public class VideoAnnotationTool {
         annotationSection.add(optimizationButtonPanel, BorderLayout.SOUTH);
         
         return annotationSection;
+    }
+    
+    /**
+     * Creates a small pill-shaped button for the tracks toolbar.
+     */
+    private JButton createPillButton(String text, String tooltip, Color accentColor) {
+        JButton button = new JButton(text) {
+            @Override
+            protected void paintComponent(Graphics g) {
+                Graphics2D g2d = (Graphics2D) g.create();
+                g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                
+                if (!isEnabled()) {
+                    g2d.setColor(new Color(70, 70, 75));
+                } else if (getModel().isPressed()) {
+                    g2d.setColor(accentColor.darker());
+                } else if (getModel().isRollover()) {
+                    g2d.setColor(accentColor);
+                } else {
+                    g2d.setColor(new Color(accentColor.getRed(), accentColor.getGreen(), accentColor.getBlue(), 180));
+                }
+                g2d.fillRoundRect(0, 0, getWidth(), getHeight(), 12, 12);
+                g2d.dispose();
+                
+                super.paintComponent(g);
+            }
+        };
+        button.setFont(new Font("Segoe UI", Font.BOLD, 9));
+        button.setForeground(Color.WHITE);
+        button.setBorder(BorderFactory.createEmptyBorder(3, 8, 3, 8));
+        button.setFocusPainted(false);
+        button.setContentAreaFilled(false);
+        button.setOpaque(false);
+        button.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        button.setToolTipText(tooltip);
+        // Change foreground color when disabled
+        button.addPropertyChangeListener("enabled", evt -> {
+            button.setForeground(button.isEnabled() ? Color.WHITE : new Color(120, 120, 125));
+        });
+        return button;
+    }
+    
+    /**
+     * Creates a small info badge for track stats display.
+     */
+    private JLabel createInfoBadge(String text, Color bgColor) {
+        JLabel badge = new JLabel(text) {
+            @Override
+            protected void paintComponent(Graphics g) {
+                Graphics2D g2d = (Graphics2D) g.create();
+                g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                g2d.setColor(bgColor);
+                g2d.fillRoundRect(0, 0, getWidth(), getHeight(), 8, 8);
+                g2d.dispose();
+                super.paintComponent(g);
+            }
+        };
+        badge.setFont(new Font("Segoe UI", Font.PLAIN, 9));
+        badge.setForeground(new Color(200, 200, 210));
+        badge.setBorder(BorderFactory.createEmptyBorder(2, 5, 2, 5));
+        badge.setOpaque(false);
+        return badge;
     }
     
     /**
@@ -13169,8 +13880,9 @@ public class VideoAnnotationTool {
         // Environment settings are NOT in the left panel - they remain in Advanced Configuration only
         // So we don't modify them here
         
-        // Optical flow settings
-        config.setProperty("flow.method", (String) cfgFlowMethodCombo.getSelectedItem());
+        // Optical flow settings - save internal name, not display name
+        String displayMethod = (String) cfgFlowMethodCombo.getSelectedItem();
+        config.setProperty("flow.method", mapDisplayToMethod(displayMethod));
         config.setProperty("flow.incremental.allocation", String.valueOf(cfgFlowIncrementalAllocCheckbox.isSelected()));
         if (cfgRaftModelCombo != null) config.setProperty("raft.model.size", (String) cfgRaftModelCombo.getSelectedItem());
         config.setProperty("dis.downsample.factor", cfgDisDownsampleSpinner.getValue().toString());
@@ -13239,7 +13951,8 @@ public class VideoAnnotationTool {
         // Environment settings are only in Advanced Configuration dialog
         // Not reloaded here
         
-        cfgFlowMethodCombo.setSelectedItem(config.getProperty("flow.method", isCpuOnly ? "dis" : "raft"));
+        String savedMethod = config.getProperty("flow.method", isCpuOnly ? "dis" : "raft");
+        cfgFlowMethodCombo.setSelectedItem(mapMethodToDisplay(savedMethod));
         if (cfgRaftModelCombo != null) cfgRaftModelCombo.setSelectedItem(config.getProperty("raft.model.size", "large"));
         cfgDisDownsampleSpinner.setValue(Integer.parseInt(config.getProperty("dis.downsample.factor", "2")));
         
@@ -13363,7 +14076,7 @@ public class VideoAnnotationTool {
             return;
         }
         
-        saveState();
+        saveState("Delete point from " + selectedTrackId);
         frameMap.remove(frameIndex);
         imageLabel.repaint();
         refreshAnnotationList();
@@ -13381,7 +14094,7 @@ public class VideoAnnotationTool {
         if (confirm == JOptionPane.YES_OPTION) {
             // Pause timer for the track being deleted to properly accumulate time
             pauseTrackTimer(selectedTrackId);
-            saveState();
+            saveState("Delete " + selectedTrackId);
             // Exit comparison mode if deleting the comparison track
             if (smoothingComparisonMode && selectedTrackId.equals(smoothingComparisonTrackId)) {
                 exitSmoothingComparisonMode();
@@ -13442,6 +14155,125 @@ public class VideoAnnotationTool {
     }
     
     /**
+     * Create a new track. Handles optical flow checks and initializes all track data.
+     */
+    private void createNewTrack() {
+        if (!opticalFlowComputed) {
+            String flowMethod = getConfiguredFlowMethod();
+            java.util.List<File> allCachedFiles = findCachedFlowFiles(currentVideoPath, flowMethod);
+            // CRITICAL: Filter by resolution to prevent using wrong-resolution flow data
+            java.util.List<File> cachedFiles = filterFlowFilesByResolution(allCachedFiles);
+            
+            if (!cachedFiles.isEmpty()) {
+                // Find if any file matches current settings
+                File matchingFile = null;
+                for (File f : cachedFiles) {
+                    if (flowFileMatchesCurrentSettings(f, flowMethod)) {
+                        matchingFile = f;
+                        break;
+                    }
+                }
+                
+                // Build informative message
+                StringBuilder message = new StringBuilder();
+                message.append("Optical flow is required for tracking.\n\n");
+                message.append("Current method: ").append(flowMethod.toUpperCase()).append("\n");
+                message.append("Found ").append(cachedFiles.size()).append(" cached file(s):\n\n");
+                
+                for (int i = 0; i < Math.min(cachedFiles.size(), 5); i++) {
+                    File f = cachedFiles.get(i);
+                    boolean isMatch = flowFileMatchesCurrentSettings(f, flowMethod);
+                    message.append(isMatch ? "  ✓ " : "  • ");
+                    message.append(describeFlowFile(f, flowMethod));
+                    if (isMatch) {
+                        message.append(" ← matches");
+                    }
+                    message.append("\n");
+                }
+                
+                message.append("\n");
+                if (matchingFile != null) {
+                    message.append("A cached file matches your settings.\n");
+                } else {
+                    message.append("No cached file matches your settings.\n");
+                }
+                
+                String[] options = {"Load Existing", "Recalculate", "Cancel"};
+                int choice = JOptionPane.showOptionDialog(
+                    frame,
+                    message.toString(),
+                    "Optical Flow Required",
+                    JOptionPane.YES_NO_CANCEL_OPTION,
+                    JOptionPane.QUESTION_MESSAGE,
+                    null,
+                    options,
+                    matchingFile != null ? options[0] : options[1]
+                );
+                
+                if (choice == 0) { // Load Existing
+                    // If multiple files available, let user choose; otherwise use best match
+                    File fileToLoad;
+                    if (cachedFiles.size() > 1) {
+                        fileToLoad = showFlowFileSelectionDialog(cachedFiles, flowMethod, matchingFile);
+                        if (fileToLoad == null) {
+                            return; // User cancelled selection
+                        }
+                    } else {
+                        fileToLoad = (matchingFile != null) ? matchingFile : cachedFiles.get(0);
+                    }
+                    loadExistingOpticalFlow(fileToLoad);
+                } else if (choice == 1) { // Recalculate
+                    computeOpticalFlowRemote(true);
+                }
+                return; // Wait for flow to be ready
+            } else {
+                // No existing optical flow file, prompt to compute
+                int result = JOptionPane.showConfirmDialog(frame,
+                    "Optical flow has not been computed yet.\n" +
+                    "Would you like to compute it now?\n\n" +
+                    "Current method: " + flowMethod.toUpperCase() + "\n" +
+                    "This is required for automatic track propagation.",
+                    "Optical Flow Required",
+                    JOptionPane.YES_NO_OPTION,
+                    JOptionPane.QUESTION_MESSAGE);
+                
+                if (result == JOptionPane.YES_OPTION) {
+                    computeOpticalFlowRemote();
+                }
+                return;
+            }
+        }
+        
+        // Pause the timer for the previously selected track before switching
+        if (selectedTrackId != null) {
+            pauseTrackTimer(selectedTrackId);
+        }
+        int nextNum = findNextAvailableTrackNumber();
+        selectedTrackId = "Track" + nextNum;
+        trackAnnotations.put(selectedTrackId, new HashMap<>());
+        trackColors.put(selectedTrackId, generateRandomColor());
+        trackAnchors.put(selectedTrackId, new ArrayList<>());
+        trackOptimized.put(selectedTrackId, false);
+        // Only the current track should be selected - deselect all others
+        for (String trackId : trackSelected.keySet()) {
+            trackSelected.put(trackId, false);
+        }
+        trackSelected.put(selectedTrackId, true);
+        // Initialize time tracking for new track
+        trackTotalTime.put(selectedTrackId, 0L);
+        trackStartTime.put(selectedTrackId, 0L);
+        trackCompleted.put(selectedTrackId, false);
+        startTrackTimer(selectedTrackId);
+        // Update trackCounter to be at least nextNum + 1 for compatibility
+        if (nextNum >= trackCounter) {
+            trackCounter = nextNum + 1;
+        }
+        refreshAnnotationList();
+        imageLabel.repaint();
+        frameSlider.repaint(); // Clear anchor annotations from previous track
+    }
+    
+    /**
      * Get a sorted list of track IDs, sorted numerically by track number.
      * E.g., Track1, Track2, Track10 (not Track1, Track10, Track2)
      */
@@ -13466,146 +14298,93 @@ public class VideoAnnotationTool {
         
         boolean multiSeedMode = isMultiSeedMode();
         
+        // Track card height - larger for better visibility
+        final int cardHeight = 70;
+        
+        // Add New Track button at the TOP of the list
+        JButton newTrackButton = createAccentButton("+ New Track", null);
+        newTrackButton.setMaximumSize(new Dimension(Integer.MAX_VALUE, rowHeight + 14));
+        newTrackButton.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(ACCENT_BLUE, 1),
+            BorderFactory.createEmptyBorder(10, 15, 10, 15)
+        ));
+        newTrackButton.setAlignmentX(Component.CENTER_ALIGNMENT);
+        newTrackButton.addActionListener(e -> createNewTrack());
+        annotationPanel.add(newTrackButton);
+        annotationPanel.add(Box.createVerticalStrut(8));
+        
         // Iterate over tracks in sorted order (Track1, Track2, Track3, ...)
         for (String trackId : getSortedTrackIds()) {
             Map<Integer, Point> frameMap = trackAnnotations.get(trackId);
             // Convert currentSlice (1-indexed UI) to 0-indexed frame
             Point p = frameMap.get(currentSlice - 1);
             
-            JPanel row = new JPanel(new BorderLayout(10, 0));
-            row.setMaximumSize(new Dimension(Integer.MAX_VALUE, rowHeight + 12));
-            row.setPreferredSize(new Dimension(280, rowHeight + 12));
-            row.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createMatteBorder(0, 0, 1, 0, BORDER_DARK),
-                BorderFactory.createEmptyBorder(10, 15, 10, 15)
-            ));
-            row.setBackground(SECONDARY_DARK);
-            
             // Check if track is completed
-            boolean isCompleted = trackCompleted.getOrDefault(trackId, false);
+            final boolean isCompleted = trackCompleted.getOrDefault(trackId, false);
+            final boolean isOptimized = trackOptimized.getOrDefault(trackId, false);
+            final boolean isSelected = trackId.equals(selectedTrackId);
+            final boolean isMultiSelected = trackSelected.getOrDefault(trackId, false);
+            final Color trackColor = getTrackColor(trackId);
             
-            // Set background color based on completion status and optimization status
-            if (isCompleted) {
-                // Completed tracks get a gray tint
-                row.setBackground(new Color(60, 60, 65));
-            } else if (multiSeedMode) {
-                boolean isOptimized = trackOptimized.getOrDefault(trackId, false);
-                if (isOptimized) {
-                    row.setBackground(new Color(35, 65, 45)); // Dark green tint
-                } else {
-                    row.setBackground(new Color(70, 40, 40)); // Dark red tint
+            // Modern card-style track row
+            JPanel row = new JPanel(new BorderLayout(8, 0)) {
+                @Override
+                protected void paintComponent(Graphics g) {
+                    Graphics2D g2d = (Graphics2D) g.create();
+                    g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                    
+                    // Card background with rounded corners
+                    Color bgColor;
+                    if (isSelected) {
+                        bgColor = new Color(35, 50, 75);
+                    } else if (isMultiSelected) {
+                        bgColor = new Color(50, 45, 65); // Purple tint for multi-selected
+                    } else if (isCompleted) {
+                        bgColor = new Color(45, 50, 55);
+                    } else if (multiSeedMode && isOptimized) {
+                        bgColor = new Color(30, 55, 40);
+                    } else if (multiSeedMode && !isOptimized) {
+                        bgColor = new Color(60, 35, 35);
+                    } else {
+                        bgColor = new Color(38, 38, 43);
+                    }
+                    g2d.setColor(bgColor);
+                    g2d.fillRoundRect(4, 2, getWidth() - 8, getHeight() - 4, 10, 10);
+                    
+                    // Left color accent bar
+                    g2d.setColor(trackColor);
+                    g2d.fillRoundRect(4, 2, 6, getHeight() - 4, 3, 3);
+                    
+                    // Selection highlight border
+                    if (isSelected) {
+                        g2d.setColor(ACCENT_BLUE);
+                        g2d.setStroke(new BasicStroke(2));
+                        g2d.drawRoundRect(4, 2, getWidth() - 9, getHeight() - 5, 10, 10);
+                    } else if (isMultiSelected) {
+                        // Purple border for multi-selected tracks
+                        g2d.setColor(new Color(150, 100, 180));
+                        g2d.setStroke(new BasicStroke(2));
+                        g2d.drawRoundRect(4, 2, getWidth() - 9, getHeight() - 5, 10, 10);
+                    }
+                    
+                    g2d.dispose();
                 }
-            }
+            };
+            row.setOpaque(false);
+            row.setMaximumSize(new Dimension(Integer.MAX_VALUE, cardHeight));
+            row.setPreferredSize(new Dimension(280, cardHeight));
+            row.setMinimumSize(new Dimension(200, cardHeight));
+            row.setBorder(BorderFactory.createEmptyBorder(8, 16, 8, 12));
             
-            // Add accent border for selected track
-            if (trackId.equals(selectedTrackId)) {
-                row.setBorder(BorderFactory.createCompoundBorder(
-                    BorderFactory.createLineBorder(ACCENT_BLUE, 2),
-                    BorderFactory.createEmptyBorder(9, 14, 9, 14)
-                ));
-                row.setBackground(new Color(40, 55, 80)); // Dark blue tint
-            }
-            row.setOpaque(true);
+            // Check completion status for this track (captured for use in lambdas)
+            final boolean trackIsCompleted = trackCompleted.getOrDefault(trackId, false);
             
-            // Add checkbox for track selection (works in both modes for batch operations)
-            {
-                JCheckBox checkbox = new JCheckBox();
-                checkbox.setSelected(trackSelected.getOrDefault(trackId, false));
-                checkbox.setOpaque(false);
-                checkbox.setFocusPainted(false);
-                
-                // Enlarge checkbox and color it
-                Color trackColor = getTrackColor(trackId);
-                checkbox.setPreferredSize(new Dimension(28, 28));
-                
-                // Custom checkbox icon with track color
-                checkbox.setIcon(new javax.swing.Icon() {
-                    @Override
-                    public void paintIcon(Component c, Graphics g, int x, int y) {
-                        Graphics2D g2 = (Graphics2D) g.create();
-                        g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-                        
-                        // Draw checkbox border
-                        g2.setColor(new Color(150, 150, 150));
-                        g2.setStroke(new BasicStroke(2));
-                        g2.drawRoundRect(x + 2, y + 2, 20, 20, 4, 4);
-                        
-                        g2.dispose();
-                    }
-                    
-                    @Override
-                    public int getIconWidth() { return 24; }
-                    
-                    @Override
-                    public int getIconHeight() { return 24; }
-                });
-                
-                checkbox.setSelectedIcon(new javax.swing.Icon() {
-                    @Override
-                    public void paintIcon(Component c, Graphics g, int x, int y) {
-                        Graphics2D g2 = (Graphics2D) g.create();
-                        g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-                        
-                        // Draw filled checkbox with track color
-                        g2.setColor(trackColor);
-                        g2.fillRoundRect(x + 2, y + 2, 20, 20, 4, 4);
-                        
-                        // Draw border
-                        g2.setColor(trackColor.darker());
-                        g2.setStroke(new BasicStroke(2));
-                        g2.drawRoundRect(x + 2, y + 2, 20, 20, 4, 4);
-                        
-                        // Draw checkmark
-                        g2.setColor(Color.WHITE);
-                        g2.setStroke(new BasicStroke(3, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
-                        int[] xPoints = {x + 6, x + 10, x + 18};
-                        int[] yPoints = {y + 12, y + 17, y + 8};
-                        for (int i = 0; i < xPoints.length - 1; i++) {
-                            g2.drawLine(xPoints[i], yPoints[i], xPoints[i + 1], yPoints[i + 1]);
-                        }
-                        
-                        g2.dispose();
-                    }
-                    
-                    @Override
-                    public int getIconWidth() { return 24; }
-                    
-                    @Override
-                    public int getIconHeight() { return 24; }
-                });
-                
-                checkbox.setToolTipText("Select for batch operations (Ctrl+click on video to toggle)");
-                checkbox.addActionListener(e -> {
-                    trackSelected.put(trackId, checkbox.isSelected());
-                    // Repaint to update visual highlight ring on video
-                    imageLabel.repaint();
-                    // Update status with selection count
-                    int selectedCount = (int) trackSelected.values().stream().filter(v -> v).count();
-                    setStatus(selectedCount + " track(s) selected");
-                });
-                row.add(checkbox, BorderLayout.WEST);
-            }
-            
-            JPanel colorBox = new JPanel();
-            colorBox.setPreferredSize(new Dimension(24, 24));
-            Color trackColor = getTrackColor(trackId);
-            colorBox.setBackground(new Color(trackColor.getRed(), trackColor.getGreen(), trackColor.getBlue()));
-            colorBox.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(new Color(150, 150, 150), 1),
-                BorderFactory.createEmptyBorder(2, 2, 2, 2)
-            ));
-            
-            JLabel trackLabel = new JLabel();
-            trackLabel.setFont(new Font("Segoe UI", Font.PLAIN, 12));
-            trackLabel.setForeground(TEXT_PRIMARY);
-            
-            // Check if current frame (0-indexed) has an anchor point
+            // Calculate track stats
             int currentFrameIndex = currentSlice - 1;
             boolean hasAnchor = false;
             List<Anchor> anchors = trackAnchors.get(trackId);
-            int anchorCount = 0;
+            int anchorCount = (anchors != null) ? anchors.size() : 0;
             if (anchors != null) {
-                anchorCount = anchors.size();
                 for (Anchor anchor : anchors) {
                     if (anchor.frame == currentFrameIndex) {
                         hasAnchor = true;
@@ -13613,68 +14392,105 @@ public class VideoAnnotationTool {
                     }
                 }
             }
-            
-            // Check completion status for this track (captured for use in lambdas)
-            final boolean trackIsCompleted = trackCompleted.getOrDefault(trackId, false);
-            
-            // Show optimization status in multi-seed mode
-            String labelText;
-            if (p != null) {
-                labelText = trackId + " (" + p.x + ", " + p.y + ")";
-            } else {
-                labelText = trackId + " (not on this frame)";
-            }
-            
-            // Add anchor count
-            if (anchorCount > 0) {
-                labelText += " [" + anchorCount + " anchor" + (anchorCount != 1 ? "s" : "") + "]";
-            }
-            
-            if (multiSeedMode && trackOptimized.getOrDefault(trackId, false)) {
-                labelText += " ✓";
-            }
-            
-            // Add occlusion indicator if track has occlusion segments
             int occludedFrames = calculateOccludedFrames(trackId);
-            if (occludedFrames > 0) {
-                labelText += " 👁" + occludedFrames;  // Eye icon with occluded frame count
-            }
+            boolean isSmoothed = trackSmoothing.getOrDefault(trackId, false);
+            long totalTime = getTrackTotalTime(trackId); // Use live time including running timer
             
-            // Add smoothing indicator if smoothing is enabled
-            if (trackSmoothing.getOrDefault(trackId, false)) {
-                labelText += " ∿";  // Wave icon to indicate smoothed
-            }
+            // Create content panel with two rows: title + info line
+            JPanel contentPanel = new JPanel();
+            contentPanel.setLayout(new BoxLayout(contentPanel, BoxLayout.Y_AXIS));
+            contentPanel.setOpaque(false);
+            contentPanel.setBorder(BorderFactory.createEmptyBorder(2, 0, 2, 0));
             
-            // Add timing info for completed tracks
-            if (trackIsCompleted) {
-                long totalTime = trackTotalTime.getOrDefault(trackId, 0L);
-                labelText += " • " + formatTime(totalTime);
-            }
-            
-            trackLabel.setText(labelText);
-            
-            // Add anchor icon if this point is an anchor
-            if (hasAnchor) {
-                Icon anchorIcon = createAnchorIcon(8, trackColor);
-                trackLabel.setIcon(anchorIcon);
-                trackLabel.setIconTextGap(5);
+            // Title row: Track name + coordinate
+            JLabel titleLabel = new JLabel();
+            titleLabel.setFont(new Font("Segoe UI", Font.BOLD, 13));
+            titleLabel.setForeground(trackIsCompleted ? TEXT_DISABLED : TEXT_PRIMARY);
+            if (p != null) {
+                titleLabel.setText(trackId + "  (" + p.x + ", " + p.y + ")");
             } else {
-                trackLabel.setIcon(null);
+                titleLabel.setText(trackId);
+                titleLabel.setForeground(TEXT_DISABLED);
             }
+            if (hasAnchor) {
+                titleLabel.setIcon(createAnchorIcon(8, trackColor));
+                titleLabel.setIconTextGap(4);
+            }
+            titleLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+            contentPanel.add(titleLabel);
             
-            // Gray out completed tracks
+            // Info row: Stats and badges
+            JPanel infoRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+            infoRow.setOpaque(false);
+            infoRow.setAlignmentX(Component.LEFT_ALIGNMENT);
+            
+            // Points badge - for completed tracks show visible points (total - occluded)
+            int frameCount = frameMap.size();
             if (trackIsCompleted) {
-                trackLabel.setForeground(TEXT_DISABLED);
-            } else if (p == null) {
-                trackLabel.setForeground(TEXT_DISABLED);
+                int visiblePoints = frameCount - occludedFrames;
+                JLabel pointsBadge = createInfoBadge(visiblePoints + " visible", new Color(80, 80, 90));
+                infoRow.add(pointsBadge);
+            } else {
+                // For tracks in edit mode, frames badge is redundant - skip it
+                // (the frame count is already visible in the track info)
             }
             
+            // Anchor count badge
+            if (anchorCount > 0) {
+                JLabel anchorBadge = createInfoBadge(anchorCount + " ⚓", new Color(70, 100, 130));
+                infoRow.add(anchorBadge);
+            }
+            
+            // Occlusion badge
+            if (occludedFrames > 0) {
+                JLabel occlusionBadge = createInfoBadge("👁 " + occludedFrames, new Color(130, 90, 70));
+                infoRow.add(occlusionBadge);
+            }
+            
+            // Smoothing badge
+            if (isSmoothed) {
+                JLabel smoothBadge = createInfoBadge("∿", new Color(0, 140, 140));
+                infoRow.add(smoothBadge);
+            }
+            
+            // Optimized badge
+            if (multiSeedMode && isOptimized) {
+                JLabel optBadge = createInfoBadge("✓", ACCENT_GREEN.darker());
+                infoRow.add(optBadge);
+            }
+            
+            // Time badge - show for all tracks with recorded time
+            if (totalTime > 0) {
+                // Different color for active vs completed
+                Color timeColor = trackIsCompleted ? new Color(90, 90, 100) : new Color(70, 100, 70);
+                JLabel timeBadge = createInfoBadge(formatTime(totalTime), timeColor);
+                infoRow.add(timeBadge);
+            }
+            
+            contentPanel.add(Box.createVerticalStrut(2));
+            contentPanel.add(infoRow);
+            
+            // Mouse handlers for the row
+            final JPanel rowRef = row;
             row.addMouseListener(new MouseAdapter() {
                 @Override
                 public void mouseClicked(MouseEvent e) {
                     // Block track switching during trim mode
                     if (trimModeActive) {
                         setStatus("Complete or cancel trim mode before switching tracks");
+                        return;
+                    }
+                    
+                    // Ctrl+click: Toggle multi-selection without changing active track
+                    if (e.isControlDown()) {
+                        boolean currentlySelected = trackSelected.getOrDefault(trackId, false);
+                        trackSelected.put(trackId, !currentlySelected);
+                        refreshAnnotationList();
+                        imageLabel.repaint();
+                        
+                        String action = !currentlySelected ? "Selected" : "Deselected";
+                        int selectedCount = (int) trackSelected.values().stream().filter(v -> v).count();
+                        setStatus(action + " " + trackId + " (" + selectedCount + " tracks selected)");
                         return;
                     }
                     
@@ -13725,40 +14541,24 @@ public class VideoAnnotationTool {
                 
                 @Override
                 public void mouseEntered(MouseEvent e) {
-                    // Don't change hover appearance for selected track
-                    if (!trackId.equals(selectedTrackId)) {
-                        row.setBackground(SURFACE_HOVER);
-                    }
+                    // Hover effect handled by repaint (paintComponent checks rollover)
+                    rowRef.repaint();
                 }
                 
                 @Override
                 public void mouseExited(MouseEvent e) {
-                    // Don't change appearance for selected track
-                    if (!trackId.equals(selectedTrackId)) {
-                        if (trackIsCompleted) {
-                            row.setBackground(new Color(60, 60, 65)); // Gray for completed
-                        } else if (multiSeedMode) {
-                            boolean isOptimized = trackOptimized.getOrDefault(trackId, false);
-                            if (isOptimized) {
-                                row.setBackground(new Color(35, 65, 45)); // Dark green tint
-                            } else {
-                                row.setBackground(new Color(70, 40, 40)); // Dark red tint
-                            }
-                        } else {
-                            row.setBackground(SECONDARY_DARK);
-                        }
-                    }
+                    rowRef.repaint();
                 }
             });
             row.setCursor(new Cursor(Cursor.HAND_CURSOR));
             
-            JPanel leftPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
-            leftPanel.setOpaque(false);
-            leftPanel.add(colorBox);
+            // Action buttons panel (right side)
+            JPanel buttonsPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
+            buttonsPanel.setOpaque(false);
             
             // Create Complete/Resume button for time tracking
             JButton actionButton = new JButton();
-            actionButton.setPreferredSize(new Dimension(24, 24));
+            actionButton.setPreferredSize(new Dimension(28, 28));
             actionButton.setBorderPainted(false);
             actionButton.setContentAreaFilled(false);
             actionButton.setFocusPainted(false);
@@ -13906,7 +14706,7 @@ public class VideoAnnotationTool {
                     @Override public int getIconHeight() { return 24; }
                 });
                 smoothButton.addActionListener(ev -> {
-                    saveState();
+                    saveState("Disable smoothing for " + currentTrackId);
                     disableTrackSmoothing(currentTrackId);
                     loadSliceImage();
                     refreshAnnotationList();
@@ -13936,7 +14736,7 @@ public class VideoAnnotationTool {
                     @Override public int getIconHeight() { return 24; }
                 });
                 smoothButton.addActionListener(ev -> {
-                    saveState();
+                    saveState("Enable smoothing for " + currentTrackId);
                     enableTrackSmoothing(currentTrackId);
                     loadSliceImage();
                     refreshAnnotationList();
@@ -13951,128 +14751,13 @@ public class VideoAnnotationTool {
             rightPanel.add(smoothButton);
             rightPanel.add(actionButton);
             
-            // Checkbox is always at WEST, leftPanel (colorBox) is not needed separately
-            row.add(leftPanel, BorderLayout.CENTER);
-            row.add(trackLabel, BorderLayout.CENTER);
+            // Assemble the row: content in center, buttons on right
+            // (left color bar is drawn in paintComponent)
+            row.add(contentPanel, BorderLayout.CENTER);
             row.add(rightPanel, BorderLayout.EAST);
+            
             annotationPanel.add(row);
         }
-        
-        JButton newTrackButton = createAccentButton("+ New Track", null);
-        newTrackButton.setMaximumSize(new Dimension(Integer.MAX_VALUE, rowHeight + 14));
-        newTrackButton.setBorder(BorderFactory.createCompoundBorder(
-            BorderFactory.createLineBorder(ACCENT_BLUE, 1),
-            BorderFactory.createEmptyBorder(10, 15, 10, 15)
-        ));
-        newTrackButton.setAlignmentX(Component.CENTER_ALIGNMENT);
-        newTrackButton.addActionListener(e -> {
-            if (!opticalFlowComputed) {
-                String flowMethod = config.getProperty("flow.method", getDefaultFlowMethod());
-                java.util.List<File> allCachedFiles = findCachedFlowFiles(currentVideoPath, flowMethod);
-                // CRITICAL: Filter by resolution to prevent using wrong-resolution flow data
-                java.util.List<File> cachedFiles = filterFlowFilesByResolution(allCachedFiles);
-                
-                if (!cachedFiles.isEmpty()) {
-                    // Find if any file matches current settings
-                    File matchingFile = null;
-                    for (File f : cachedFiles) {
-                        if (flowFileMatchesCurrentSettings(f, flowMethod)) {
-                            matchingFile = f;
-                            break;
-                        }
-                    }
-                    
-                    // Build informative message
-                    StringBuilder message = new StringBuilder();
-                    message.append("Optical flow is required for tracking.\n\n");
-                    message.append("Current method: ").append(flowMethod.toUpperCase()).append("\n");
-                    message.append("Found ").append(cachedFiles.size()).append(" cached file(s):\n\n");
-                    
-                    for (int i = 0; i < Math.min(cachedFiles.size(), 5); i++) {
-                        File f = cachedFiles.get(i);
-                        boolean isMatch = flowFileMatchesCurrentSettings(f, flowMethod);
-                        message.append(isMatch ? "  ✓ " : "  • ");
-                        message.append(describeFlowFile(f, flowMethod));
-                        if (isMatch) {
-                            message.append(" ← matches");
-                        }
-                        message.append("\n");
-                    }
-                    
-                    message.append("\n");
-                    if (matchingFile != null) {
-                        message.append("A cached file matches your settings.\n");
-                    } else {
-                        message.append("No cached file matches your settings.\n");
-                    }
-                    
-                    String[] options = {"Load Existing", "Recalculate", "Cancel"};
-                    int choice = JOptionPane.showOptionDialog(
-                        frame,
-                        message.toString(),
-                        "Optical Flow Required",
-                        JOptionPane.YES_NO_CANCEL_OPTION,
-                        JOptionPane.QUESTION_MESSAGE,
-                        null,
-                        options,
-                        matchingFile != null ? options[0] : options[1]
-                    );
-                    
-                    if (choice == 0) { // Load Existing
-                        File fileToLoad = (matchingFile != null) ? matchingFile : cachedFiles.get(0);
-                        loadExistingOpticalFlow(fileToLoad);
-                    } else if (choice == 1) { // Recalculate
-                        computeOpticalFlowRemote(true);
-                    }
-                    return; // Wait for flow to be ready
-                } else {
-                    // No existing optical flow file, prompt to compute
-                    int result = JOptionPane.showConfirmDialog(frame,
-                        "Optical flow has not been computed yet.\n" +
-                        "Would you like to compute it now?\n\n" +
-                        "Current method: " + flowMethod.toUpperCase() + "\n" +
-                        "This is required for automatic track propagation.",
-                        "Optical Flow Required",
-                        JOptionPane.YES_NO_OPTION,
-                        JOptionPane.QUESTION_MESSAGE);
-                    
-                    if (result == JOptionPane.YES_OPTION) {
-                        computeOpticalFlowRemote();
-                    }
-                    return;
-                }
-            }
-            
-            // No longer require Frame 1 - bidirectional propagation supported
-            // Pause the timer for the previously selected track before switching
-            if (selectedTrackId != null) {
-                pauseTrackTimer(selectedTrackId);
-            }
-            int nextNum = findNextAvailableTrackNumber();
-            selectedTrackId = "Track" + nextNum;
-            trackAnnotations.put(selectedTrackId, new HashMap<>());
-            trackColors.put(selectedTrackId, generateRandomColor());
-            trackAnchors.put(selectedTrackId, new ArrayList<>());
-            trackOptimized.put(selectedTrackId, false);
-            // Only the current track should be selected - deselect all others
-            for (String trackId : trackSelected.keySet()) {
-                trackSelected.put(trackId, false);
-            }
-            trackSelected.put(selectedTrackId, true);
-            // Initialize time tracking for new track
-            trackTotalTime.put(selectedTrackId, 0L);
-            trackStartTime.put(selectedTrackId, 0L);
-            trackCompleted.put(selectedTrackId, false);
-            startTrackTimer(selectedTrackId);
-            // Update trackCounter to be at least nextNum + 1 for compatibility
-            if (nextNum >= trackCounter) {
-                trackCounter = nextNum + 1;
-            }
-            refreshAnnotationList();
-            imageLabel.repaint();
-            frameSlider.repaint(); // Clear anchor annotations from previous track
-        });
-        annotationPanel.add(newTrackButton);
         
         // Update fine-tune button state (GPU mode only)
         // Enable only when: 
@@ -14114,6 +14799,30 @@ public class VideoAnnotationTool {
                 }
             } else {
                 fineTuneButton.setToolTipText("Fine-tune LocoTrack on " + trackAnnotations.size() + " completed tracks");
+            }
+        }
+        
+        // Update batch complete button state - disabled when all selected tracks are already complete
+        if (batchCompleteBtn != null) {
+            boolean hasIncompleteSelected = false;
+            int selectedCount = 0;
+            for (String trackId : trackAnnotations.keySet()) {
+                if (trackSelected.getOrDefault(trackId, false)) {
+                    selectedCount++;
+                    if (!trackCompleted.getOrDefault(trackId, false)) {
+                        hasIncompleteSelected = true;
+                    }
+                }
+            }
+            // Enable if there's at least one incomplete selected track
+            boolean shouldEnable = hasIncompleteSelected;
+            batchCompleteBtn.setEnabled(shouldEnable);
+            if (!shouldEnable && selectedCount > 0) {
+                batchCompleteBtn.setToolTipText("All selected tracks are already complete");
+            } else if (selectedCount == 0) {
+                batchCompleteBtn.setToolTipText("Select tracks to mark complete");
+            } else {
+                batchCompleteBtn.setToolTipText("Mark selected complete");
             }
         }
         
@@ -14307,24 +15016,42 @@ public class VideoAnnotationTool {
             return;
         }
         
-        int confirm = JOptionPane.showConfirmDialog(frame,
-            "Mark " + toComplete.size() + " selected track(s) as complete?\n\n" +
-            "This will:\n" +
-            "• Stop the timer for each track\n" +
-            "• Lock the tracks from editing\n" +
-            "• Optionally trim tracks\n\n" +
-            "You can resume editing later using the edit button.",
-            "Mark Tracks Complete",
-            JOptionPane.YES_NO_OPTION,
-            JOptionPane.QUESTION_MESSAGE);
-        
-        if (confirm != JOptionPane.YES_OPTION) {
+        // For single track, use the standard flow with occlusion marking
+        if (toComplete.size() == 1) {
+            markTrackComplete(toComplete.get(0));
             return;
         }
         
-        saveState();
+        // For multiple tracks, offer batch completion options
+        String[] options = {"Mark All Complete", "Mark with Occlusions (one by one)", "Cancel"};
+        int choice = JOptionPane.showOptionDialog(frame,
+            "Mark " + toComplete.size() + " selected track(s) as complete?\n\n" +
+            "Choose how to complete:\n" +
+            "• Mark All Complete: Quickly mark all as fully visible\n" +
+            "• Mark with Occlusions: Mark occlusions for each track one by one\n\n" +
+            "You can resume editing later using the edit button on each track.",
+            "Mark Tracks Complete",
+            JOptionPane.YES_NO_CANCEL_OPTION,
+            JOptionPane.QUESTION_MESSAGE,
+            null,
+            options,
+            options[0]);
         
-        // Mark each track as complete (without individual trim dialogs for batch)
+        if (choice == 2 || choice == JOptionPane.CLOSED_OPTION) {
+            return; // Cancel
+        }
+        
+        if (choice == 1) {
+            // Mark with occlusions - process one by one
+            // Start with first track, after occlusion mode completes, continue with next
+            pendingCompleteTracks = new ArrayList<>(toComplete);
+            processNextPendingCompleteTrack();
+            return;
+        }
+        
+        // Choice 0: Mark all complete immediately (no occlusions)
+        saveState("Mark " + toComplete.size() + " tracks complete");
+        
         for (String trackId : toComplete) {
             pauseTrackTimer(trackId);
             trackCompleted.put(trackId, true);
@@ -14332,7 +15059,30 @@ public class VideoAnnotationTool {
         
         refreshAnnotationList();
         imageLabel.repaint();
-        setStatus("Marked " + toComplete.size() + " track(s) as complete");
+        setStatus("Marked " + toComplete.size() + " track(s) as complete (fully visible)");
+    }
+    
+    // List of tracks waiting to be completed with occlusion marking
+    private List<String> pendingCompleteTracks = null;
+    
+    /**
+     * Process the next track in the pending complete list.
+     * Called after each track's occlusion mode completes.
+     */
+    private void processNextPendingCompleteTrack() {
+        if (pendingCompleteTracks == null || pendingCompleteTracks.isEmpty()) {
+            pendingCompleteTracks = null;
+            return;
+        }
+        
+        String nextTrack = pendingCompleteTracks.remove(0);
+        int remaining = pendingCompleteTracks.size();
+        
+        if (remaining > 0) {
+            setStatus("Completing " + nextTrack + " (" + remaining + " more after this)");
+        }
+        
+        markTrackComplete(nextTrack);
     }
     
     /**
@@ -14377,7 +15127,7 @@ public class VideoAnnotationTool {
             pauseTrackTimer(selectedTrackId);
         }
         
-        saveState();
+        saveState("Delete " + toRemove.size() + " selected tracks");
         
         for (String trackId : toRemove) {
             // Exit comparison mode if deleting the comparison track
@@ -14447,7 +15197,7 @@ public class VideoAnnotationTool {
             pauseTrackTimer(trackId);
         }
         
-        saveState();
+        saveState("Remove all tracks");
         
         // Exit comparison mode if active (track will be deleted)
         if (smoothingComparisonMode) {
@@ -14554,6 +15304,41 @@ public class VideoAnnotationTool {
     
     // Timer for delayed annotation refresh (avoids blocking during rapid scrolling)
     private javax.swing.Timer annotationRefreshTimer;
+    
+    // Timer for live time counter updates (updates every second when a track is being timed)
+    private javax.swing.Timer liveTimeUpdateTimer;
+    
+    /**
+     * Start the live time update timer that refreshes track time badges every second.
+     */
+    private void startLiveTimeUpdateTimer() {
+        if (liveTimeUpdateTimer == null) {
+            liveTimeUpdateTimer = new javax.swing.Timer(1000, e -> {
+                // Only refresh if there's an actively timed track
+                for (String trackId : trackStartTime.keySet()) {
+                    Long startTime = trackStartTime.get(trackId);
+                    if (startTime != null && startTime > 0) {
+                        // There's an active timer, refresh the annotation list
+                        refreshAnnotationList();
+                        break;
+                    }
+                }
+            });
+            liveTimeUpdateTimer.setRepeats(true);
+        }
+        if (!liveTimeUpdateTimer.isRunning()) {
+            liveTimeUpdateTimer.start();
+        }
+    }
+    
+    /**
+     * Stop the live time update timer.
+     */
+    private void stopLiveTimeUpdateTimer() {
+        if (liveTimeUpdateTimer != null && liveTimeUpdateTimer.isRunning()) {
+            liveTimeUpdateTimer.stop();
+        }
+    }
     
     /**
      * Fast slice loading - minimal work for responsive scrolling (like ImageJ).
@@ -15754,14 +16539,11 @@ public class VideoAnnotationTool {
         while (true) {
             JFileChooser chooser = createStyledFileChooser();
             
-            // Use last opened directory if available, otherwise use current working directory
-            File startDir;
+            // Use last opened directory if available (overrides default repo directory)
             if (lastOpenedVideoDirectory != null && lastOpenedVideoDirectory.exists()) {
-                startDir = lastOpenedVideoDirectory;
-            } else {
-                startDir = new File(System.getProperty("user.dir"));
+                chooser.setCurrentDirectory(lastOpenedVideoDirectory);
             }
-            chooser.setCurrentDirectory(startDir);
+            // Otherwise keep the repo directory set by createStyledFileChooser()
             chooser.setFileFilter(new FileNameExtensionFilter("Video Files (TIFF, AVI)", "tif", "tiff", "avi"));
             
             if (chooser.showOpenDialog(frame) != JFileChooser.APPROVE_OPTION) {
@@ -16001,6 +16783,14 @@ public class VideoAnnotationTool {
             frameSlider.setValue(1);
             frameSlider.setEnabled(totalSlices > 1);
             
+            // Reset slider zoom state
+            sliderZoomed = false;
+            sliderZoomStart = 1;
+            sliderZoomEnd = totalSlices;
+            if (sliderZoomLabel != null) {
+                sliderZoomLabel.setVisible(false);
+            }
+            
             // Start background thread for slice loading (like ImageJ's StackWindow)
             startSliceLoaderThread();
             
@@ -16029,7 +16819,7 @@ public class VideoAnnotationTool {
             return;
         }
         
-        String flowMethod = config.getProperty("flow.method", getDefaultFlowMethod());
+        String flowMethod = getConfiguredFlowMethod();
         java.util.List<File> allCachedFiles = findCachedFlowFiles(currentVideoPath, flowMethod);
         
         // CRITICAL: Filter by resolution to prevent using wrong-resolution flow data
@@ -16096,7 +16886,16 @@ public class VideoAnnotationTool {
             );
             
             if (choice == 0) { // Load Existing
-                File fileToLoad = (matchingFile != null) ? matchingFile : cachedFiles.get(0);
+                // If multiple files available, let user choose; otherwise use best match
+                File fileToLoad;
+                if (cachedFiles.size() > 1) {
+                    fileToLoad = showFlowFileSelectionDialog(cachedFiles, flowMethod, matchingFile);
+                    if (fileToLoad == null) {
+                        return; // User cancelled selection
+                    }
+                } else {
+                    fileToLoad = (matchingFile != null) ? matchingFile : cachedFiles.get(0);
+                }
                 loadExistingOpticalFlow(fileToLoad);
             } else if (choice == 1) { // Recalculate
                 computeOpticalFlowRemote(true);
@@ -16136,10 +16935,11 @@ public class VideoAnnotationTool {
     /**
      * Find the most recent optical flow file for a given video and method.
      * CRITICAL: Only returns files that match the current working resolution.
-     * Files now have descriptive names with parameters, e.g.:
-     * - video_raft_optical_flow.npz (or video_raft_WxH_optical_flow.npz if resized)
-     * - video_locotrack_r2.5_t0.00_kgau_fs15_ts0.10_sf0_optical_flow.npz
-     * - video_trackpy_d11_mm0_sr15_m5_kgau_fs15_optical_flow.npz
+     * Files have descriptive names with parameters, e.g.:
+     * - video_raft_WxH_optical_flow.npz
+     * - video_locotrack_WxH_r2.5_t0.00_kgau_fs15_ts0.10_seed0_optical_flow.npz
+     * - video_trackpy_WxH_r2.5_t0.00_sr15_m5_kgau_fs15_sf0.10_optical_flow.npz
+     * - video_dis_WxH_ds2_optical_flow.npz
      */
     private String getOpticalFlowPath(String videoPath) {
         if (videoPath == null) return null;
@@ -16147,7 +16947,7 @@ public class VideoAnnotationTool {
         String outputDir = getOutputDirectory();
         String videoName = new File(videoPath).getName();
         String baseName = videoName.replaceFirst("\\.[^.]+$", "");
-        String flowMethod = config.getProperty("flow.method", getDefaultFlowMethod());
+        String flowMethod = getConfiguredFlowMethod();
         
         // Look for existing flow files matching the pattern AND resolution
         java.util.List<File> allFiles = findCachedFlowFiles(videoPath, flowMethod);
@@ -16175,7 +16975,7 @@ public class VideoAnnotationTool {
     private boolean opticalFlowFileExists(String videoPath) {
         if (videoPath == null) return false;
         
-        String flowMethod = config.getProperty("flow.method", getDefaultFlowMethod());
+        String flowMethod = getConfiguredFlowMethod();
         java.util.List<File> allFiles = findCachedFlowFiles(videoPath, flowMethod);
         java.util.List<File> compatibleFiles = filterFlowFilesByResolution(allFiles);
         
@@ -16628,8 +17428,8 @@ public class VideoAnnotationTool {
         loadSliceImageFast();  // Fast update during wheel scroll
         pageLabel.setText(String.format("Frame: %d / %d", currentSlice, totalSlices));
         frameSlider.setValue(currentSlice);
-        // Schedule annotation list refresh after a delay to avoid blocking scroll
-        scheduleAnnotationRefresh();
+        // Refresh annotation list immediately for coordinate and anchor updates
+        refreshAnnotationList();
     }
 
     private void updateImageLabelPreferredSize() {
@@ -16818,6 +17618,739 @@ public class VideoAnnotationTool {
     // Export content enum
     private enum ExportContent { RICH, TRAJECTORIES_ONLY, BOTH }
     
+    /**
+     * Show the export video dialog.
+     * Allows user to configure and export video with track overlays as MP4.
+     * 
+     * Edge cases handled:
+     * - No video loaded: show warning
+     * - No tracks: show warning
+     * - Empty tracks: skipped in export
+     * - Video compression active: uses working video path
+     * - Invalid FPS values: validated and constrained
+     * - Python script errors: caught and displayed
+     */
+    private void showExportVideoDialog() {
+        if (imp == null || currentVideoPath == null) {
+            JOptionPane.showMessageDialog(frame, 
+                "Please open a video file first.", 
+                "Export Video", 
+                JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        
+        if (trackAnnotations.isEmpty()) {
+            JOptionPane.showMessageDialog(frame, 
+                "No tracks to include in video export.\nCreate or import tracks first.", 
+                "Export Video", 
+                JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        
+        // Count non-empty tracks
+        int validTrackCount = 0;
+        for (Map.Entry<String, Map<Integer, Point>> entry : trackAnnotations.entrySet()) {
+            if (entry.getValue() != null && !entry.getValue().isEmpty()) {
+                validTrackCount++;
+            }
+        }
+        
+        if (validTrackCount == 0) {
+            JOptionPane.showMessageDialog(frame, 
+                "All tracks are empty. Add some annotations first.", 
+                "Export Video", 
+                JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        
+        // Create the export dialog
+        JDialog dialog = new JDialog(frame, "Export Video with Tracks", true);
+        dialog.setLayout(new BorderLayout(10, 10));
+        
+        // Main settings panel
+        JPanel mainPanel = new JPanel();
+        mainPanel.setLayout(new BoxLayout(mainPanel, BoxLayout.Y_AXIS));
+        mainPanel.setBorder(BorderFactory.createEmptyBorder(15, 15, 10, 15));
+        mainPanel.setBackground(SECONDARY_DARK);
+        
+        // Header
+        JLabel headerLabel = new JLabel("Export Video with Track Overlays");
+        headerLabel.setFont(new Font("Segoe UI", Font.BOLD, 16));
+        headerLabel.setForeground(TEXT_PRIMARY);
+        headerLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        mainPanel.add(headerLabel);
+        mainPanel.add(Box.createVerticalStrut(5));
+        
+        JLabel infoLabel = new JLabel(String.format("Video: %d frames  |  Tracks: %d", totalSlices, validTrackCount));
+        infoLabel.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        infoLabel.setForeground(TEXT_SECONDARY);
+        infoLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        mainPanel.add(infoLabel);
+        mainPanel.add(Box.createVerticalStrut(15));
+        
+        // Display options section
+        JPanel displayPanel = new JPanel(new GridBagLayout());
+        displayPanel.setBackground(SECONDARY_DARK);
+        displayPanel.setBorder(BorderFactory.createTitledBorder(
+            BorderFactory.createLineBorder(BORDER_DARK),
+            "Display Options",
+            javax.swing.border.TitledBorder.LEFT,
+            javax.swing.border.TitledBorder.TOP,
+            new Font("Segoe UI", Font.BOLD, 12),
+            TEXT_PRIMARY
+        ));
+        displayPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.insets = new Insets(5, 8, 5, 8);
+        gbc.anchor = GridBagConstraints.WEST;
+        
+        // Show points checkbox
+        JCheckBox showPointsCheckbox = createStyledCheckbox("Show point markers");
+        showPointsCheckbox.setSelected(true);
+        showPointsCheckbox.setToolTipText("Display circular markers at current track positions");
+        gbc.gridx = 0; gbc.gridy = 0; gbc.gridwidth = 2;
+        displayPanel.add(showPointsCheckbox, gbc);
+        
+        // Show trails checkbox
+        JCheckBox showTrailsCheckbox = createStyledCheckbox("Show trailing lines");
+        showTrailsCheckbox.setSelected(true);
+        showTrailsCheckbox.setToolTipText("Display track history as lines behind current position");
+        gbc.gridy = 1;
+        displayPanel.add(showTrailsCheckbox, gbc);
+        
+        // Persistent trails checkbox
+        JCheckBox persistentTrailsCheckbox = createStyledCheckbox("Persistent trails (full history)");
+        persistentTrailsCheckbox.setSelected(false);
+        persistentTrailsCheckbox.setToolTipText("Show entire track from start instead of last N frames");
+        gbc.gridy = 2;
+        displayPanel.add(persistentTrailsCheckbox, gbc);
+        
+        mainPanel.add(displayPanel);
+        mainPanel.add(Box.createVerticalStrut(10));
+        
+        // Size options section
+        JPanel sizePanel = new JPanel(new GridBagLayout());
+        sizePanel.setBackground(SECONDARY_DARK);
+        sizePanel.setBorder(BorderFactory.createTitledBorder(
+            BorderFactory.createLineBorder(BORDER_DARK),
+            "Size Settings",
+            javax.swing.border.TitledBorder.LEFT,
+            javax.swing.border.TitledBorder.TOP,
+            new Font("Segoe UI", Font.BOLD, 12),
+            TEXT_PRIMARY
+        ));
+        sizePanel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        
+        gbc = new GridBagConstraints();
+        gbc.insets = new Insets(5, 8, 5, 8);
+        gbc.anchor = GridBagConstraints.WEST;
+        
+        // Point size
+        JLabel pointSizeLabel = createStyledLabel("Point marker size:");
+        gbc.gridx = 0; gbc.gridy = 0;
+        sizePanel.add(pointSizeLabel, gbc);
+        
+        JSpinner pointSizeSpinner = new JSpinner(new SpinnerNumberModel(6, 1, 30, 1));
+        pointSizeSpinner.setPreferredSize(new Dimension(60, 25));
+        pointSizeSpinner.setToolTipText("Radius of point markers in pixels");
+        gbc.gridx = 1;
+        sizePanel.add(pointSizeSpinner, gbc);
+        
+        JLabel pointSizeUnitLabel = createStyledLabel("pixels");
+        pointSizeUnitLabel.setForeground(TEXT_SECONDARY);
+        gbc.gridx = 2;
+        sizePanel.add(pointSizeUnitLabel, gbc);
+        
+        // Trail thickness
+        JLabel trailThicknessLabel = createStyledLabel("Trail line thickness:");
+        gbc.gridx = 0; gbc.gridy = 1;
+        sizePanel.add(trailThicknessLabel, gbc);
+        
+        JSpinner trailThicknessSpinner = new JSpinner(new SpinnerNumberModel(2, 1, 15, 1));
+        trailThicknessSpinner.setPreferredSize(new Dimension(60, 25));
+        trailThicknessSpinner.setToolTipText("Thickness of trail lines in pixels");
+        gbc.gridx = 1;
+        sizePanel.add(trailThicknessSpinner, gbc);
+        
+        JLabel trailThicknessUnitLabel = createStyledLabel("pixels");
+        trailThicknessUnitLabel.setForeground(TEXT_SECONDARY);
+        gbc.gridx = 2;
+        sizePanel.add(trailThicknessUnitLabel, gbc);
+        
+        // Trail length
+        JLabel trailLengthLabel = createStyledLabel("Trail length:");
+        gbc.gridx = 0; gbc.gridy = 2;
+        sizePanel.add(trailLengthLabel, gbc);
+        
+        JSpinner trailLengthSpinner = new JSpinner(new SpinnerNumberModel(30, 1, 500, 5));
+        trailLengthSpinner.setPreferredSize(new Dimension(60, 25));
+        trailLengthSpinner.setToolTipText("Number of frames to show in trail (when persistent is off)");
+        gbc.gridx = 1;
+        sizePanel.add(trailLengthSpinner, gbc);
+        
+        JLabel trailLengthUnitLabel = createStyledLabel("frames");
+        trailLengthUnitLabel.setForeground(TEXT_SECONDARY);
+        gbc.gridx = 2;
+        sizePanel.add(trailLengthUnitLabel, gbc);
+        
+        // Enable/disable trail length based on persistent checkbox
+        persistentTrailsCheckbox.addActionListener(e -> {
+            boolean enableLength = !persistentTrailsCheckbox.isSelected();
+            trailLengthSpinner.setEnabled(enableLength);
+            trailLengthLabel.setEnabled(enableLength);
+            trailLengthUnitLabel.setEnabled(enableLength);
+        });
+        
+        mainPanel.add(sizePanel);
+        mainPanel.add(Box.createVerticalStrut(10));
+        
+        // Video settings section
+        JPanel videoPanel = new JPanel(new GridBagLayout());
+        videoPanel.setBackground(SECONDARY_DARK);
+        videoPanel.setBorder(BorderFactory.createTitledBorder(
+            BorderFactory.createLineBorder(BORDER_DARK),
+            "Video Settings",
+            javax.swing.border.TitledBorder.LEFT,
+            javax.swing.border.TitledBorder.TOP,
+            new Font("Segoe UI", Font.BOLD, 12),
+            TEXT_PRIMARY
+        ));
+        videoPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        
+        gbc = new GridBagConstraints();
+        gbc.insets = new Insets(5, 8, 5, 8);
+        gbc.anchor = GridBagConstraints.WEST;
+        
+        // FPS
+        JLabel fpsLabel = createStyledLabel("Output FPS:");
+        gbc.gridx = 0; gbc.gridy = 0;
+        videoPanel.add(fpsLabel, gbc);
+        
+        JSpinner fpsSpinner = new JSpinner(new SpinnerNumberModel(30.0, 0.1, 120.0, 1.0));
+        fpsSpinner.setPreferredSize(new Dimension(70, 25));
+        fpsSpinner.setToolTipText("Output video framerate (frames per second)");
+        gbc.gridx = 1;
+        videoPanel.add(fpsSpinner, gbc);
+        
+        JLabel fpsUnitLabel = createStyledLabel("fps");
+        fpsUnitLabel.setForeground(TEXT_SECONDARY);
+        gbc.gridx = 2;
+        videoPanel.add(fpsUnitLabel, gbc);
+        
+        // Quality (CRF)
+        JLabel qualityLabel = createStyledLabel("Quality:");
+        gbc.gridx = 0; gbc.gridy = 1;
+        videoPanel.add(qualityLabel, gbc);
+        
+        JComboBox<String> qualityCombo = new JComboBox<>(new String[] {
+            "High (CRF 18)",
+            "Medium (CRF 23)",
+            "Low (CRF 28)"
+        });
+        qualityCombo.setSelectedIndex(1); // Default to medium
+        qualityCombo.setToolTipText("Video compression quality (lower CRF = higher quality, larger file)");
+        gbc.gridx = 1; gbc.gridwidth = 2;
+        videoPanel.add(qualityCombo, gbc);
+        
+        mainPanel.add(videoPanel);
+        
+        dialog.add(mainPanel, BorderLayout.CENTER);
+        
+        // Button panel
+        JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 10));
+        buttonPanel.setBackground(SECONDARY_DARK);
+        
+        JButton cancelButton = createStyledButton("Cancel");
+        JButton exportButton = createAccentButton("Export Video", "export");
+        
+        cancelButton.addActionListener(e -> dialog.dispose());
+        
+        exportButton.addActionListener(e -> {
+            // Gather settings
+            boolean showPoints = showPointsCheckbox.isSelected();
+            boolean showTrails = showTrailsCheckbox.isSelected();
+            boolean persistentTrails = persistentTrailsCheckbox.isSelected();
+            int pointSize = (Integer) pointSizeSpinner.getValue();
+            int trailThickness = (Integer) trailThicknessSpinner.getValue();
+            int trailLength = (Integer) trailLengthSpinner.getValue();
+            double fps = (Double) fpsSpinner.getValue();
+            
+            // Get quality CRF value
+            int quality;
+            switch (qualityCombo.getSelectedIndex()) {
+                case 0: quality = 18; break;
+                case 2: quality = 28; break;
+                default: quality = 23; break;
+            }
+            
+            dialog.dispose();
+            
+            // Perform export in background
+            performVideoExport(showPoints, showTrails, persistentTrails, 
+                              pointSize, trailThickness, trailLength, fps, quality);
+        });
+        
+        buttonPanel.add(cancelButton);
+        buttonPanel.add(exportButton);
+        dialog.add(buttonPanel, BorderLayout.SOUTH);
+        
+        // Handle ESC key
+        dialog.getRootPane().registerKeyboardAction(
+            e -> dialog.dispose(),
+            KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0),
+            JComponent.WHEN_IN_FOCUSED_WINDOW
+        );
+        
+        styleDialog(dialog);
+        dialog.pack();
+        dialog.setMinimumSize(new Dimension(400, 500));
+        dialog.setLocationRelativeTo(frame);
+        dialog.setVisible(true);
+    }
+    
+    /**
+     * Perform the video export with track overlays.
+     * Runs the Python video_export.py script in a background thread.
+     */
+    private void performVideoExport(boolean showPoints, boolean showTrails, boolean persistentTrails,
+                                    int pointSize, int trailThickness, int trailLength,
+                                    double fps, int quality) {
+        // Choose output file
+        String videoName = imp.getTitle();
+        if (videoName.contains(".")) {
+            videoName = videoName.substring(0, videoName.lastIndexOf('.'));
+        }
+        String defaultOutputName = videoName + "_with_tracks.mp4";
+        
+        JFileChooser chooser = createStyledFileChooser();
+        // Use last export video directory if available
+        if (lastExportVideoDirectory != null && lastExportVideoDirectory.exists()) {
+            chooser.setCurrentDirectory(lastExportVideoDirectory);
+        }
+        chooser.setFileFilter(new FileNameExtensionFilter("MP4 Video (*.mp4)", "mp4"));
+        chooser.setSelectedFile(new File(defaultOutputName));
+        
+        if (chooser.showSaveDialog(frame) != JFileChooser.APPROVE_OPTION) {
+            return;
+        }
+        
+        File outputFile = chooser.getSelectedFile();
+        // Remember this directory for next export video operation
+        if (outputFile.getParentFile() != null && outputFile.getParentFile().exists()) {
+            lastExportVideoDirectory = outputFile.getParentFile();
+        }
+        if (!outputFile.getName().toLowerCase().endsWith(".mp4")) {
+            outputFile = new File(outputFile.getAbsolutePath() + ".mp4");
+        }
+        
+        // Check if file already exists
+        if (outputFile.exists()) {
+            int overwrite = JOptionPane.showConfirmDialog(frame,
+                "File already exists:\n" + outputFile.getName() + "\n\nWould you like to replace it?",
+                "Confirm Overwrite",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.WARNING_MESSAGE);
+            if (overwrite != JOptionPane.YES_OPTION) {
+                return;
+            }
+        }
+        
+        final File finalOutputFile = outputFile;
+        
+        // Build tracks JSON for the Python script
+        JSONArray tracksArray = new JSONArray();
+        for (Map.Entry<String, Map<Integer, Point>> entry : trackAnnotations.entrySet()) {
+            String trackId = entry.getKey();
+            Map<Integer, Point> points = entry.getValue();
+            
+            if (points == null || points.isEmpty()) continue;
+            
+            JSONObject trackObj = new JSONObject();
+            trackObj.put("track_id", trackId);
+            
+            // Get color - must match what's shown in interface
+            Color color = trackColors.getOrDefault(trackId, Color.WHITE);
+            String hexColor = String.format("#%02x%02x%02x", color.getRed(), color.getGreen(), color.getBlue());
+            trackObj.put("color", hexColor);
+            
+            // Add frame positions (0-indexed for Python)
+            JSONArray framesArray = new JSONArray();
+            for (Map.Entry<Integer, Point> pointEntry : points.entrySet()) {
+                int frameNum = pointEntry.getKey();
+                Point pt = pointEntry.getValue();
+                
+                JSONObject frameObj = new JSONObject();
+                frameObj.put("frame", frameNum - 1);  // Convert to 0-indexed
+                frameObj.put("x", pt.x);
+                frameObj.put("y", pt.y);
+                framesArray.put(frameObj);
+            }
+            trackObj.put("frames", framesArray);
+            
+            tracksArray.put(trackObj);
+        }
+        
+        // Create temporary JSON file for tracks
+        File tempTracksFile;
+        try {
+            tempTracksFile = File.createTempFile("ripple_tracks_", ".json");
+            tempTracksFile.deleteOnExit();
+            
+            JSONObject exportData = new JSONObject();
+            exportData.put("tracks", tracksArray);
+            
+            try (java.io.FileWriter writer = new java.io.FileWriter(tempTracksFile)) {
+                writer.write(exportData.toString(2));
+            }
+        } catch (IOException ex) {
+            JOptionPane.showMessageDialog(frame, 
+                "Failed to create temporary tracks file: " + ex.getMessage(),
+                "Export Error", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        
+        final File finalTracksFile = tempTracksFile;
+        
+        // Use working video path if compression was applied
+        String videoPath = workingVideoPath != null ? workingVideoPath : currentVideoPath;
+        final String finalVideoPath = videoPath;
+        
+        // Show progress dialog
+        JDialog progressDialog = new JDialog(frame, "Exporting Video...", false);
+        progressDialog.setLayout(new BorderLayout(10, 10));
+        
+        JPanel progressPanel = new JPanel();
+        progressPanel.setLayout(new BoxLayout(progressPanel, BoxLayout.Y_AXIS));
+        progressPanel.setBorder(BorderFactory.createEmptyBorder(20, 20, 20, 20));
+        progressPanel.setBackground(SECONDARY_DARK);
+        
+        JLabel progressLabel = new JLabel("Exporting video with track overlays...");
+        progressLabel.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        progressLabel.setForeground(TEXT_SECONDARY);
+        progressLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
+        progressPanel.add(progressLabel);
+        
+        progressPanel.add(Box.createVerticalStrut(10));
+        
+        // Progress bar for frame tracking
+        final JProgressBar progressBar = new JProgressBar(0, totalSlices);
+        progressBar.setPreferredSize(new Dimension(300, 20));
+        progressBar.setStringPainted(true);
+        progressBar.setAlignmentX(Component.CENTER_ALIGNMENT);
+        progressPanel.add(progressBar);
+        
+        progressPanel.add(Box.createVerticalStrut(10));
+        
+        // Elapsed time label (like other functions)
+        final JLabel elapsedLabel = new JLabel("Elapsed: 0s");
+        elapsedLabel.setFont(new Font("Segoe UI", Font.BOLD, 14));
+        elapsedLabel.setForeground(ACCENT_BLUE);
+        elapsedLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
+        progressPanel.add(elapsedLabel);
+        
+        progressDialog.add(progressPanel, BorderLayout.CENTER);
+        
+        JPanel cancelPanel = new JPanel(new FlowLayout(FlowLayout.CENTER));
+        cancelPanel.setBackground(SECONDARY_DARK);
+        JButton cancelBtn = createStyledButton("Cancel");
+        cancelPanel.add(cancelBtn);
+        progressDialog.add(cancelPanel, BorderLayout.SOUTH);
+        
+        styleDialog(progressDialog);
+        progressDialog.pack();
+        progressDialog.setSize(400, 150);
+        progressDialog.setLocationRelativeTo(frame);
+        
+        // Track the running process for cancellation
+        final AtomicReference<Process> exportProcess = new AtomicReference<>(null);
+        
+        // Timer to update elapsed time
+        final long startTime = System.currentTimeMillis();
+        final Timer elapsedTimer = new Timer(1000, e -> {
+            long elapsed = (System.currentTimeMillis() - startTime) / 1000;
+            if (elapsed >= 60) {
+                long mins = elapsed / 60;
+                long secs = elapsed % 60;
+                elapsedLabel.setText(String.format("Elapsed: %dm %02ds", mins, secs));
+            } else {
+                elapsedLabel.setText("Elapsed: " + elapsed + "s");
+            }
+        });
+        elapsedTimer.start();
+        
+        // Export worker
+        SwingWorker<Boolean, String> exportWorker = new SwingWorker<Boolean, String>() {
+            @Override
+            protected Boolean doInBackground() throws Exception {
+                Process process = null;
+                try {
+                    // Build command using the same pattern as tracking server
+                    String scriptPath = findVideoExportScript();
+                    
+                    List<String> args = new ArrayList<>();
+                    args.add(finalVideoPath);
+                    args.add(finalTracksFile.getAbsolutePath());
+                    args.add("-o");
+                    args.add(finalOutputFile.getAbsolutePath());
+                    args.add("--fps");
+                    args.add(String.valueOf(fps));
+                    args.add("--point-size");
+                    args.add(String.valueOf(pointSize));
+                    args.add("--trail-thickness");
+                    args.add(String.valueOf(trailThickness));
+                    args.add("--trail-length");
+                    args.add(String.valueOf(trailLength));
+                    args.add("--quality");
+                    args.add(String.valueOf(quality));
+                    
+                    // Pass display range for brightness/contrast matching
+                    if (viewMin != null && viewMax != null) {
+                        args.add("--display-min");
+                        args.add(String.valueOf(viewMin));
+                        args.add("--display-max");
+                        args.add(String.valueOf(viewMax));
+                    }
+                    
+                    if (!showPoints) args.add("--no-points");
+                    if (!showTrails) args.add("--no-trails");
+                    if (persistentTrails) args.add("--persistent-trails");
+                    
+                    // Build command using cross-platform pattern
+                    List<String> command = buildVideoExportCommand(scriptPath, args);
+                    
+                    System.out.println("[VideoExport] Command: " + String.join(" ", command));
+                    
+                    ProcessBuilder pb = new ProcessBuilder(command);
+                    pb.redirectErrorStream(true);
+                    
+                    // Start process
+                    process = pb.start();
+                    exportProcess.set(process);
+                    
+                    // Read output for progress updates
+                    BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+                    String line;
+                    
+                    while ((line = reader.readLine()) != null && !isCancelled()) {
+                        final String outputLine = line;
+                        publish(outputLine);
+                        
+                        // Parse progress updates (format: "Progress: N/T frames (P%)")
+                        if (line.contains("Progress:")) {
+                            try {
+                                String[] parts = line.split("/");
+                                if (parts.length > 0) {
+                                    String numStr = parts[0].replaceAll("[^0-9]", "");
+                                    if (!numStr.isEmpty()) {
+                                        int currentFrame = Integer.parseInt(numStr);
+                                        SwingUtilities.invokeLater(() -> {
+                                            progressBar.setValue(currentFrame);
+                                            progressLabel.setText("Processing frame " + currentFrame + " of " + totalSlices);
+                                        });
+                                    }
+                                }
+                            } catch (Exception ignored) {}
+                        }
+                        
+                        System.out.println("[VideoExport] " + outputLine);
+                    }
+                    
+                    if (isCancelled()) {
+                        // Terminate process on cancellation
+                        if (process.isAlive()) {
+                            process.destroyForcibly();
+                        }
+                        return false;
+                    }
+                    
+                    int exitCode = process.waitFor();
+                    return exitCode == 0 && finalOutputFile.exists();
+                    
+                } finally {
+                    // Clean up temp file
+                    if (finalTracksFile.exists()) {
+                        finalTracksFile.delete();
+                    }
+                    exportProcess.set(null);
+                }
+            }
+            
+            @Override
+            protected void process(List<String> chunks) {
+                // Already updating progress in the while loop
+            }
+            
+            @Override
+            protected void done() {
+                elapsedTimer.stop();
+                progressDialog.dispose();
+                
+                try {
+                    Boolean success = get();
+                    if (success != null && success) {
+                        long fileSizeKb = finalOutputFile.length() / 1024;
+                        String sizeStr = fileSizeKb > 1024 ? 
+                            String.format("%.1f MB", fileSizeKb / 1024.0) : 
+                            String.format("%d KB", fileSizeKb);
+                        
+                        JOptionPane.showMessageDialog(frame,
+                            "Video exported successfully!\n\n" +
+                            "File: " + finalOutputFile.getName() + "\n" +
+                            "Size: " + sizeStr + "\n" +
+                            "Location: " + finalOutputFile.getParent(),
+                            "Export Complete",
+                            JOptionPane.INFORMATION_MESSAGE);
+                        setStatus("Video exported: " + finalOutputFile.getName());
+                    } else if (!isCancelled()) {
+                        JOptionPane.showMessageDialog(frame,
+                            "Video export failed. Check console for details.",
+                            "Export Error",
+                            JOptionPane.ERROR_MESSAGE);
+                        setStatus("Video export failed");
+                    } else {
+                        setStatus("Video export cancelled");
+                    }
+                } catch (Exception ex) {
+                    if (!isCancelled()) {
+                        ex.printStackTrace();
+                        JOptionPane.showMessageDialog(frame,
+                            "Video export failed: " + ex.getMessage(),
+                            "Export Error",
+                            JOptionPane.ERROR_MESSAGE);
+                        setStatus("Video export failed");
+                    }
+                }
+            }
+        };
+        
+        // Cancel button handler
+        cancelBtn.addActionListener(e -> {
+            // Terminate the running process
+            Process proc = exportProcess.get();
+            if (proc != null && proc.isAlive()) {
+                proc.destroyForcibly();
+            }
+            exportWorker.cancel(true);
+            elapsedTimer.stop();
+            progressDialog.dispose();
+            setStatus("Video export cancelled");
+            
+            // Clean up partial output file
+            if (finalOutputFile.exists()) {
+                finalOutputFile.delete();
+            }
+        });
+        
+        elapsedTimer.start();
+        exportWorker.execute();
+        progressDialog.setVisible(true);
+    }
+    
+    /**
+     * Build command for video export with cross-platform support.
+     * Uses the established pattern for handling Windows/WSL/Linux/macOS.
+     */
+    private List<String> buildVideoExportCommand(String scriptPath, List<String> args) {
+        List<String> command = new ArrayList<>();
+        String os = System.getProperty("os.name").toLowerCase();
+        boolean isWindows = os.contains("win");
+        
+        // Find Python executable
+        String pythonExe = findCondaPython();
+        
+        if (isWindows) {
+            // On Windows, check if we should use WSL for conda environment
+            if (isWSLAvailable() && scriptPath.contains("/")) {
+                // Script is on WSL filesystem - use wsl.exe
+                command.add("wsl.exe");
+                command.add("python3");
+                command.add(scriptPath);
+            } else {
+                // Native Windows
+                command.add(pythonExe);
+                command.add(scriptPath);
+            }
+        } else {
+            // Linux/macOS - use Python directly
+            command.add(pythonExe);
+            command.add(scriptPath);
+        }
+        
+        // Add script arguments
+        command.addAll(args);
+        
+        return command;
+    }
+    
+    /**
+     * Find the Python executable from the conda environment.
+     */
+    private String findCondaPython() {
+        // Check if CONDA_PREFIX is set
+        String condaPrefix = System.getenv("CONDA_PREFIX");
+        if (condaPrefix != null && !condaPrefix.isEmpty()) {
+            File pythonExe;
+            if (isWindowsOS()) {
+                pythonExe = new File(condaPrefix, "python.exe");
+            } else {
+                pythonExe = new File(condaPrefix, "bin/python");
+            }
+            if (pythonExe.exists()) {
+                return pythonExe.getAbsolutePath();
+            }
+        }
+        
+        // Fallback to system python
+        return isWindowsOS() ? "python" : "python3";
+    }
+    
+    /**
+     * Find the video_export.py script path.
+     */
+    private String findVideoExportScript() {
+        // First check relative to JAR location
+        try {
+            String jarPath = VideoAnnotationTool.class.getProtectionDomain()
+                .getCodeSource().getLocation().toURI().getPath();
+            File jarFile = new File(jarPath);
+            File jarDir = jarFile.getParentFile();
+            
+            // Check various possible locations
+            String[] possiblePaths = {
+                "python/video_export.py",
+                "../python/video_export.py",
+                "src/main/python/video_export.py",
+                "../src/main/python/video_export.py",
+            };
+            
+            for (String relPath : possiblePaths) {
+                File scriptFile = new File(jarDir, relPath);
+                if (scriptFile.exists()) {
+                    return scriptFile.getAbsolutePath();
+                }
+            }
+            
+            // Check in target/classes/python (Maven build)
+            File classesDir = jarDir;
+            if (classesDir.getName().equals("classes")) {
+                File scriptFile = new File(classesDir, "python/video_export.py");
+                if (scriptFile.exists()) {
+                    return scriptFile.getAbsolutePath();
+                }
+            }
+        } catch (Exception ignored) {}
+        
+        // Check current working directory
+        File cwdScript = new File("src/main/python/video_export.py");
+        if (cwdScript.exists()) {
+            return cwdScript.getAbsolutePath();
+        }
+        
+        // Last resort - assume it's in PATH or PYTHONPATH
+        return "video_export.py";
+    }
+
     private void exportAnnotations() {
         if (imp == null) return;
         
@@ -16990,25 +18523,43 @@ public class VideoAnnotationTool {
         }
         
         JFileChooser chooser = createStyledFileChooser();
+        // Use last export annotations directory if available, then startDir parameter, then default
+        if (lastExportAnnotationsDirectory != null && lastExportAnnotationsDirectory.exists()) {
+            chooser.setCurrentDirectory(lastExportAnnotationsDirectory);
+        } else if (startDir != null && startDir.isDirectory()) {
+            chooser.setCurrentDirectory(startDir);
+        }
+        
         if (format == ExportFormat.JSON) {
             chooser.setFileFilter(new FileNameExtensionFilter("JSON Files (*.json)", "json"));
         } else {
             chooser.setFileFilter(new FileNameExtensionFilter("CSV Files (*.csv)", "csv"));
         }
         
-        // Set starting directory if provided, otherwise use filename only
-        if (startDir != null && startDir.isDirectory()) {
-            chooser.setSelectedFile(new File(startDir, exportFileName));
-        } else {
-            chooser.setSelectedFile(new File(exportFileName));
-        }
+        chooser.setSelectedFile(new File(exportFileName));
         
         if (chooser.showSaveDialog(frame) != JFileChooser.APPROVE_OPTION) return null;
         
         File outputFile = chooser.getSelectedFile();
+        // Remember this directory for next export annotations operation
+        if (outputFile.getParentFile() != null && outputFile.getParentFile().exists()) {
+            lastExportAnnotationsDirectory = outputFile.getParentFile();
+        }
         // Ensure correct extension
         if (!outputFile.getName().toLowerCase().endsWith(extension)) {
             outputFile = new File(outputFile.getAbsolutePath() + extension);
+        }
+        
+        // Check if file already exists
+        if (outputFile.exists()) {
+            int overwrite = JOptionPane.showConfirmDialog(frame,
+                "File already exists:\n" + outputFile.getName() + "\n\nWould you like to replace it?",
+                "Confirm Overwrite",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.WARNING_MESSAGE);
+            if (overwrite != JOptionPane.YES_OPTION) {
+                return null;
+            }
         }
         
         if (format == ExportFormat.JSON) {
@@ -17585,12 +19136,20 @@ public class VideoAnnotationTool {
         }
         
         JFileChooser chooser = createStyledFileChooser();
+        // Use last import annotations directory if available
+        if (lastImportAnnotationsDirectory != null && lastImportAnnotationsDirectory.exists()) {
+            chooser.setCurrentDirectory(lastImportAnnotationsDirectory);
+        }
         chooser.setFileFilter(new FileNameExtensionFilter("Annotation Files (*.json, *.csv)", "json", "csv"));
 
         while (true) {
             if (chooser.showOpenDialog(frame) != JFileChooser.APPROVE_OPTION) return;
             
             File selectedFile = chooser.getSelectedFile();
+            // Remember this directory for next import annotations operation
+            if (selectedFile.getParentFile() != null && selectedFile.getParentFile().exists()) {
+                lastImportAnnotationsDirectory = selectedFile.getParentFile();
+            }
             String filename = selectedFile.getName().toLowerCase();
             
             try {
@@ -17631,16 +19190,75 @@ public class VideoAnnotationTool {
                     }
                 }
                 
+                // Clean up uninitialized tracks (tracks with no annotation points)
+                // These are tracks that were created but never had points propagated
+                List<String> uninitializedTracks = new ArrayList<>();
+                for (Map.Entry<String, Map<Integer, Point>> entry : trackAnnotations.entrySet()) {
+                    if (entry.getValue() == null || entry.getValue().isEmpty()) {
+                        uninitializedTracks.add(entry.getKey());
+                    }
+                }
+                for (String trackId : uninitializedTracks) {
+                    trackAnnotations.remove(trackId);
+                    trackColors.remove(trackId);
+                    trackAnchors.remove(trackId);
+                    trackOptimized.remove(trackId);
+                    trackSelected.remove(trackId);
+                    trackTotalTime.remove(trackId);
+                    trackStartTime.remove(trackId);
+                    trackCompleted.remove(trackId);
+                    trackOcclusionSegments.remove(trackId);
+                    trackSmoothing.remove(trackId);
+                    trackOriginalAnnotations.remove(trackId);
+                    trackUntrimmedAnnotations.remove(trackId);
+                    trackUntrimmedAnchors.remove(trackId);
+                    trackTrimRange.remove(trackId);
+                }
+                if (!uninitializedTracks.isEmpty()) {
+                    System.out.println("Cleaned up " + uninitializedTracks.size() + " uninitialized track(s) before import");
+                }
+                
+                // Check if there are existing tracks and ask user what to do
+                boolean keepExistingTracks = false;
+                int existingMaxTrackNum = 0;
+                if (!trackAnnotations.isEmpty()) {
+                    // Calculate highest existing track number for potential renumbering
+                    for (String trackId : trackAnnotations.keySet()) {
+                        try {
+                            String numStr = trackId.replaceAll("[^0-9]", "");
+                            if (!numStr.isEmpty()) {
+                                existingMaxTrackNum = Math.max(existingMaxTrackNum, Integer.parseInt(numStr));
+                            }
+                        } catch (NumberFormatException ignored) {}
+                    }
+                    
+                    int choice = JOptionPane.showOptionDialog(frame,
+                        "You have " + trackAnnotations.size() + " existing track(s).\n\n" +
+                        "What would you like to do with them?",
+                        "Existing Tracks",
+                        JOptionPane.YES_NO_CANCEL_OPTION,
+                        JOptionPane.QUESTION_MESSAGE,
+                        null,
+                        new String[]{"Keep Existing", "Discard Existing", "Cancel"},
+                        "Keep Existing");
+                    
+                    if (choice == 2 || choice == JOptionPane.CLOSED_OPTION) {
+                        // User cancelled
+                        return;
+                    }
+                    keepExistingTracks = (choice == 0);
+                }
+                
                 // Perform the actual import (resolution validation happens inside these functions)
                 if (filename.endsWith(".csv")) {
-                    importFromCsvContent(content);
+                    importFromCsvContent(content, keepExistingTracks, existingMaxTrackNum);
                 } else {
                     char firstChar = content.charAt(0);
                     if (firstChar == '{' || firstChar == '[') {
-                        importFromJson(content);
+                        importFromJson(content, keepExistingTracks, existingMaxTrackNum);
                     } else {
                         // Assume CSV
-                        importFromCsvContent(content);
+                        importFromCsvContent(content, keepExistingTracks, existingMaxTrackNum);
                     }
                 }
                 
@@ -17764,7 +19382,7 @@ public class VideoAnnotationTool {
     
     private void importFromCsv(File file) throws Exception {
         String content = new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
-        importFromCsvContent(content);
+        importFromCsvContent(content, false, 0);
     }
     
     /**
@@ -17776,10 +19394,16 @@ public class VideoAnnotationTool {
      * No resolution validation needed - just scale and import.
      * 
      * Also parses TRACK_SUMMARY comments for time, trim, and occlusion data.
+     * 
+     * @param content The CSV content to import
+     * @param keepExistingTracks If true, existing tracks are preserved and new tracks are renumbered
+     * @param existingMaxTrackNum The highest track number among existing tracks (for renumbering)
      */
-    private void importFromCsvContent(String content) throws Exception {
-        // Clear existing data
-        clearAllTrackData();
+    private void importFromCsvContent(String content, boolean keepExistingTracks, int existingMaxTrackNum) throws Exception {
+        // Clear existing data only if not keeping existing tracks
+        if (!keepExistingTracks) {
+            clearAllTrackData();
+        };
         
         String[] lines = content.split("\\r?\\n");
         
@@ -17845,11 +19469,15 @@ public class VideoAnnotationTool {
         int workingWidth = (imp != null) ? imp.getWidth() : Integer.MAX_VALUE;
         int workingHeight = (imp != null) ? imp.getHeight() : Integer.MAX_VALUE;
         
-        int maxTrackNum = 0;
+        int maxTrackNum = keepExistingTracks ? existingMaxTrackNum : 0;
         Map<String, Boolean> trackPropertiesSet = new HashMap<>();
         
         // For reconstructing occlusion segments from per-row occluded flags (fallback)
         Map<String, List<Integer>> trackOccludedFrames = new HashMap<>();
+        
+        // Track ID mapping for renumbering imported tracks when keeping existing tracks
+        Map<String, String> trackIdMap = new HashMap<>();
+        int nextNewTrackNum = existingMaxTrackNum + 1;
         
         // Process data rows - start after header
         int dataStartLine = headerLine + 1;
@@ -17864,8 +19492,24 @@ public class VideoAnnotationTool {
             }
             
             try {
-                String trackId = values[trackIdCol].trim();
-                if (trackId.isEmpty()) continue;
+                String originalTrackId = values[trackIdCol].trim();
+                if (originalTrackId.isEmpty()) continue;
+                
+                // Map track ID for renumbering when keeping existing tracks
+                String trackId;
+                if (keepExistingTracks) {
+                    if (!trackIdMap.containsKey(originalTrackId)) {
+                        // Assign a new track ID that doesn't conflict with existing tracks
+                        // Use "Track" + number (no underscore) to match the app's naming convention
+                        trackId = "Track" + nextNewTrackNum;
+                        trackIdMap.put(originalTrackId, trackId);
+                        nextNewTrackNum++;
+                    } else {
+                        trackId = trackIdMap.get(originalTrackId);
+                    }
+                } else {
+                    trackId = originalTrackId;
+                }
                 
                 // Validate frame number
                 int frameNum;
@@ -17936,8 +19580,9 @@ public class VideoAnnotationTool {
                     }
                     
                     // If we have TRACK_SUMMARY data, use it; otherwise fall back to row data
-                    if (hasTrackSummaries && trackSummaries.containsKey(trackId)) {
-                        Map<String, String> summary = trackSummaries.get(trackId);
+                    // Note: trackSummaries uses original track IDs from the file
+                    if (hasTrackSummaries && trackSummaries.containsKey(originalTrackId)) {
+                        Map<String, String> summary = trackSummaries.get(originalTrackId);
                         applyTrackSummaryData(trackId, summary);
                     } else {
                         // Fallback: use row-level data
@@ -18241,8 +19886,12 @@ public class VideoAnnotationTool {
      * - Negative frame numbers (treated as 0 with warning)
      * - Invalid coordinates (clamped to image bounds)
      * - Invalid occlusion segments (skipped)
+     * 
+     * @param content The JSON content to import
+     * @param keepExistingTracks If true, existing tracks are preserved and new tracks are renumbered
+     * @param existingMaxTrackNum The highest track number among existing tracks (for renumbering)
      */
-    private void importFromJson(String content) throws Exception {
+    private void importFromJson(String content, boolean keepExistingTracks, int existingMaxTrackNum) throws Exception {
         if (content == null || content.trim().isEmpty()) {
             throw new Exception("Empty JSON content");
         }
@@ -18289,26 +19938,41 @@ public class VideoAnnotationTool {
             throw new Exception("No tracks found in JSON file");
         }
         
-        // Clear existing data
-        clearAllTrackData();
+        // Clear existing data only if not keeping existing tracks
+        if (!keepExistingTracks) {
+            clearAllTrackData();
+        }
         
         // Get working dimensions for coordinate clamping
         int workingWidth = (imp != null) ? imp.getWidth() : Integer.MAX_VALUE;
         int workingHeight = (imp != null) ? imp.getHeight() : Integer.MAX_VALUE;
         
-        int maxTrackNum = 0;
+        int maxTrackNum = keepExistingTracks ? existingMaxTrackNum : 0;
         int importedCount = 0;
         int skippedCount = 0;
+        
+        // Track renumbering counter for when keeping existing tracks
+        int nextNewTrackNum = existingMaxTrackNum + 1;
         
         for (int i = 0; i < tracksArray.length(); i++) {
             try {
                 JSONObject trackObj = tracksArray.getJSONObject(i);
-                String trackId = trackObj.optString("track_id", "");
+                String originalTrackId = trackObj.optString("track_id", "");
                 
                 // Generate track ID if missing or empty
-                if (trackId == null || trackId.trim().isEmpty()) {
-                    trackId = "Track_" + (i + 1);
-                    System.err.println("Warning: Track at index " + i + " has no track_id, assigned: " + trackId);
+                if (originalTrackId == null || originalTrackId.trim().isEmpty()) {
+                    originalTrackId = "Track" + (i + 1);
+                    System.err.println("Warning: Track at index " + i + " has no track_id, assigned: " + originalTrackId);
+                }
+                
+                // Renumber track if keeping existing tracks
+                // Use "Track" + number (no underscore) to match the app's naming convention
+                String trackId;
+                if (keepExistingTracks) {
+                    trackId = "Track" + nextNewTrackNum;
+                    nextNewTrackNum++;
+                } else {
+                    trackId = originalTrackId;
                 }
                 
                 // Import color (rich format only, or use default)
@@ -19445,6 +21109,154 @@ public class VideoAnnotationTool {
         return constrainedPoints;
     }
     
+    // =============================================
+    // Modern Toolbar UI Components
+    // =============================================
+    
+    /**
+     * Creates a compact toolbar button with icon and hover effects.
+     */
+    private JButton createToolbarButton(String text, String iconType, String tooltip) {
+        JButton button = new JButton(text) {
+            @Override
+            protected void paintComponent(Graphics g) {
+                Graphics2D g2d = (Graphics2D) g.create();
+                g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                
+                if (getModel().isPressed()) {
+                    g2d.setColor(new Color(25, 25, 28));
+                } else if (getModel().isRollover()) {
+                    g2d.setColor(SURFACE_HOVER);
+                } else {
+                    g2d.setColor(getBackground());
+                }
+                g2d.fillRoundRect(0, 0, getWidth(), getHeight(), 6, 6);
+                g2d.dispose();
+                
+                super.paintComponent(g);
+            }
+        };
+        button.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+        button.setForeground(TEXT_PRIMARY);
+        button.setBackground(new Color(45, 45, 50));
+        button.setBorder(BorderFactory.createEmptyBorder(5, 10, 5, 10));
+        button.setFocusPainted(false);
+        button.setContentAreaFilled(false);
+        button.setOpaque(false);
+        button.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        button.setToolTipText(tooltip);
+        
+        // Fixed sizes based on content to prevent layout shifts
+        // Account for icon width (18px) when iconType is present
+        int iconWidth = (iconType != null) ? 18 : 0;
+        int textWidth = text.length() * 9;  // ~9px per character for comfortable fit
+        int padding = 24;  // Left + right padding
+        int width = Math.max(40, textWidth + iconWidth + padding);
+        
+        Dimension fixedSize = new Dimension(width, 28);
+        button.setMinimumSize(fixedSize);
+        button.setPreferredSize(fixedSize);
+        button.setMaximumSize(fixedSize);
+        
+        if (iconType != null) {
+            ImageIcon icon = createProgrammaticIcon(iconType, 14, 14);
+            if (icon != null) {
+                button.setIcon(icon);
+                button.setHorizontalTextPosition(SwingConstants.RIGHT);
+                button.setIconTextGap(4);
+            }
+        }
+        
+        return button;
+    }
+    
+    /**
+     * Creates a grouped panel for toolbar sections with a subtle label.
+     */
+    private JPanel createToolbarGroup(String label) {
+        JPanel group = new JPanel() {
+            @Override
+            protected void paintComponent(Graphics g) {
+                Graphics2D g2d = (Graphics2D) g.create();
+                g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                // Subtle rounded background
+                g2d.setColor(new Color(40, 40, 45, 120));
+                g2d.fillRoundRect(0, 0, getWidth(), getHeight(), 8, 8);
+                g2d.dispose();
+            }
+        };
+        group.setLayout(new BoxLayout(group, BoxLayout.X_AXIS));
+        group.setOpaque(false);
+        group.setBorder(BorderFactory.createEmptyBorder(2, 6, 2, 6));
+        
+        // Add tiny label at top (using HTML for multi-line effect isn't needed here)
+        // Instead we'll just use the group visually
+        return group;
+    }
+    
+    /**
+     * Creates a vertical divider for toolbar sections.
+     */
+    private JPanel createToolbarDivider() {
+        JPanel divider = new JPanel() {
+            @Override
+            protected void paintComponent(Graphics g) {
+                Graphics2D g2d = (Graphics2D) g.create();
+                g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                int x = getWidth() / 2;
+                // Gradient fade from transparent to visible to transparent
+                g2d.setColor(new Color(80, 80, 85, 60));
+                g2d.drawLine(x, 4, x, getHeight() - 4);
+                g2d.dispose();
+            }
+            
+            @Override
+            public Dimension getPreferredSize() {
+                return new Dimension(8, 32);
+            }
+            
+            @Override
+            public Dimension getMaximumSize() {
+                return new Dimension(8, 32);
+            }
+        };
+        divider.setOpaque(false);
+        return divider;
+    }
+    
+    /**
+     * Creates a compact text field for toolbar use.
+     */
+    private JTextField createCompactTextField(String text, int columns) {
+        JTextField field = new JTextField(text, columns) {
+            @Override
+            protected void paintComponent(Graphics g) {
+                Graphics2D g2d = (Graphics2D) g.create();
+                g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                g2d.setColor(getBackground());
+                g2d.fillRoundRect(0, 0, getWidth(), getHeight(), 4, 4);
+                g2d.dispose();
+                super.paintComponent(g);
+            }
+        };
+        field.setFont(new Font("Consolas", Font.PLAIN, 11));
+        field.setBackground(new Color(35, 35, 40));
+        field.setForeground(ACCENT_BLUE);
+        field.setCaretColor(ACCENT_BLUE);
+        field.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
+        field.setOpaque(false);
+        field.setHorizontalAlignment(JTextField.CENTER);
+        
+        // Set fixed size based on columns to prevent expansion in BoxLayout
+        int width = columns * 8 + 12;  // ~8px per character + padding
+        Dimension fixedSize = new Dimension(width, 24);
+        field.setPreferredSize(fixedSize);
+        field.setMaximumSize(fixedSize);
+        field.setMinimumSize(fixedSize);
+        
+        return field;
+    }
+    
     // Modern UI Helper Methods
     private JButton createStyledButton(String text) {
         return createStyledButton(text, null);
@@ -19547,6 +21359,270 @@ public class VideoAnnotationTool {
                 button.setForeground(TEXT_PRIMARY);
             }
         });
+    }
+    
+    /**
+     * Apply modern dark-themed styling to a scroll pane.
+     * Creates thin, rounded scrollbars that match the app's aesthetic.
+     */
+    private void styleScrollPane(JScrollPane scrollPane) {
+        scrollPane.setBorder(null);
+        scrollPane.getViewport().setBackground(SECONDARY_DARK);
+        
+        // Style vertical scrollbar
+        JScrollBar verticalBar = scrollPane.getVerticalScrollBar();
+        verticalBar.setUI(new ModernScrollBarUI());
+        verticalBar.setUnitIncrement(16);
+        verticalBar.setPreferredSize(new Dimension(10, 0));
+        
+        // Style horizontal scrollbar
+        JScrollBar horizontalBar = scrollPane.getHorizontalScrollBar();
+        horizontalBar.setUI(new ModernScrollBarUI());
+        horizontalBar.setUnitIncrement(16);
+        horizontalBar.setPreferredSize(new Dimension(0, 10));
+    }
+    
+    /**
+     * Modern scroll bar UI with thin, rounded thumb and minimal track.
+     */
+    private class ModernScrollBarUI extends javax.swing.plaf.basic.BasicScrollBarUI {
+        private final int THUMB_SIZE = 8;
+        private final int TRACK_PADDING = 2;
+        private final Color THUMB_COLOR = new Color(90, 90, 100);
+        private final Color THUMB_HOVER_COLOR = new Color(120, 120, 135);
+        private final Color TRACK_COLOR = new Color(35, 35, 40);
+        private boolean isThumbHovered = false;
+        
+        @Override
+        protected void configureScrollBarColors() {
+            this.thumbColor = THUMB_COLOR;
+            this.trackColor = TRACK_COLOR;
+        }
+        
+        @Override
+        protected JButton createDecreaseButton(int orientation) {
+            return createInvisibleButton();
+        }
+        
+        @Override
+        protected JButton createIncreaseButton(int orientation) {
+            return createInvisibleButton();
+        }
+        
+        private JButton createInvisibleButton() {
+            JButton button = new JButton();
+            button.setPreferredSize(new Dimension(0, 0));
+            button.setMinimumSize(new Dimension(0, 0));
+            button.setMaximumSize(new Dimension(0, 0));
+            return button;
+        }
+        
+        @Override
+        protected void installListeners() {
+            super.installListeners();
+            // Add hover detection for thumb
+            scrollbar.addMouseMotionListener(new MouseMotionAdapter() {
+                @Override
+                public void mouseMoved(MouseEvent e) {
+                    boolean wasHovered = isThumbHovered;
+                    isThumbHovered = getThumbBounds().contains(e.getPoint());
+                    if (wasHovered != isThumbHovered) {
+                        scrollbar.repaint();
+                    }
+                }
+            });
+            scrollbar.addMouseListener(new MouseAdapter() {
+                @Override
+                public void mouseExited(MouseEvent e) {
+                    if (isThumbHovered) {
+                        isThumbHovered = false;
+                        scrollbar.repaint();
+                    }
+                }
+            });
+        }
+        
+        @Override
+        protected void paintTrack(Graphics g, JComponent c, Rectangle trackBounds) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            g2.setColor(TRACK_COLOR);
+            g2.fillRect(trackBounds.x, trackBounds.y, trackBounds.width, trackBounds.height);
+            g2.dispose();
+        }
+        
+        @Override
+        protected void paintThumb(Graphics g, JComponent c, Rectangle thumbBounds) {
+            if (thumbBounds.isEmpty() || !scrollbar.isEnabled()) {
+                return;
+            }
+            
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            
+            // Calculate thumb dimensions with padding
+            int x, y, width, height;
+            if (scrollbar.getOrientation() == JScrollBar.VERTICAL) {
+                x = thumbBounds.x + TRACK_PADDING;
+                y = thumbBounds.y;
+                width = THUMB_SIZE;
+                height = thumbBounds.height;
+            } else {
+                x = thumbBounds.x;
+                y = thumbBounds.y + TRACK_PADDING;
+                width = thumbBounds.width;
+                height = THUMB_SIZE;
+            }
+            
+            // Draw rounded thumb
+            g2.setColor(isThumbHovered || isDragging ? THUMB_HOVER_COLOR : THUMB_COLOR);
+            g2.fillRoundRect(x, y, width, height, THUMB_SIZE, THUMB_SIZE);
+            
+            g2.dispose();
+        }
+        
+        @Override
+        protected Dimension getMinimumThumbSize() {
+            if (scrollbar.getOrientation() == JScrollBar.VERTICAL) {
+                return new Dimension(THUMB_SIZE, 30);
+            }
+            return new Dimension(30, THUMB_SIZE);
+        }
+    }
+    
+    /**
+     * Modern split pane divider UI with thin, styled appearance.
+     */
+    private class ModernSplitPaneDividerUI extends javax.swing.plaf.basic.BasicSplitPaneUI {
+        @Override
+        public javax.swing.plaf.basic.BasicSplitPaneDivider createDefaultDivider() {
+            return new ModernSplitPaneDivider(this);
+        }
+    }
+    
+    private class ModernSplitPaneDivider extends javax.swing.plaf.basic.BasicSplitPaneDivider {
+        private final Color DIVIDER_COLOR = new Color(50, 50, 55);
+        private final Color DIVIDER_HOVER_COLOR = new Color(70, 70, 80);
+        private final Color GRIP_COLOR = new Color(90, 90, 100);
+        private final Color GRIP_HOVER_COLOR = ACCENT_BLUE;
+        private boolean isHovered = false;
+        
+        public ModernSplitPaneDivider(javax.swing.plaf.basic.BasicSplitPaneUI ui) {
+            super(ui);
+            setBackground(DIVIDER_COLOR);
+            
+            addMouseListener(new MouseAdapter() {
+                @Override
+                public void mouseEntered(MouseEvent e) {
+                    isHovered = true;
+                    setCursor(Cursor.getPredefinedCursor(
+                        splitPane.getOrientation() == JSplitPane.HORIZONTAL_SPLIT 
+                            ? Cursor.E_RESIZE_CURSOR : Cursor.N_RESIZE_CURSOR));
+                    repaint();
+                }
+                @Override
+                public void mouseExited(MouseEvent e) {
+                    isHovered = false;
+                    repaint();
+                }
+            });
+        }
+        
+        @Override
+        public void paint(Graphics g) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            
+            // Background
+            g2.setColor(isHovered ? DIVIDER_HOVER_COLOR : DIVIDER_COLOR);
+            g2.fillRect(0, 0, getWidth(), getHeight());
+            
+            // Draw grip dots in the center
+            g2.setColor(isHovered ? GRIP_HOVER_COLOR : GRIP_COLOR);
+            int dotSize = 3;
+            int gap = 5;
+            
+            if (splitPane.getOrientation() == JSplitPane.HORIZONTAL_SPLIT) {
+                // Vertical dots for horizontal split
+                int cx = getWidth() / 2;
+                int cy = getHeight() / 2;
+                for (int i = -2; i <= 2; i++) {
+                    g2.fillOval(cx - dotSize/2, cy + i * gap - dotSize/2, dotSize, dotSize);
+                }
+            } else {
+                // Horizontal dots for vertical split
+                int cx = getWidth() / 2;
+                int cy = getHeight() / 2;
+                for (int i = -2; i <= 2; i++) {
+                    g2.fillOval(cx + i * gap - dotSize/2, cy - dotSize/2, dotSize, dotSize);
+                }
+            }
+            
+            g2.dispose();
+        }
+        
+        @Override
+        protected JButton createLeftOneTouchButton() {
+            return createOneTouchButton(true);
+        }
+        
+        @Override
+        protected JButton createRightOneTouchButton() {
+            return createOneTouchButton(false);
+        }
+        
+        private JButton createOneTouchButton(boolean isLeft) {
+            JButton button = new JButton() {
+                @Override
+                public void paint(Graphics g) {
+                    Graphics2D g2 = (Graphics2D) g.create();
+                    g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                    
+                    // Draw small arrow
+                    g2.setColor(GRIP_COLOR);
+                    int[] xPoints, yPoints;
+                    int s = 6; // arrow size
+                    int cx = getWidth() / 2;
+                    int cy = getHeight() / 2;
+                    
+                    if (splitPane.getOrientation() == JSplitPane.HORIZONTAL_SPLIT) {
+                        if (isLeft) {
+                            xPoints = new int[]{cx + s/2, cx - s/2, cx + s/2};
+                            yPoints = new int[]{cy - s/2, cy, cy + s/2};
+                        } else {
+                            xPoints = new int[]{cx - s/2, cx + s/2, cx - s/2};
+                            yPoints = new int[]{cy - s/2, cy, cy + s/2};
+                        }
+                    } else {
+                        if (isLeft) {
+                            xPoints = new int[]{cx - s/2, cx, cx + s/2};
+                            yPoints = new int[]{cy + s/2, cy - s/2, cy + s/2};
+                        } else {
+                            xPoints = new int[]{cx - s/2, cx, cx + s/2};
+                            yPoints = new int[]{cy - s/2, cy + s/2, cy - s/2};
+                        }
+                    }
+                    g2.fillPolygon(xPoints, yPoints, 3);
+                    g2.dispose();
+                }
+            };
+            button.setMinimumSize(new Dimension(8, 8));
+            button.setPreferredSize(new Dimension(8, 8));
+            button.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            button.setFocusPainted(false);
+            button.setBorderPainted(false);
+            button.setContentAreaFilled(false);
+            return button;
+        }
+    }
+    
+    /**
+     * Apply modern styling to a split pane with custom divider.
+     */
+    private void styleSplitPane(JSplitPane splitPane) {
+        splitPane.setUI(new ModernSplitPaneDividerUI());
+        splitPane.setBorder(null);
+        splitPane.setDividerSize(8);
     }
     
     // Styled text field for dark theme
@@ -19669,13 +21745,20 @@ public class VideoAnnotationTool {
                 break;
                 
             case "flow":
-                // Flow/wave icon
-                g2d.setStroke(new BasicStroke(2.0f));
-                // Wave lines
-                g2d.drawArc(2, 4, 6, 6, 0, 180);
-                g2d.drawArc(8, 4, 6, 6, 0, 180);
-                g2d.drawArc(2, 8, 6, 6, 180, 180);
-                g2d.drawArc(8, 8, 6, 6, 180, 180);
+                // Flow/wave icon - simplified to avoid clipping
+                g2d.setStroke(new BasicStroke(1.5f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                // Draw wavy lines
+                int[] x1 = {3, 5, 7, 9, 11};
+                int[] y1 = {8, 5, 8, 5, 8};
+                for (int i = 0; i < x1.length - 1; i++) {
+                    g2d.drawLine(x1[i], y1[i], x1[i + 1], y1[i + 1]);
+                }
+                // Second wave
+                int[] x2 = {3, 5, 7, 9, 11};
+                int[] y2 = {10, 7, 10, 7, 10};
+                for (int i = 0; i < x2.length - 1; i++) {
+                    g2d.drawLine(x2[i], y2[i], x2[i + 1], y2[i + 1]);
+                }
                 break;
                 
             default:
@@ -19730,6 +21813,290 @@ public class VideoAnnotationTool {
                 return size;
             }
         };
+    }
+    
+    /**
+     * Creates the cursor controls overlay panel (positioned top-left of video).
+     * Contains cursor size slider, circle, opaque, and persistent checkboxes.
+     * Semi-transparent background that fades when mouse is not hovering.
+     */
+    private JPanel createCursorOverlayPanel() {
+        JPanel panel = new JPanel() {
+            private float alpha = 0.6f;
+            
+            @Override
+            protected void paintComponent(Graphics g) {
+                Graphics2D g2d = (Graphics2D) g.create();
+                g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                g2d.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, alpha));
+                g2d.setColor(new Color(30, 30, 35));
+                g2d.fillRoundRect(0, 0, getWidth(), getHeight(), 8, 8);
+                g2d.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, alpha * 0.8f));
+                g2d.setColor(BORDER_DARK);
+                g2d.setStroke(new BasicStroke(1));
+                g2d.drawRoundRect(0, 0, getWidth() - 1, getHeight() - 1, 8, 8);
+                g2d.dispose();
+            }
+            
+            public void setAlpha(float a) {
+                this.alpha = a;
+                repaint();
+            }
+            
+            public float getAlpha() {
+                return alpha;
+            }
+        };
+        panel.setOpaque(false);
+        panel.setLayout(new FlowLayout(FlowLayout.LEFT, 4, 4));
+        panel.setBorder(BorderFactory.createEmptyBorder(2, 6, 2, 6));
+        
+        // Cursor size label
+        JLabel cursorLabel = new JLabel("Cursor");
+        cursorLabel.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+        cursorLabel.setForeground(TEXT_SECONDARY);
+        panel.add(cursorLabel);
+        
+        // Cursor size slider (1-25 maps to 3x3 to 51x51)
+        int initialSliderValue = (hoverCursorSize - 1) / 2;
+        cursorSizeSlider = new JSlider(1, 25, initialSliderValue);
+        cursorSizeSlider.setPreferredSize(new Dimension(70, 18));
+        cursorSizeSlider.setMaximumSize(new Dimension(70, 18));
+        cursorSizeSlider.setOpaque(false);
+        cursorSizeSlider.setToolTipText("Cursor size (3x3 to 51x51)");
+        panel.add(cursorSizeSlider);
+        
+        // Cursor size value label
+        cursorSizeValueLabel = new JLabel(hoverCursorSize + "");
+        cursorSizeValueLabel.setFont(new Font("Consolas", Font.PLAIN, 10));
+        cursorSizeValueLabel.setForeground(ACCENT_BLUE);
+        cursorSizeValueLabel.setPreferredSize(new Dimension(22, 16));
+        panel.add(cursorSizeValueLabel);
+        
+        // Add small separator
+        JLabel sep1 = new JLabel("|");
+        sep1.setForeground(BORDER_DARK);
+        panel.add(sep1);
+        
+        // Circle checkbox (compact)
+        circleCheckbox = new JCheckBox("○");
+        circleCheckbox.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+        circleCheckbox.setForeground(TEXT_SECONDARY);
+        circleCheckbox.setOpaque(false);
+        circleCheckbox.setSelected(cursorCircleMode);
+        circleCheckbox.setToolTipText("Circle shape");
+        circleCheckbox.setMargin(new Insets(0, 0, 0, 0));
+        panel.add(circleCheckbox);
+        
+        // Opaque checkbox (compact)
+        opaqueCheckbox = new JCheckBox("●");
+        opaqueCheckbox.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+        opaqueCheckbox.setForeground(TEXT_SECONDARY);
+        opaqueCheckbox.setOpaque(false);
+        opaqueCheckbox.setSelected(cursorOpaqueMode);
+        opaqueCheckbox.setToolTipText("Filled/Opaque");
+        opaqueCheckbox.setMargin(new Insets(0, 0, 0, 0));
+        panel.add(opaqueCheckbox);
+        
+        // Persistent checkbox (compact)
+        persistentCheckbox = new JCheckBox("∀");
+        persistentCheckbox.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+        persistentCheckbox.setForeground(TEXT_SECONDARY);
+        persistentCheckbox.setOpaque(false);
+        persistentCheckbox.setSelected(cursorPersistentMode);
+        persistentCheckbox.setToolTipText("Apply to all tracks");
+        persistentCheckbox.setMargin(new Insets(0, 0, 0, 0));
+        panel.add(persistentCheckbox);
+        
+        // Wire up the slider
+        cursorSizeSlider.addChangeListener(e -> {
+            hoverCursorSize = cursorSizeSlider.getValue() * 2 + 1;
+            cursorSizeValueLabel.setText(hoverCursorSize + "");
+            imageLabel.repaint();
+        });
+        
+        // Wire up checkboxes
+        circleCheckbox.addActionListener(e -> {
+            cursorCircleMode = circleCheckbox.isSelected();
+            imageLabel.repaint();
+        });
+        
+        opaqueCheckbox.addActionListener(e -> {
+            cursorOpaqueMode = opaqueCheckbox.isSelected();
+            imageLabel.repaint();
+        });
+        
+        persistentCheckbox.addActionListener(e -> {
+            cursorPersistentMode = persistentCheckbox.isSelected();
+            imageLabel.repaint();
+        });
+        
+        // Fade effect on hover
+        panel.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseEntered(MouseEvent e) {
+                try {
+                    java.lang.reflect.Method setAlpha = panel.getClass().getMethod("setAlpha", float.class);
+                    setAlpha.invoke(panel, 0.95f);
+                } catch (Exception ex) { /* ignore */ }
+            }
+            
+            @Override
+            public void mouseExited(MouseEvent e) {
+                try {
+                    java.lang.reflect.Method setAlpha = panel.getClass().getMethod("setAlpha", float.class);
+                    setAlpha.invoke(panel, 0.6f);
+                } catch (Exception ex) { /* ignore */ }
+            }
+        });
+        
+        return panel;
+    }
+    
+    /**
+     * Creates the zoom controls overlay panel (positioned bottom-right of video).
+     * Contains pixel value display and zoom controls (level, -, +, Fit, 1:1).
+     * Semi-transparent background that fades when mouse is not hovering.
+     */
+    private JPanel createZoomOverlayPanel() {
+        JPanel panel = new JPanel() {
+            private float alpha = 0.6f;
+            
+            @Override
+            protected void paintComponent(Graphics g) {
+                Graphics2D g2d = (Graphics2D) g.create();
+                g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                g2d.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, alpha));
+                g2d.setColor(new Color(30, 30, 35));
+                g2d.fillRoundRect(0, 0, getWidth(), getHeight(), 8, 8);
+                g2d.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, alpha * 0.8f));
+                g2d.setColor(BORDER_DARK);
+                g2d.setStroke(new BasicStroke(1));
+                g2d.drawRoundRect(0, 0, getWidth() - 1, getHeight() - 1, 8, 8);
+                g2d.dispose();
+            }
+            
+            public void setAlpha(float a) {
+                this.alpha = a;
+                repaint();
+            }
+            
+            public float getAlpha() {
+                return alpha;
+            }
+        };
+        panel.setOpaque(false);
+        panel.setLayout(new FlowLayout(FlowLayout.RIGHT, 4, 4));
+        panel.setBorder(BorderFactory.createEmptyBorder(2, 6, 2, 6));
+        
+        // Pixel value display
+        pixelValueLabel = new JLabel("Pixel: N/A");
+        pixelValueLabel.setFont(new Font("Consolas", Font.PLAIN, 10));
+        pixelValueLabel.setForeground(ACCENT_BLUE);
+        pixelValueLabel.setPreferredSize(new Dimension(120, 16));
+        panel.add(pixelValueLabel);
+        
+        // Small separator
+        JLabel sep = new JLabel("|");
+        sep.setForeground(BORDER_DARK);
+        panel.add(sep);
+        
+        // Zoom out button
+        zoomOutButton = createCompactButton("-", "Zoom out (Ctrl+scroll down)");
+        zoomOutButton.addActionListener(e -> {
+            if (currentImage == null) return;
+            Point center = new Point(imageLabel.getWidth() / 2, imageLabel.getHeight() / 2);
+            zoomCenteredAt(center, 0.8);
+            updateZoomLabel();
+        });
+        panel.add(zoomOutButton);
+        
+        // Zoom level label
+        zoomLabel = new JLabel("100%");
+        zoomLabel.setFont(new Font("Consolas", Font.BOLD, 10));
+        zoomLabel.setForeground(ACCENT_BLUE);
+        zoomLabel.setPreferredSize(new Dimension(40, 16));
+        zoomLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        zoomLabel.setToolTipText("Current zoom level");
+        panel.add(zoomLabel);
+        
+        // Zoom in button
+        zoomInButton = createCompactButton("+", "Zoom in (Ctrl+scroll up)");
+        zoomInButton.addActionListener(e -> {
+            if (currentImage == null) return;
+            Point center = new Point(imageLabel.getWidth() / 2, imageLabel.getHeight() / 2);
+            zoomCenteredAt(center, 1.25);
+            updateZoomLabel();
+        });
+        panel.add(zoomInButton);
+        
+        // Fit button
+        zoomFitButton = createCompactButton("Fit", "Fit image to window");
+        zoomFitButton.addActionListener(e -> {
+            if (currentImage == null) return;
+            fitImageToWindow();
+            updateZoomLabel();
+        });
+        panel.add(zoomFitButton);
+        
+        // 1:1 button
+        zoomResetButton = createCompactButton("1:1", "Reset to 100% zoom");
+        zoomResetButton.addActionListener(e -> {
+            if (currentImage == null) return;
+            resetZoomToActual();
+            updateZoomLabel();
+        });
+        panel.add(zoomResetButton);
+        
+        // Fade effect on hover
+        panel.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseEntered(MouseEvent e) {
+                try {
+                    java.lang.reflect.Method setAlpha = panel.getClass().getMethod("setAlpha", float.class);
+                    setAlpha.invoke(panel, 0.95f);
+                } catch (Exception ex) { /* ignore */ }
+            }
+            
+            @Override
+            public void mouseExited(MouseEvent e) {
+                try {
+                    java.lang.reflect.Method setAlpha = panel.getClass().getMethod("setAlpha", float.class);
+                    setAlpha.invoke(panel, 0.6f);
+                } catch (Exception ex) { /* ignore */ }
+            }
+        });
+        
+        return panel;
+    }
+    
+    /**
+     * Creates a compact button for overlay panels.
+     */
+    private JButton createCompactButton(String text, String tooltip) {
+        JButton button = new JButton(text);
+        button.setFont(new Font("Segoe UI", Font.BOLD, 10));
+        button.setForeground(TEXT_PRIMARY);
+        button.setBackground(SECONDARY_DARK);
+        button.setBorder(BorderFactory.createEmptyBorder(2, 6, 2, 6));
+        button.setFocusPainted(false);
+        button.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        button.setToolTipText(tooltip);
+        button.setOpaque(true);
+        
+        button.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseEntered(MouseEvent e) {
+                button.setBackground(SURFACE_HOVER);
+            }
+            
+            @Override
+            public void mouseExited(MouseEvent e) {
+                button.setBackground(SECONDARY_DARK);
+            }
+        });
+        
+        return button;
     }
     
     private JLabel createStyledLabel(String text) {
@@ -19808,10 +22175,11 @@ public class VideoAnnotationTool {
         });
         
         browseBtn.addActionListener(e -> {
-            JFileChooser chooser = new JFileChooser();
+            // Start from repo directory by default
+            JFileChooser chooser = new JFileChooser(getApplicationDirectory());
             chooser.setDialogTitle(dialogTitle);
             
-            // Set initial directory from current text field value
+            // Set initial directory from current text field value (overrides default if valid)
             String currentPath = textField.getText().trim();
             if (!currentPath.isEmpty() && !currentPath.startsWith("{")) {
                 File currentFile = new File(currentPath);
@@ -20046,9 +22414,44 @@ public class VideoAnnotationTool {
         return icon;
     }
     
-    // Create styled file chooser with dark theme
+    /**
+     * Get the application's base directory (repo/installation directory).
+     * This is used as the default starting directory for file operations.
+     */
+    private File getApplicationDirectory() {
+        try {
+            // Get the location of the class files
+            java.net.URL classUrl = VideoAnnotationTool.class.getProtectionDomain()
+                .getCodeSource().getLocation();
+            File location = new File(classUrl.toURI());
+            
+            // If running from JAR, start from the directory containing the JAR
+            if (location.isFile() && location.getName().endsWith(".jar")) {
+                location = location.getParentFile();
+            }
+            
+            // Search upward for project root (contains pom.xml)
+            File current = location;
+            while (current != null) {
+                File pomFile = new File(current, "pom.xml");
+                if (pomFile.exists()) {
+                    return current; // Found the project root
+                }
+                current = current.getParentFile();
+            }
+            
+            return location;
+        } catch (Exception e) {
+            // Fall through to default
+        }
+        
+        // Fallback to current working directory
+        return new File(System.getProperty("user.dir"));
+    }
+    
+    // Create styled file chooser with dark theme, starting from repo directory
     private JFileChooser createStyledFileChooser() {
-        JFileChooser chooser = new JFileChooser();
+        JFileChooser chooser = new JFileChooser(getApplicationDirectory());
         styleFileChooser(chooser);
         return chooser;
     }

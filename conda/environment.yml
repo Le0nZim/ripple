@@ -13,11 +13,13 @@
 
 name: ripple-env
 channels:
+  - conda-forge
   - defaults
 dependencies:
   - python=3.11
   - pip>=25.0
   - setuptools>=80.0
+  - ffmpeg>=6.0
   - wheel>=0.45
   - pip:
       # Core scientific computing
