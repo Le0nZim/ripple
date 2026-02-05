@@ -5,6 +5,10 @@ dist/
 *.jar
 !lib/*.jar
 
+# ==== Auto-generated scripts ====
+RIPPLE.bat
+RIPPLE.sh
+
 # ==== Java ====
 *.class
 *.log
