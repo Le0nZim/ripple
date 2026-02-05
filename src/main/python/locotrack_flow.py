@@ -620,6 +620,7 @@ class LocoTrackModelManager:
         if weights_path is None:
             weights_file = f"locotrack_{model_size}.ckpt"
             candidates = [
+                os.path.join(RIPPLE_ROOT, "locotrack_pytorch", "weights", weights_file),
                 os.path.join(RIPPLE_ROOT, "models", "weights", weights_file),
                 os.path.join(RIPPLE_ROOT, "locotrack", "weights", weights_file),
                 os.path.join(RIPPLE_ROOT, "src", "main", "locotrack", "weights", weights_file),
