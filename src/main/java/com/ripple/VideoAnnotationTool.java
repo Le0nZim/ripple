@@ -29,7 +29,6 @@ import java.nio.file.Paths;
 import javax.swing.Timer;
 import java.util.*;
 import java.util.List;
-import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -806,6 +805,8 @@ public class VideoAnnotationTool {
 
     private JPanel annotationPanel;
     private JScrollPane annotationScrollPane;  // Scroll pane for track list (for programmatic scrolling)
+    private JTextArea promptInputArea; // Free-form notes for video / tracks
+    private JScrollPane promptScrollPane; // Scroll pane for notes editor
     private int rowHeight = 30;
 
     private Timer playTimer;
@@ -13674,7 +13675,66 @@ public class VideoAnnotationTool {
         styleScrollPane(annotationScrollPane);
         
         annotationSection.add(headerPanel, BorderLayout.NORTH);
-        annotationSection.add(annotationScrollPane, BorderLayout.CENTER);
+
+        // Center container stacks the tracks list and a notes editor beneath it
+        JPanel centerContainer = new JPanel(new BorderLayout());
+        centerContainer.setOpaque(false);
+        centerContainer.add(annotationScrollPane, BorderLayout.CENTER);
+
+        // Notes editor panel (beneath tracks)
+        promptInputArea = new JTextArea(6, 20);
+        promptInputArea.setLineWrap(true);
+        promptInputArea.setWrapStyleWord(true);
+        promptInputArea.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        promptInputArea.setForeground(TEXT_PRIMARY);
+        promptInputArea.setBackground(new Color(38, 38, 44));
+        promptInputArea.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8));
+
+        promptScrollPane = new JScrollPane(promptInputArea);
+        promptScrollPane.setBorder(BorderFactory.createTitledBorder(null, "SCRIPT PROMPT", 0, 0,
+            new Font("Segoe UI", Font.BOLD, 12), TEXT_PRIMARY));
+        promptScrollPane.setOpaque(false);
+        promptScrollPane.getViewport().setOpaque(false);
+        styleScrollPane(promptScrollPane);
+
+        // Small wrapper to visually separate notes area from tracks
+        JPanel promptWrapper = new JPanel(new BorderLayout());
+        promptWrapper.setOpaque(false);
+        promptWrapper.setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 8));
+        promptWrapper.add(promptScrollPane, BorderLayout.CENTER);
+
+        // Submit button panel below the prompt area
+        JPanel promptButtonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 6));
+        promptButtonPanel.setOpaque(false);
+        final JButton promptSubmitBtn = createAccentButton("Submit Prompt", null);
+        promptSubmitBtn.setToolTipText("Submit script prompt for generation");
+        promptSubmitBtn.addActionListener(e -> {
+            String text = promptInputArea.getText();
+            generateTrackingScript(text);
+        });
+        promptButtonPanel.add(promptSubmitBtn);
+        promptWrapper.add(promptButtonPanel, BorderLayout.SOUTH);
+
+        // Enter key submits the prompt; Shift+Enter inserts a newline
+        InputMap im = promptInputArea.getInputMap(JComponent.WHEN_FOCUSED);
+        ActionMap am = promptInputArea.getActionMap();
+        im.put(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0), "submitPrompt");
+        im.put(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, InputEvent.SHIFT_DOWN_MASK), "insertNewline");
+        am.put("submitPrompt", new AbstractAction() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                promptSubmitBtn.doClick();
+            }
+        });
+        am.put("insertNewline", new AbstractAction() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                promptInputArea.append("\n");
+            }
+        });
+
+        centerContainer.add(promptWrapper, BorderLayout.SOUTH);
+        annotationSection.add(centerContainer, BorderLayout.CENTER);
         
         // Bottom optimization button panel
         JPanel optimizationButtonPanel = new JPanel(new FlowLayout(FlowLayout.CENTER, 10, 10)) {
@@ -13867,6 +13927,14 @@ public class VideoAnnotationTool {
         });
         
         return combo;
+    }
+
+    /**
+     * Called when the user submits a script prompt. Implement script generation here.
+     * @param prompt The text entered by the user
+     */
+    private void generateTrackingScript(String prompt) {
+        System.out.println("[DEBUG] Tracking script prompt submitted: '" + prompt + "'");
     }
     
     /**
