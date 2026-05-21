@@ -2,6 +2,32 @@
 
 A hybrid Java/Python application for video annotation and particle tracking in biological microscopy.
 
+## 🎬 Demos
+
+A small selection of demo videos is embedded below. The **complete set** (app demos, RIPPLE vs. full manual annotation comparisons, deep-learning tracker failures, and SLEAP results) is available in the companion Google Drive folder:
+
+📁 **[Full demo collection on Google Drive](https://drive.google.com/drive/folders/186gzAZ_zwIbH4ug-lEKC2fDDzT9ss4Yr?usp=sharing)**
+
+### App demo — neural-activity dataset
+
+A walkthrough of the RIPPLE annotation workflow on a neural-activity microscopy video.
+
+<video src="https://github.com/Le0nZim/ripple/raw/main/demo_videos/app_demo_neural.mp4" controls width="720"></video>
+
+### RIPPLE vs. full manual annotation — freely-moving dataset
+
+Overlay of RIPPLE predictions (squares) vs. ground-truth manual annotations (circles); line length encodes per-frame error. One color per matched track pair.
+
+<video src="https://github.com/Le0nZim/ripple/raw/main/demo_videos/ripple_vs_manual_freely.mp4" controls width="720"></video>
+
+### Deep-learning tracker failure — freely-moving dataset
+
+LocoTrack predictions on the same freely-moving dataset, illustrating typical failure modes of a state-of-the-art deep-learning point tracker on biological microscopy data.
+
+<video src="https://github.com/Le0nZim/ripple/raw/main/demo_videos/dl_tracker_failure_freely.mp4" controls width="720"></video>
+
+> The Google Drive folder also contains companion `tracks.xlsx` files with the raw matched coordinates and per-dataset `README.txt` files describing the visual encoding and frame counts.
+
 ## 🚀 Quick Start
 
 ### Prerequisites
