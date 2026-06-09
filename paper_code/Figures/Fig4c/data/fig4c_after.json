@@ -1,0 +1,10 @@
+{
+ "comment": "AFTER (GT-anchor flow-blend) APP. Produced by re-running flow-blend interpolation with the manual GT coordinates substituted at each RIPPLE anchor frame; requires the per-dataset optical-flow volumes (15+ GB, not in source_data). Shipped as a checkpoint.",
+ "after": {
+  "Neural Activity": 97.0,
+  "Pinned Down": 96.2,
+  "Freely": 79.76,
+  "Sperm": 62.71,
+  "Homeostasis": 65.08
+ }
+}

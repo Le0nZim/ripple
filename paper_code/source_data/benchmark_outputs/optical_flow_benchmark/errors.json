@@ -1,0 +1,170 @@
+[
+  {
+    "algorithm": "tv_raft_large",
+    "dataset": "pinned",
+    "error": "ValueError: Feature maps are too small to be down-sampled by the correlation pyramid. H and W of feature maps should be at least 16; got: torch.Size([13, 13]). Remember that input images to the model are downsampled by 8, so that means their dimensions should be at least 8 * 16 = 128.",
+    "timestamp": "2026-03-21 16:48:19"
+  },
+  {
+    "algorithm": "tv_raft_small",
+    "dataset": "pinned",
+    "error": "ValueError: Feature maps are too small to be down-sampled by the correlation pyramid. H and W of feature maps should be at least 16; got: torch.Size([13, 13]). Remember that input images to the model are downsampled by 8, so that means their dimensions should be at least 8 * 16 = 128.",
+    "timestamp": "2026-03-21 16:48:19"
+  },
+  {
+    "algorithm": "ptl_flowformer",
+    "dataset": "pinned",
+    "error": "RuntimeError: The expanded size of the tensor (128) must match the existing size (960) at non-singleton dimension 2.  Target sizes: [1, 432, 128].  Tensor sizes: [432, 960]",
+    "timestamp": "2026-03-21 16:58:47"
+  },
+  {
+    "algorithm": "ptl_flowformer_pp",
+    "dataset": "pinned",
+    "error": "RuntimeError: The expanded size of the tensor (128) must match the existing size (960) at non-singleton dimension 2.  Target sizes: [1, 432, 128].  Tensor sizes: [432, 960]",
+    "timestamp": "2026-03-21 16:58:51"
+  },
+  {
+    "algorithm": "ptl_separableflow",
+    "dataset": "pinned",
+    "error": "ValueError: Problem with given class_path 'ptlflow.models.separableflow.separableflow.separableflow':\n  ERROR: Could not import libs.GANet required for SeparableFlow. Go to ptlflow/models/separableflow/ and then install GANet by running: bash compile.sh",
+    "timestamp": "2026-03-21 18:12:29"
+  },
+  {
+    "algorithm": "ptl_matchflow",
+    "dataset": "pinned",
+    "error": "ValueError: Problem with given class_path 'ptlflow.models.matchflow.matchflow.matchflow':\n  QuadTreeAttention is not compiled for matchflow! Please follow the instruction at ptlflow/models/matchflow/README.md",
+    "timestamp": "2026-03-21 18:20:09"
+  },
+  {
+    "algorithm": "ptl_streamflow",
+    "dataset": "pinned",
+    "error": "RuntimeError: Given groups=1, weight of size [576, 384, 1, 1], expected input[1, 128, 16, 16] to have 384 channels, but got 128 channels instead",
+    "timestamp": "2026-03-21 18:23:55"
+  },
+  {
+    "algorithm": "ptl_dicl",
+    "dataset": "pinned",
+    "error": "RuntimeError: The expanded size of the tensor (1) must match the existing size (0) at non-singleton dimension 2.  Target sizes: [1, 32, 1, 0].  Tensor sizes: [32, 0, 1]",
+    "timestamp": "2026-03-21 18:45:18"
+  },
+  {
+    "algorithm": "ptl_flowformer",
+    "dataset": "neural",
+    "error": "RuntimeError: The expanded size of the tensor (320) must match the existing size (960) at non-singleton dimension 2.  Target sizes: [1, 432, 320].  Tensor sizes: [432, 960]",
+    "timestamp": "2026-03-21 23:11:47"
+  },
+  {
+    "algorithm": "ptl_flowformer_pp",
+    "dataset": "neural",
+    "error": "RuntimeError: The expanded size of the tensor (320) must match the existing size (960) at non-singleton dimension 2.  Target sizes: [1, 432, 320].  Tensor sizes: [432, 960]",
+    "timestamp": "2026-03-21 23:11:49"
+  },
+  {
+    "algorithm": "ptl_separableflow",
+    "dataset": "neural",
+    "error": "ValueError: Problem with given class_path 'ptlflow.models.separableflow.separableflow.separableflow':\n  ERROR: Could not import libs.GANet required for SeparableFlow. Go to ptlflow/models/separableflow/ and then install GANet by running: bash compile.sh",
+    "timestamp": "2026-03-22 02:54:25"
+  },
+  {
+    "algorithm": "ptl_matchflow",
+    "dataset": "neural",
+    "error": "ValueError: Problem with given class_path 'ptlflow.models.matchflow.matchflow.matchflow':\n  QuadTreeAttention is not compiled for matchflow! Please follow the instruction at ptlflow/models/matchflow/README.md",
+    "timestamp": "2026-03-22 03:24:41"
+  },
+  {
+    "algorithm": "ptl_streamflow",
+    "dataset": "neural",
+    "error": "RuntimeError: Given groups=1, weight of size [576, 384, 1, 1], expected input[1, 128, 80, 80] to have 384 channels, but got 128 channels instead",
+    "timestamp": "2026-03-22 03:38:37"
+  },
+  {
+    "algorithm": "dense_rlof",
+    "dataset": "sperm",
+    "error": "error: OpenCV(4.13.0) /io/opencv_contrib/modules/ximgproc/src/sparse_match_interpolators.cpp:204: error: (-215:Assertion failed) match_num<SHRT_MAX in function 'interpolate'\n",
+    "timestamp": "2026-03-22 06:27:38"
+  },
+  {
+    "algorithm": "simpleflow",
+    "dataset": "sperm",
+    "error": "ValueError: cannot convert float NaN to integer",
+    "timestamp": "2026-03-22 06:52:50"
+  },
+  {
+    "algorithm": "ptl_craft",
+    "dataset": "sperm",
+    "error": "OutOfMemoryError: CUDA out of memory. Tried to allocate 6.25 GiB. GPU 0 has a total capacity of 23.46 GiB of which 6.03 GiB is free. Including non-PyTorch memory, this process has 17.42 GiB memory in use. Of the allocated memory 12.25 GiB is allocated by PyTorch, and 4.81 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)",
+    "timestamp": "2026-03-22 13:52:36"
+  },
+  {
+    "algorithm": "ptl_separableflow",
+    "dataset": "sperm",
+    "error": "ValueError: Problem with given class_path 'ptlflow.models.separableflow.separableflow.separableflow':\n  ERROR: Could not import libs.GANet required for SeparableFlow. Go to ptlflow/models/separableflow/ and then install GANet by running: bash compile.sh",
+    "timestamp": "2026-03-22 15:30:58"
+  },
+  {
+    "algorithm": "ptl_matchflow",
+    "dataset": "sperm",
+    "error": "ValueError: Problem with given class_path 'ptlflow.models.matchflow.matchflow.matchflow':\n  QuadTreeAttention is not compiled for matchflow! Please follow the instruction at ptlflow/models/matchflow/README.md",
+    "timestamp": "2026-03-22 15:53:45"
+  },
+  {
+    "algorithm": "ptl_streamflow",
+    "dataset": "sperm",
+    "error": "RuntimeError: Given groups=1, weight of size [576, 384, 1, 1], expected input[1, 128, 128, 160] to have 384 channels, but got 128 channels instead",
+    "timestamp": "2026-03-22 16:00:55"
+  },
+  {
+    "algorithm": "dense_rlof",
+    "dataset": "freely",
+    "error": "error: OpenCV(4.13.0) /io/opencv_contrib/modules/ximgproc/src/sparse_match_interpolators.cpp:204: error: (-215:Assertion failed) match_num<SHRT_MAX in function 'interpolate'\n",
+    "timestamp": "2026-03-22 17:39:53"
+  },
+  {
+    "algorithm": "ptl_craft",
+    "dataset": "freely",
+    "error": "OutOfMemoryError: CUDA out of memory. Tried to allocate 6.25 GiB. GPU 0 has a total capacity of 23.46 GiB of which 6.03 GiB is free. Including non-PyTorch memory, this process has 17.42 GiB memory in use. Of the allocated memory 12.25 GiB is allocated by PyTorch, and 4.81 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)",
+    "timestamp": "2026-03-23 01:04:04"
+  },
+  {
+    "algorithm": "ptl_separableflow",
+    "dataset": "freely",
+    "error": "ValueError: Problem with given class_path 'ptlflow.models.separableflow.separableflow.separableflow':\n  ERROR: Could not import libs.GANet required for SeparableFlow. Go to ptlflow/models/separableflow/ and then install GANet by running: bash compile.sh",
+    "timestamp": "2026-03-23 02:17:25"
+  },
+  {
+    "algorithm": "ptl_matchflow",
+    "dataset": "freely",
+    "error": "ValueError: Problem with given class_path 'ptlflow.models.matchflow.matchflow.matchflow':\n  QuadTreeAttention is not compiled for matchflow! Please follow the instruction at ptlflow/models/matchflow/README.md",
+    "timestamp": "2026-03-23 02:37:51"
+  },
+  {
+    "algorithm": "ptl_streamflow",
+    "dataset": "freely",
+    "error": "RuntimeError: Given groups=1, weight of size [576, 384, 1, 1], expected input[1, 128, 128, 160] to have 384 channels, but got 128 channels instead",
+    "timestamp": "2026-03-23 02:43:56"
+  },
+  {
+    "algorithm": "ptl_craft",
+    "dataset": "regen",
+    "error": "OutOfMemoryError: CUDA out of memory. Tried to allocate 6.41 GiB. GPU 0 has a total capacity of 23.46 GiB of which 5.61 GiB is free. Including non-PyTorch memory, this process has 17.84 GiB memory in use. Of the allocated memory 12.54 GiB is allocated by PyTorch, and 4.95 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)",
+    "timestamp": "2026-03-23 08:27:41"
+  },
+  {
+    "algorithm": "ptl_separableflow",
+    "dataset": "regen",
+    "error": "ValueError: Problem with given class_path 'ptlflow.models.separableflow.separableflow.separableflow':\n  ERROR: Could not import libs.GANet required for SeparableFlow. Go to ptlflow/models/separableflow/ and then install GANet by running: bash compile.sh",
+    "timestamp": "2026-03-23 09:14:40"
+  },
+  {
+    "algorithm": "ptl_matchflow",
+    "dataset": "regen",
+    "error": "ValueError: Problem with given class_path 'ptlflow.models.matchflow.matchflow.matchflow':\n  QuadTreeAttention is not compiled for matchflow! Please follow the instruction at ptlflow/models/matchflow/README.md",
+    "timestamp": "2026-03-23 09:27:14"
+  },
+  {
+    "algorithm": "ptl_streamflow",
+    "dataset": "regen",
+    "error": "RuntimeError: Given groups=1, weight of size [576, 384, 1, 1], expected input[1, 128, 144, 144] to have 384 channels, but got 128 channels instead",
+    "timestamp": "2026-03-23 09:31:11"
+  }
+]

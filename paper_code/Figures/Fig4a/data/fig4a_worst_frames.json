@@ -1,0 +1,174 @@
+{
+ "datasets": {
+  "Neural Activity": {
+   "Track1": {
+    "seg_id": 1,
+    "worst_frame": 223,
+    "dist": 5.66
+   },
+   "Track2": {
+    "seg_id": 2,
+    "worst_frame": 7,
+    "dist": 1.0
+   },
+   "Track3": {
+    "seg_id": 3,
+    "worst_frame": 0,
+    "dist": 1.0
+   },
+   "Track4": {
+    "seg_id": 4,
+    "worst_frame": 44,
+    "dist": 1.0
+   },
+   "Track5": {
+    "seg_id": 5,
+    "worst_frame": 12,
+    "dist": 2.24
+   },
+   "Track6": {
+    "seg_id": 6,
+    "worst_frame": 95,
+    "dist": 1.0
+   },
+   "Track7": {
+    "seg_id": 7,
+    "worst_frame": 0,
+    "dist": 0.0
+   },
+   "Track8": {
+    "seg_id": 8,
+    "worst_frame": 0,
+    "dist": 0.0
+   },
+   "Track9": {
+    "seg_id": 9,
+    "worst_frame": 65,
+    "dist": 1.0
+   },
+   "Track10": {
+    "seg_id": 10,
+    "worst_frame": 11,
+    "dist": 1.0
+   }
+  },
+  "Pinned Down": {
+   "Track1": {
+    "seg_id": 1,
+    "worst_frame": 91,
+    "dist": 1.41
+   },
+   "Track2": {
+    "seg_id": 2,
+    "worst_frame": 242,
+    "dist": 1.41
+   },
+   "Track3": {
+    "seg_id": 3,
+    "worst_frame": 59,
+    "dist": 1.41
+   }
+  },
+  "Freely": {
+   "Track1": {
+    "seg_id": 1,
+    "worst_frame": 27,
+    "dist": 3.16
+   },
+   "Track2": {
+    "seg_id": 2,
+    "worst_frame": 47,
+    "dist": 5.0
+   },
+   "Track3": {
+    "seg_id": 3,
+    "worst_frame": 141,
+    "dist": 2.83
+   }
+  },
+  "Sperm": {
+   "Track1": {
+    "seg_id": 1,
+    "worst_frame": 71,
+    "dist": 7.07
+   },
+   "Track2": {
+    "seg_id": 2,
+    "worst_frame": 377,
+    "dist": 69.2
+   },
+   "Track3": {
+    "seg_id": 3,
+    "worst_frame": 246,
+    "dist": 72.67
+   },
+   "Track4": {
+    "seg_id": 4,
+    "worst_frame": 18,
+    "dist": 8.06
+   },
+   "Track5": {
+    "seg_id": 5,
+    "worst_frame": 161,
+    "dist": 90.05
+   },
+   "Track6": {
+    "seg_id": 6,
+    "worst_frame": 214,
+    "dist": 78.52
+   }
+  },
+  "Homeostasis": {
+   "Track1": {
+    "seg_id": "Track1",
+    "worst_frame": 8,
+    "dist": 5.1
+   },
+   "Track2": {
+    "seg_id": "Track2",
+    "worst_frame": 16,
+    "dist": 4.12
+   },
+   "Track3": {
+    "seg_id": "Track3",
+    "worst_frame": 3,
+    "dist": 2.24
+   },
+   "Track4": {
+    "seg_id": "Track4",
+    "worst_frame": 4,
+    "dist": 42.06
+   },
+   "Track5": {
+    "seg_id": "Track5",
+    "worst_frame": 13,
+    "dist": 3.0
+   },
+   "Track6": {
+    "seg_id": "Track6",
+    "worst_frame": 47,
+    "dist": 5.1
+   },
+   "Track7": {
+    "seg_id": "Track7",
+    "worst_frame": 47,
+    "dist": 2.0
+   },
+   "Track8": {
+    "seg_id": "Track8",
+    "worst_frame": 0,
+    "dist": 2.24
+   },
+   "Track9": {
+    "seg_id": "Track9",
+    "worst_frame": 0,
+    "dist": 2.0
+   },
+   "Track10": {
+    "seg_id": "Track10",
+    "worst_frame": 22,
+    "dist": 3.61
+   }
+  }
+ }
+}

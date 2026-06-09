@@ -1,0 +1,10 @@
+PLACEHOLDER — manual-segmentation mask not included in this repository.
+
+File: segmentation_id03.nrrd
+
+This NRRD segmentation volume exceeds GitHub's 100 MB per-file limit, so it is not
+committed here. It can be provided by communicating with the authors (see the
+contact details in the top-level README.md and source_data/README.md).
+
+To use it: obtain the file from the authors and place it here with this exact
+name (without the ".PLACEHOLDER" suffix), then run the relevant generate_data.py.

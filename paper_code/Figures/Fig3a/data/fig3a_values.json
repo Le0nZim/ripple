@@ -1,0 +1,29 @@
+{
+ "datasets": {
+  "Neural Activity": {
+   "total_gt_frames": 4000,
+   "total_anchors": 158,
+   "avg_app": 97.975
+  },
+  "Pinned Down": {
+   "total_gt_frames": 1199,
+   "total_anchors": 116,
+   "avg_app": 96.93077564637198
+  },
+  "Freely": {
+   "total_gt_frames": 1008,
+   "total_anchors": 352,
+   "avg_app": 75.5952380952381
+  },
+  "Sperm": {
+   "total_gt_frames": 1847,
+   "total_anchors": 529,
+   "avg_app": 25.165132647536545
+  },
+  "Homeostasis": {
+   "total_gt_frames": 480,
+   "total_anchors": 47,
+   "avg_app": 64.08333333333334
+  }
+ }
+}

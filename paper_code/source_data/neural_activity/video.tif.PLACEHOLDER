@@ -1,0 +1,10 @@
+PLACEHOLDER — source video not included in this repository.
+
+File: video.tif
+
+The raw video / image-volume files are not redistributed here due to their size.
+They can be provided by communicating with the authors (see the contact details
+in the top-level README.md and source_data/README.md).
+
+To use it: obtain the file from the authors and place it here with this exact
+name (without the ".PLACEHOLDER" suffix), then run the relevant generate_data.py.

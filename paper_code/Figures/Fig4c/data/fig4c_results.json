@@ -1,0 +1,39 @@
+{
+ "datasets": {
+  "Neural Activity": {
+   "gt_frames": 4000,
+   "anchor_count": 158,
+   "before": 97.97,
+   "after": 97.0,
+   "delta": -0.97
+  },
+  "Pinned Down": {
+   "gt_frames": 1199,
+   "anchor_count": 116,
+   "before": 96.93,
+   "after": 96.2,
+   "delta": -0.73
+  },
+  "Freely": {
+   "gt_frames": 1008,
+   "anchor_count": 352,
+   "before": 75.6,
+   "after": 79.76,
+   "delta": 4.16
+  },
+  "Sperm": {
+   "gt_frames": 1847,
+   "anchor_count": 529,
+   "before": 25.17,
+   "after": 62.71,
+   "delta": 37.54
+  },
+  "Homeostasis": {
+   "gt_frames": 480,
+   "anchor_count": 47,
+   "before": 64.08,
+   "after": 65.08,
+   "delta": 1.0
+  }
+ }
+}
