@@ -21,6 +21,20 @@ records, per anchor frame, the ground-truth and RIPPLE coordinates (needs the
 NRRD/JSON annotations in `source_data/`). `reproduce_fig4b.py` computes the
 distances and draws the panels (needs only `numpy`/`matplotlib`).
 
+## Panels (`results/`)
+
+| File | Description |
+|------|-------------|
+| `disagreement_box_log.svg` | box + strip, **log** y-axis (the published panel) |
+| `disagreement_cdf_log.svg` | CDF, **log** x-axis (the published panel) |
+| `disagreement_box.svg` | box + strip, linear y-axis |
+| `disagreement_cdf.svg` | CDF, linear x-axis |
+
+The published figure uses the **log-scale** panels, because the disagreement
+spans sub-pixel (Neural/Pinned) to ~25 px (Sperm). Zeros are clamped to 0.1 px
+(box) / 0.05 px (CDF) so they remain visible on the log axis. The linear panels
+are kept for reference.
+
 ## Values
 
 | Dataset | n | median (px) | mean (px) |
