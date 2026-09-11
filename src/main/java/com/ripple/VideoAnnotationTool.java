@@ -342,11 +342,12 @@ public class VideoAnnotationTool {
     private static Color ACCENT_GREEN = new Color(52, 168, 83);       // Success/positive
     private static Color ACCENT_RED = new Color(234, 67, 53);         // Delete/negative
     private static Color ACCENT_ORANGE = new Color(255, 152, 0);      // Object occlusion
-    private static Color ACCENT_YELLOW = new Color(251, 188, 4);      // Warning/attention
+    private static Color ACCENT_YELLOW = new Color(251, 188, 4);      // Warning/attention / low-quality tracking
 
     // Occlusion type constants
     private static final int OCCLUSION_OUT_OF_PLANE = 0;  // Out of plane - no educated guess possible (red, X marker)
     private static final int OCCLUSION_OBJECT = 1;        // Object occlusion - overlapping objects (orange, + marker)
+    private static final int OCCLUSION_LOW_QUALITY = 2;   // Low-quality tracking (yellow, circle marker)
     private static Color TEXT_PRIMARY_COLOR;
     private static Color TEXT_SECONDARY_COLOR;
     private static Color TEXT_DISABLED_COLOR;
@@ -729,7 +730,7 @@ public class VideoAnnotationTool {
     // Occlusion segments state (for LocoTrack fine-tuning)
     // Stores OCCLUSION segments (frames where object is NOT visible)
     // Each segment is an int[3] array: [startFrame, endFrame, type] inclusive (0-indexed)
-    // type: 0 = OCCLUSION_OUT_OF_PLANE (out of plane), 1 = OCCLUSION_OBJECT (object occlusion)
+    // type: 0 = OCCLUSION_OUT_OF_PLANE, 1 = OCCLUSION_OBJECT, 2 = OCCLUSION_LOW_QUALITY
     // Frames INSIDE these segments are occluded; frames OUTSIDE are visible
     // Legacy int[2] arrays (no type) are treated as OCCLUSION_OUT_OF_PLANE for backward compatibility
     private final Map<String, List<int[]>> trackOcclusionSegments = new HashMap<>();  // List of [start, end, type] occlusion segments
@@ -2097,8 +2098,9 @@ public class VideoAnnotationTool {
             "Track range: Frame " + (minFrame + 1) + " to " + (maxFrame + 1) + "\n" +
             "(" + (maxFrame - minFrame + 1) + " frames total)\n\n" +
             "Occlusion segments mark frames where the object is temporarily\n" +
-            "not visible (e.g., behind another object or out of frame).\n\n" +
-            "If the object is always visible, click No to mark complete.",
+            "not visible (e.g., behind another object or out of frame),\n" +
+            "or where tracking quality is too low to trust.\n\n" +
+            "If the object is always visible and the track is reliable, click No to mark complete.",
             "Mark Occlusion Segments?",
             JOptionPane.YES_NO_CANCEL_OPTION,
             JOptionPane.QUESTION_MESSAGE);
@@ -2802,7 +2804,7 @@ public class VideoAnnotationTool {
         imageLabel.repaint();
         refreshAnnotationList();
         
-        setStatus("Occlusion mode: Mark frames where object becomes occluded (hidden). Green = visible, Red = out-of-plane, Orange = object occlusion.");
+        setStatus("Occlusion mode: Mark frames where object is occluded or tracking is unreliable. Green = visible, Red = out-of-plane, Orange = object occlusion, Yellow = low-quality tracking.");
     }
     
     /**
@@ -2839,20 +2841,20 @@ public class VideoAnnotationTool {
         trackLabel.setForeground(TEXT_PRIMARY);
         
         // Occlusion type dropdown
-        occlusionModeTypeCombo = new JComboBox<>(new String[]{"Out of Plane", "Object Occlusion"});
+        occlusionModeTypeCombo = new JComboBox<>(new String[]{"Out of Plane", "Object Occlusion", "Low-Quality Tracking"});
         occlusionModeTypeCombo.setSelectedIndex(occlusionModeSelectedType);
         occlusionModeTypeCombo.setFont(new Font("Segoe UI", Font.PLAIN, 11));
         occlusionModeTypeCombo.setBackground(PANEL_DARK);
         occlusionModeTypeCombo.setForeground(TEXT_PRIMARY);
         occlusionModeTypeCombo.setFocusable(false);
         occlusionModeTypeCombo.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
-        occlusionModeTypeCombo.setToolTipText("Select occlusion type: Out of Plane (no trajectory guess possible) or Object Occlusion (overlapping objects)");
-        occlusionModeTypeCombo.setPreferredSize(new Dimension(140, 24));
+        occlusionModeTypeCombo.setToolTipText("Select occlusion type: Out of Plane (no trajectory guess possible), Object Occlusion (overlapping objects), or Low-Quality Tracking (unreliable track to exclude from analysis)");
+        occlusionModeTypeCombo.setPreferredSize(new Dimension(190, 24));
         occlusionModeTypeCombo.addActionListener(e -> {
             occlusionModeSelectedType = occlusionModeTypeCombo.getSelectedIndex();
             // Update Start button color to match selected type
             if (occlusionModePendingStart < 0 && occlusionModeAddButton != null) {
-                occlusionModeAddButton.setBackground(occlusionModeSelectedType == OCCLUSION_OBJECT ? ACCENT_ORANGE : new Color(180, 80, 80));
+                occlusionModeAddButton.setBackground(occlusionTypeButtonColor(occlusionModeSelectedType));
             }
         });
 
@@ -2871,7 +2873,7 @@ public class VideoAnnotationTool {
         
         // Start/End Occlusion Segment button - changes state based on pending segment
         occlusionModeAddButton = new JButton("Start Occlusion");
-        occlusionModeAddButton.setBackground(occlusionModeSelectedType == OCCLUSION_OBJECT ? ACCENT_ORANGE : new Color(180, 80, 80));  // Color matches type
+        occlusionModeAddButton.setBackground(occlusionTypeButtonColor(occlusionModeSelectedType));  // Color matches type
         occlusionModeAddButton.setForeground(Color.WHITE);
         occlusionModeAddButton.setFocusPainted(false);
         occlusionModeAddButton.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
@@ -2997,7 +2999,7 @@ public class VideoAnnotationTool {
             
             // Update button appearance
             occlusionModeAddButton.setText("Start Occlusion");
-            occlusionModeAddButton.setBackground(occlusionModeSelectedType == OCCLUSION_OBJECT ? ACCENT_ORANGE : new Color(180, 80, 80));
+            occlusionModeAddButton.setBackground(occlusionTypeButtonColor(occlusionModeSelectedType));
             occlusionModeAddButton.setToolTipText("Mark current frame as start of occlusion (object disappears)");
             
             updateOcclusionModeInfoLabel();
@@ -3017,12 +3019,15 @@ public class VideoAnnotationTool {
         int occludedFrames = 0;
         int oopFrames = 0;
         int objFrames = 0;
+        int lqFrames = 0;
         for (int[] seg : occlusionModeSegments) {
             int segFrames = seg[1] - seg[0] + 1;
             occludedFrames += segFrames;
             int segType = seg.length >= 3 ? seg[2] : OCCLUSION_OUT_OF_PLANE;
             if (segType == OCCLUSION_OBJECT) {
                 objFrames += segFrames;
+            } else if (segType == OCCLUSION_LOW_QUALITY) {
+                lqFrames += segFrames;
             } else {
                 oopFrames += segFrames;
             }
@@ -3042,9 +3047,20 @@ public class VideoAnnotationTool {
             occlusionModeInfoLabel.setForeground(ACCENT_GREEN);
         } else {
             text.append(occlusionModeSegments.size()).append(" segment(s): ");
-            if (oopFrames > 0) text.append(oopFrames).append(" OoP");
-            if (oopFrames > 0 && objFrames > 0) text.append(", ");
-            if (objFrames > 0) text.append(objFrames).append(" Obj");
+            boolean needComma = false;
+            if (oopFrames > 0) {
+                text.append(oopFrames).append(" ").append(occlusionTypeShortLabel(OCCLUSION_OUT_OF_PLANE));
+                needComma = true;
+            }
+            if (objFrames > 0) {
+                if (needComma) text.append(", ");
+                text.append(objFrames).append(" ").append(occlusionTypeShortLabel(OCCLUSION_OBJECT));
+                needComma = true;
+            }
+            if (lqFrames > 0) {
+                if (needComma) text.append(", ");
+                text.append(lqFrames).append(" ").append(occlusionTypeShortLabel(OCCLUSION_LOW_QUALITY));
+            }
             text.append(" hidden, ").append(visibleFrames).append(" visible");
             occlusionModeInfoLabel.setText(text.toString());
             occlusionModeInfoLabel.setForeground(ACCENT_YELLOW);
@@ -3072,7 +3088,7 @@ public class VideoAnnotationTool {
         if (foundIdx < 0) {
             JOptionPane.showMessageDialog(frame,
                 "Current frame is not inside an occlusion segment.\n\n" +
-                "Navigate to a frame within an occlusion segment (shown in red or orange) to remove it.",
+                "Navigate to a frame within an occlusion segment (shown in red, orange, or yellow) to remove it.",
                 "No Segment at Current Frame",
                 JOptionPane.INFORMATION_MESSAGE);
             return;
@@ -3162,7 +3178,7 @@ public class VideoAnnotationTool {
     /**
      * Calculate the number of occluded frames of a specific type for a track.
      * @param trackId The track ID
-     * @param type OCCLUSION_OUT_OF_PLANE or OCCLUSION_OBJECT
+     * @param type OCCLUSION_OUT_OF_PLANE, OCCLUSION_OBJECT, or OCCLUSION_LOW_QUALITY
      * @return number of frames with the given occlusion type
      */
     private int calculateOccludedFramesByType(String trackId, int type) {
@@ -3248,7 +3264,7 @@ public class VideoAnnotationTool {
      * 
      * @param trackId The track ID
      * @param frame The frame number (0-indexed)
-     * @return OCCLUSION_OUT_OF_PLANE (0) or OCCLUSION_OBJECT (1), or -1 if not occluded
+     * @return OCCLUSION_OUT_OF_PLANE (0), OCCLUSION_OBJECT (1), OCCLUSION_LOW_QUALITY (2), or -1 if not occluded
      */
     private int getOcclusionType(String trackId, int frame) {
         List<int[]> segments = trackOcclusionSegments.get(trackId);
@@ -3262,6 +3278,66 @@ public class VideoAnnotationTool {
             }
         }
         return -1;  // Frame is outside all occlusion segments (visible)
+    }
+
+    /** JSON type string for an occlusion constant. Unknown ints serialize as out_of_plane. */
+    private static String occlusionTypeToJson(int type) {
+        if (type == OCCLUSION_OBJECT) return "object";
+        if (type == OCCLUSION_LOW_QUALITY) return "low_quality";
+        return "out_of_plane";
+    }
+
+    /**
+     * Parse a JSON occlusion type string.
+     * Missing/unknown values default to out_of_plane for backward compatibility.
+     */
+    private static int occlusionTypeFromJson(String typeStr) {
+        if (typeStr != null && "object".equalsIgnoreCase(typeStr)) return OCCLUSION_OBJECT;
+        if (typeStr != null && "low_quality".equalsIgnoreCase(typeStr)) return OCCLUSION_LOW_QUALITY;
+        return OCCLUSION_OUT_OF_PLANE;
+    }
+
+    /** Slider / indicator color for an occlusion type. */
+    private static Color occlusionTypeColor(int type) {
+        if (type == OCCLUSION_OBJECT) return ACCENT_ORANGE;
+        if (type == OCCLUSION_LOW_QUALITY) return ACCENT_YELLOW;
+        return ACCENT_RED;
+    }
+
+    /** Start-button fill that keeps white label text readable. */
+    private static Color occlusionTypeButtonColor(int type) {
+        if (type == OCCLUSION_OBJECT) return ACCENT_ORANGE;
+        if (type == OCCLUSION_LOW_QUALITY) return new Color(190, 140, 10);
+        return new Color(180, 80, 80);
+    }
+
+    private static String occlusionTypeShortLabel(int type) {
+        if (type == OCCLUSION_OBJECT) return "Obj";
+        if (type == OCCLUSION_LOW_QUALITY) return "LQ";
+        return "OoP";
+    }
+
+    private static Color occlusionTypeBadgeColor(int type) {
+        if (type == OCCLUSION_OBJECT) return new Color(160, 110, 40);
+        if (type == OCCLUSION_LOW_QUALITY) return new Color(160, 130, 30);
+        return new Color(150, 60, 50);
+    }
+
+    /** X = out-of-plane, + = object occlusion, circle = low-quality tracking. */
+    private static void drawOcclusionMarkerShape(Graphics2D g2d, int occMarkerType,
+                                                int xLeft, int xRight, int xTop, int xBottom,
+                                                int xMidX, int xMidY) {
+        if (occMarkerType == OCCLUSION_OBJECT) {
+            g2d.drawLine(xMidX, xTop, xMidX, xBottom);
+            g2d.drawLine(xLeft, xMidY, xRight, xMidY);
+        } else if (occMarkerType == OCCLUSION_LOW_QUALITY) {
+            int w = Math.max(4, xRight - xLeft);
+            int h = Math.max(4, xBottom - xTop);
+            g2d.drawOval(xLeft, xTop, w, h);
+        } else {
+            g2d.drawLine(xLeft, xTop, xRight, xBottom);
+            g2d.drawLine(xLeft, xBottom, xRight, xTop);
+        }
     }
 
     /**
@@ -3506,7 +3582,7 @@ public class VideoAnnotationTool {
                     segObj.put("start", seg[0]);
                     segObj.put("end", seg[1]);
                     int type = seg.length >= 3 ? seg[2] : OCCLUSION_OUT_OF_PLANE;
-                    segObj.put("type", type == OCCLUSION_OBJECT ? "object" : "out_of_plane");
+                    segObj.put("type", occlusionTypeToJson(type));
                     segmentsArray.put(segObj);
                 }
                 trackObj.put("occlusion_segments", segmentsArray);
@@ -4849,7 +4925,7 @@ public class VideoAnnotationTool {
                                 }
                                 
                                 // Draw occlusion marker for occluded frames
-                                // X = out-of-plane, + = object occlusion
+                                // X = out-of-plane, + = object occlusion, circle = low-quality tracking
                                 {
                                     int occMarkerType = getOcclusionType(trackId, currentSlice - 1);
                                     if (occMarkerType >= 0) {
@@ -4865,26 +4941,12 @@ public class VideoAnnotationTool {
                                         g2d.setColor(new Color(0, 0, 0, 180));
                                         g2d.setStroke(new BasicStroke(Math.max(4.0f, (float)(pixelWidth / 1.5)), 
                                                                        BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
-                                        if (occMarkerType == OCCLUSION_OBJECT) {
-                                            // + marker for object occlusion
-                                            g2d.drawLine(xMidX, xTop, xMidX, xBottom);
-                                            g2d.drawLine(xLeft, xMidY, xRight, xMidY);
-                                        } else {
-                                            // X marker for out-of-plane
-                                            g2d.drawLine(xLeft, xTop, xRight, xBottom);
-                                            g2d.drawLine(xLeft, xBottom, xRight, xTop);
-                                        }
+                                        drawOcclusionMarkerShape(g2d, occMarkerType, xLeft, xRight, xTop, xBottom, xMidX, xMidY);
                                         // Draw marker in track color on top
                                         g2d.setColor(color);
                                         g2d.setStroke(new BasicStroke(Math.max(2.0f, (float)(pixelWidth / 2.0)), 
                                                                        BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
-                                        if (occMarkerType == OCCLUSION_OBJECT) {
-                                            g2d.drawLine(xMidX, xTop, xMidX, xBottom);
-                                            g2d.drawLine(xLeft, xMidY, xRight, xMidY);
-                                        } else {
-                                            g2d.drawLine(xLeft, xTop, xRight, xBottom);
-                                            g2d.drawLine(xLeft, xBottom, xRight, xTop);
-                                        }
+                                        drawOcclusionMarkerShape(g2d, occMarkerType, xLeft, xRight, xTop, xBottom, xMidX, xMidY);
                                     }
                                 }
                             } else {
@@ -4892,7 +4954,7 @@ public class VideoAnnotationTool {
                                 g2d.fillRect(screenX, screenY, screenPixelW, screenPixelH);
                                 
                                 // Draw occlusion marker for non-selected tracks (scaled to cursor size)
-                                // X = out-of-plane, + = object occlusion
+                                // X = out-of-plane, + = object occlusion, circle = low-quality tracking
                                 {
                                     int occMarkerType = getOcclusionType(trackId, currentSlice - 1);
                                     if (occMarkerType >= 0) {
@@ -4923,24 +4985,12 @@ public class VideoAnnotationTool {
                                         g2d.setColor(new Color(0, 0, 0, 180));
                                         g2d.setStroke(new BasicStroke(Math.max(3.0f, (float)(pixelWidth / 2.0)), 
                                                                        BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
-                                        if (occMarkerType == OCCLUSION_OBJECT) {
-                                            g2d.drawLine(xMidX, xTop, xMidX, xBottom);
-                                            g2d.drawLine(xLeft, xMidY, xRight, xMidY);
-                                        } else {
-                                            g2d.drawLine(xLeft, xTop, xRight, xBottom);
-                                            g2d.drawLine(xLeft, xBottom, xRight, xTop);
-                                        }
+                                        drawOcclusionMarkerShape(g2d, occMarkerType, xLeft, xRight, xTop, xBottom, xMidX, xMidY);
                                         // Draw marker in track color
                                         g2d.setColor(color);
                                         g2d.setStroke(new BasicStroke(Math.max(1.5f, (float)(pixelWidth / 3.0)), 
                                                                        BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
-                                        if (occMarkerType == OCCLUSION_OBJECT) {
-                                            g2d.drawLine(xMidX, xTop, xMidX, xBottom);
-                                            g2d.drawLine(xLeft, xMidY, xRight, xMidY);
-                                        } else {
-                                            g2d.drawLine(xLeft, xTop, xRight, xBottom);
-                                            g2d.drawLine(xLeft, xBottom, xRight, xTop);
-                                        }
+                                        drawOcclusionMarkerShape(g2d, occMarkerType, xLeft, xRight, xTop, xBottom, xMidX, xMidY);
                                     }
                                 }
                             }
@@ -5370,12 +5420,12 @@ public class VideoAnnotationTool {
                     g2.setColor(new Color(ACCENT_GREEN.getRed(), ACCENT_GREEN.getGreen(), ACCENT_GREEN.getBlue(), 120));
                     g2.fillRoundRect(rangeMinX, trackY - 6, rangeMaxX - rangeMinX, 12, 6, 6);
                     
-                    // Draw occlusion segments (color varies by type: RED for out-of-plane, ORANGE for object)
+                    // Draw occlusion segments (RED out-of-plane, ORANGE object, YELLOW low-quality)
                     for (int[] seg : occlusionModeSegments) {
                         int segStart = seg[0] + 1;  // Convert to 1-indexed
                         int segEnd = seg[1] + 1;
                         int segType = seg.length >= 3 ? seg[2] : OCCLUSION_OUT_OF_PLANE;
-                        Color segColor = segType == OCCLUSION_OBJECT ? ACCENT_ORANGE : ACCENT_RED;
+                        Color segColor = occlusionTypeColor(segType);
                         
                         double segStartRatio = (double)(segStart - getMinimum()) / Math.max(1, getMaximum() - getMinimum());
                         double segEndRatio = (double)(segEnd - getMinimum()) / Math.max(1, getMaximum() - getMinimum());
@@ -5397,7 +5447,7 @@ public class VideoAnnotationTool {
                     if (occlusionModePendingStart >= 0) {
                         int pendingStart = occlusionModePendingStart + 1;  // Convert to 1-indexed
                         int currentFrame = getValue();
-                        Color pendingColor = occlusionModeSelectedType == OCCLUSION_OBJECT ? ACCENT_ORANGE : ACCENT_RED;
+                        Color pendingColor = occlusionTypeColor(occlusionModeSelectedType);
                         
                         double pendingStartRatio = (double)(pendingStart - getMinimum()) / Math.max(1, getMaximum() - getMinimum());
                         double currentRatio = (double)(currentFrame - getMinimum()) / Math.max(1, getMaximum() - getMinimum());
@@ -5437,8 +5487,8 @@ public class VideoAnnotationTool {
                         }
                     }
                     
-                    // Draw current frame indicator (green if visible, red if OoP, orange if object occlusion)
-                    Color indicatorColor = occType < 0 ? ACCENT_GREEN : (occType == OCCLUSION_OBJECT ? ACCENT_ORANGE : ACCENT_RED);
+                    // Draw current frame indicator (green if visible, otherwise type color)
+                    Color indicatorColor = occType < 0 ? ACCENT_GREEN : occlusionTypeColor(occType);
                     g2.setColor(indicatorColor);
                     g2.setStroke(new BasicStroke(1));
                     g2.fillOval(currentX - 7, trackY - 9, 14, 18);
@@ -14930,13 +14980,21 @@ public class VideoAnnotationTool {
             // Occlusion badges (separate counts per type)
             int oopFrames = calculateOccludedFramesByType(trackId, OCCLUSION_OUT_OF_PLANE);
             int objFrames = calculateOccludedFramesByType(trackId, OCCLUSION_OBJECT);
+            int lqFrames = calculateOccludedFramesByType(trackId, OCCLUSION_LOW_QUALITY);
             if (oopFrames > 0) {
-                JLabel oopBadge = createInfoBadge("👁 " + oopFrames + " OoP", new Color(150, 60, 50));
+                JLabel oopBadge = createInfoBadge("👁 " + oopFrames + " " + occlusionTypeShortLabel(OCCLUSION_OUT_OF_PLANE),
+                        occlusionTypeBadgeColor(OCCLUSION_OUT_OF_PLANE));
                 infoRow.add(oopBadge);
             }
             if (objFrames > 0) {
-                JLabel objBadge = createInfoBadge("👁 " + objFrames + " Obj", new Color(160, 110, 40));
+                JLabel objBadge = createInfoBadge("👁 " + objFrames + " " + occlusionTypeShortLabel(OCCLUSION_OBJECT),
+                        occlusionTypeBadgeColor(OCCLUSION_OBJECT));
                 infoRow.add(objBadge);
+            }
+            if (lqFrames > 0) {
+                JLabel lqBadge = createInfoBadge("👁 " + lqFrames + " " + occlusionTypeShortLabel(OCCLUSION_LOW_QUALITY),
+                        occlusionTypeBadgeColor(OCCLUSION_LOW_QUALITY));
+                infoRow.add(lqBadge);
             }
             
             // Smoothing badge
@@ -19360,7 +19418,7 @@ public class VideoAnnotationTool {
                         segObj.put("start", segStart);
                         segObj.put("end", segEnd);
                         int type = seg.length >= 3 ? seg[2] : OCCLUSION_OUT_OF_PLANE;
-                        segObj.put("type", type == OCCLUSION_OBJECT ? "object" : "out_of_plane");
+                        segObj.put("type", occlusionTypeToJson(type));
                         segmentsArray.put(segObj);
                     }
                     if (segmentsArray.length() > 0) {
@@ -20665,9 +20723,9 @@ public class VideoAnnotationTool {
                                 JSONObject segObj = segmentsArray.getJSONObject(j);
                                 int segStart = segObj.optInt("start", 0);
                                 int segEnd = segObj.optInt("end", 0);
-                                // Read type with backward compatibility (default to out_of_plane)
+                                // Read type with backward compatibility (missing/unknown -> out_of_plane)
                                 String typeStr = segObj.optString("type", "out_of_plane");
-                                int type = "object".equalsIgnoreCase(typeStr) ? OCCLUSION_OBJECT : OCCLUSION_OUT_OF_PLANE;
+                                int type = occlusionTypeFromJson(typeStr);
                                 
                                 // Validate segment
                                 if (segStart < 0) segStart = 0;
