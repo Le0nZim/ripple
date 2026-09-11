@@ -1,0 +1,14 @@
+---
+description: Never modify paper_code/; it is the journal analysis tree and must stay unchanged.
+alwaysApply: true
+---
+
+# Leave `paper_code/` unchanged
+
+`paper_code/` is the RIPPLE paper analysis tree (figures, tables, source data). It is on GitHub for journal review. Treat it as frozen.
+
+- Do not edit, move, rename, or delete anything under `paper_code/`.
+- Do not stage `paper_code/` in software commits. Never `git add -A` / `git add .` if that would include `paper_code` deletes or diffs.
+- If `paper_code/` is missing from the working tree, restore it with `git restore paper_code` (or `git checkout HEAD -- paper_code`). Do not commit the deletion.
+- Software updates belong in the app/installer paths only: `src/`, `scripts/`, `conda/`, `requirements/`, `pom.xml`, `quickstart.*`, `uninstall.*`, and related docs.
+- Change `paper_code/` only when the user explicitly asks to update the paper results.

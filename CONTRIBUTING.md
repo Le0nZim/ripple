@@ -8,6 +8,7 @@ Thank you for your interest in contributing to RIPPLE! This document provides gu
 - [Getting Started](#getting-started)
 - [Development Setup](#development-setup)
 - [Making Changes](#making-changes)
+- [Paper code](#paper-code)
 - [Pull Request Process](#pull-request-process)
 - [Coding Standards](#coding-standards)
 - [Reporting Bugs](#reporting-bugs)
@@ -90,6 +91,10 @@ By participating in this project, you agree to maintain a respectful and inclusi
    - `refactor:` - Code refactoring
    - `test:` - Adding/updating tests
    - `chore:` - Maintenance tasks
+
+## Paper code
+
+`paper_code/` is the journal analysis tree (figures, tables, and reproduction scripts). **Do not modify, move, or delete it** when updating the RIPPLE software. Restore it from git if it is missing from a working copy. Change it only when explicitly updating paper results.
 
 ## Pull Request Process
 
