@@ -78,6 +78,12 @@ public class Constants {
     public static final String FLOW_SUFFIX = "_optical_flow.npz";
     public static final String ANNOTATION_SUFFIX = "_annotations.json";
     public static final String FLOW_VIZ_SUFFIX = "_flow_viz.tif";
+    public static final String BATCH_MANIFEST_SUFFIX = "_ripple_batches.json";
+    public static final String BATCH_ANNOTATION_INFIX = "_batch";
+    public static final int BATCH_OVERLAP_FRAMES = 1;
+    public static final int BATCH_PROMPT_MIN_FRAMES = 500;
+    public static final long BATCH_PROMPT_FLOW_BYTES = 2L * 1024 * 1024 * 1024;
+    public static final String CMD_MEMORY_STATUS = "memory_status";
     
     // AVI format processing specifications
     public static final int AVI_TARGET_WIDTH = 768;

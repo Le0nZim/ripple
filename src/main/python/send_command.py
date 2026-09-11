@@ -16,6 +16,7 @@ Examples:
 import argparse
 import json
 import os
+import re
 import socket
 import sys
 
@@ -298,6 +299,17 @@ def parse_args():
             tagged = [p for p in candidates if tag in os.path.basename(p)]
             if tagged:
                 candidates = tagged
+
+        frame_start = command.get("frame_start")
+        frame_end = command.get("frame_end")
+        if frame_start is not None and frame_end is not None:
+            token = f"_f{int(frame_start)}-{int(frame_end)}_"
+            candidates = [path for path in candidates if token in os.path.basename(path)]
+        else:
+            candidates = [
+                path for path in candidates
+                if re.search(r"_f\d+-\d+_", os.path.basename(path)) is None
+            ]
 
         if not candidates:
             raise ValueError(

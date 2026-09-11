@@ -1,1 +1,25 @@
-Coming soon...
+TRACKS
+
+Create a track with + New Track, then click a frame to seed it. In
+single-seed mode RIPPLE propagates through the loaded optical flow.
+Click again to add corrections; the current correction method
+(full blend, corridor DP, or blob-assisted) re-optimizes the path.
+
+CLIP MODE
+
+Creating and editing tracks is only allowed after Switch (work mode).
+Preview shows first and last-frame dots only. Entire video is read-only.
+
+When you Switch into a clip:
+- A track that only exists at the shared overlap is seed-propagated.
+- A track that already has interior points keeps those corrections.
+  If the neighbor overlap moved, that frame becomes an extra anchor
+  and the selected correction method re-optimizes.
+- Unchanged overlap is left alone so bouncing 1→2→1 does not wipe
+  interior fixes.
+
+Track IDs and colors are global. Deleting a track can remove it from
+this clip only or from every clip JSON.
+
+Smoothing, trim, and occlusion use global frame numbers but only edit
+frames present in the working clip. Smoothing is per-clip.

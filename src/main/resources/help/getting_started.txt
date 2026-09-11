@@ -1,9 +1,27 @@
 GETTING STARTED
 
 1. Open a video with the Open button (TIFF or AVI).
-2. Create a track with + New Track, then click on a frame to place a point.
-3. Compute optical flow when prompted, then track and correct as needed.
-4. Save annotations with Save.
+2. Choose whether to compress the video (resolution).
+3. If optical flow for the whole video may not fit in RAM, RIPPLE then
+   offers to split it into clips. Small videos skip this and go on.
+4. Create a track with + New Track, then click on a frame to place a point.
+5. Compute optical flow when prompted, then track and correct as needed.
+6. Save annotations with Export.
+
+LONG VIDEOS (CLIP BATCHING)
+
+Optical flow for a long video is a large (T-1) × H × W × 2 array in RAM.
+Right after the compression prompt, RIPPLE estimates that size from the
+working resolution and the current flow method, compares it to free RAM,
+and suggests a clip count when the full video would be too large.
+
+- Preview a clip to watch that range and see first/last-frame dots only.
+- Switch loads that clip’s optical flow and unloads the previous clip.
+- Entire video shows the whole movie with stitched annotations (read-only).
+- Adjacent clips share one frame so tracks line up when you Switch.
+
+Use Tools → Split video into clips… any time. Tools → Fill remaining clips
+walks 1→2→3… with only one flow array in memory.
 
 UPDATING RIPPLE
 

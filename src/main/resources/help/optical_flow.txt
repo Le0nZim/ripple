@@ -1,1 +1,25 @@
-Coming soon...
+OPTICAL FLOW
+
+Optical flow is the motion field between consecutive frames. RIPPLE uses
+it to propagate and correct tracks (RAFT, DIS, DIS-fast, LocoTrack, or
+TrackPy). The dense array is the main RAM cost: one 2-D vector per pixel
+for every frame pair.
+
+CLIP MODE
+
+When a video is split into clips, only the working clip’s flow is loaded.
+Preview and Entire video do not load or unload flow.
+
+On disk, clip flow files look like:
+  video_raft_512x384_f0-839_optical_flow.npz
+
+Full-video NPZs are never loaded whole in clip mode. If one exists, the
+server memory-maps it and copies only the current frame range, or the
+clip is recomputed.
+
+Flow visualization is available only while you are working on a clip
+(after Switch). Recalculate Optical Flow and Switch Flow Method also
+apply to the current clip range only.
+
+Smoothing, trim, and occlusion edits stay in global frame numbers but
+run only on frames present in the working clip.

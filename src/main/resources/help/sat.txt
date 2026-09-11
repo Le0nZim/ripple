@@ -1,1 +1,11 @@
-Coming soon...
+SAT (SEGMENTED ANNOTATION TRACKING)
+
+SAT builds a 3-D connected-component volume so tracks can snap to
+bright regions. That volume is another RAM cost (boolean[T][H][W]).
+
+In clip mode SAT runs only on the working clip after you Switch.
+It is disabled in preview and Entire video.
+
+Enable SAT, set the intensity threshold, then initialize a track
+inside a region. Propagation keeps the point inside that region
+when SAT is on.

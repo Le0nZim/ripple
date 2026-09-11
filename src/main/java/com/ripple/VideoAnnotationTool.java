@@ -214,6 +214,38 @@ public class VideoAnnotationTool {
         System.err.println("Warning: Could not detect system memory. Using 32GB default.");
         return 32.0;
     }
+
+    private static long getAvailableMemoryBytes() {
+        try {
+            java.lang.management.OperatingSystemMXBean osBean =
+                java.lang.management.ManagementFactory.getOperatingSystemMXBean();
+            for (String methodName : new String[]{"getFreeMemorySize", "getFreePhysicalMemorySize"}) {
+                try {
+                    java.lang.reflect.Method method = osBean.getClass().getMethod(methodName);
+                    method.setAccessible(true);
+                    long value = (Long) method.invoke(osBean);
+                    if (value > 0) {
+                        return value;
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader("/proc/meminfo"))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.startsWith("MemAvailable:")) {
+                    String[] parts = line.split("\\s+");
+                    if (parts.length >= 2) {
+                        return Long.parseLong(parts[1]) * 1024L;
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return (long) (getSystemMemoryGB() * 0.40 * 1024.0 * 1024.0 * 1024.0);
+    }
     
     // Zoom level limits (matching ImageJ's approach for stability at high zoom)
     private static final double MIN_ZOOM = 1.0 / 72.0;  // ~1.4%
@@ -394,6 +426,15 @@ public class VideoAnnotationTool {
     
     private ImagePlus flowVisualization = null;
     private boolean showingFlowViz = false;
+
+    private final VideoBatchCoordinator batchCoordinator = new VideoBatchCoordinator();
+    private JPanel batchStrip;
+    private JPanel batchBanner;
+    private JMenuItem splitClipsMenuItem;
+    private JMenuItem fillClipsMenuItem;
+    private VideoBatchPanel.Listener batchUiListener;
+    private boolean batchSwitchInProgress;
+    private final AtomicBoolean batchFillCancelled = new AtomicBoolean(false);
     
     // Detection preview overlay state (shared by DoG and Trackpy)
     private boolean previewModeActive = false;      // True when in preview mode (UI locked)
@@ -495,6 +536,8 @@ public class VideoAnnotationTool {
     
     // Segmentation-Assisted Tracking (SAT) module configuration and state
     private boolean satEnabled = false;
+    private int satVolumeFrames = 0;
+    private int satVolumeOffset = 0;
     private double satThresholdMin = 0.0;
     private double satThresholdMax = 255.0;
     private int satMaskOpacity = 70; // Segmentation overlay opacity (range: 0-255, where 255 is fully opaque)
@@ -1107,6 +1150,17 @@ public class VideoAnnotationTool {
     }
 
     private Color getTrackColor(String trackId) {
+        if (batchCoordinator.isPreview()) {
+            Color preview = batchCoordinator.getPreviewColors().get(trackId);
+            if (preview != null) {
+                return preview;
+            }
+        } else if (batchCoordinator.isEntireVideo()) {
+            Color stitched = batchCoordinator.getStitchedColors().get(trackId);
+            if (stitched != null) {
+                return stitched;
+            }
+        }
         return trackColors.getOrDefault(trackId, new Color(255, 0, 0, 200)); // Default to red if not found
     }
     
@@ -2306,11 +2360,11 @@ public class VideoAnnotationTool {
     private void goToFrame(int frame) {
         if (imp == null || totalSlices <= 0) return;
         
-        int targetFrame = Math.max(1, Math.min(totalSlices, frame));
+        int targetFrame = clampNavigationSlice(frame);
         if (targetFrame != currentSlice) {
             currentSlice = targetFrame;
             frameSlider.setValue(currentSlice);
-            pageLabel.setText(String.format("Frame: %d / %d", currentSlice, totalSlices));
+            updateFrameStatus();
             loadSliceImageFast();
         }
     }
@@ -2322,14 +2376,18 @@ public class VideoAnnotationTool {
     private void zoomSliderIn() {
         if (totalSlices <= 1) return;
         
+        int navMin = navigationMinSlice();
+        int navMax = navigationMaxSlice();
+        int navSpan = Math.max(1, navMax - navMin);
+
         // Initialize zoom if not already zoomed
         if (!sliderZoomed) {
-            sliderZoomStart = 1;
-            sliderZoomEnd = totalSlices;
+            sliderZoomStart = navMin;
+            sliderZoomEnd = navMax;
         }
         
         int currentRange = sliderZoomEnd - sliderZoomStart;
-        int minRange = Math.max(10, totalSlices / 50);  // Minimum ~10 frames or 2% of total
+        int minRange = Math.max(10, navSpan / 50);  // Minimum ~10 frames or 2% of the navigation span
         
         if (currentRange <= minRange) return;  // Already at max zoom
         
@@ -2341,14 +2399,14 @@ public class VideoAnnotationTool {
         int newStart = center - newRange / 2;
         int newEnd = newStart + newRange;
         
-        // Clamp to valid range
-        if (newStart < 1) {
-            newStart = 1;
-            newEnd = 1 + newRange;
+        // Clamp to the current navigation window (clip or entire video)
+        if (newStart < navMin) {
+            newStart = navMin;
+            newEnd = Math.min(navMax, navMin + newRange);
         }
-        if (newEnd > totalSlices) {
-            newEnd = totalSlices;
-            newStart = Math.max(1, totalSlices - newRange);
+        if (newEnd > navMax) {
+            newEnd = navMax;
+            newStart = Math.max(navMin, navMax - newRange);
         }
         
         sliderZoomStart = newStart;
@@ -2364,11 +2422,15 @@ public class VideoAnnotationTool {
     private void zoomSliderOut() {
         if (totalSlices <= 1 || !sliderZoomed) return;
         
+        int navMin = navigationMinSlice();
+        int navMax = navigationMaxSlice();
+        int navSpan = Math.max(1, navMax - navMin);
+
         int currentRange = sliderZoomEnd - sliderZoomStart;
         int newRange = currentRange * 2;
         
-        // If new range covers all frames, reset to full view
-        if (newRange >= totalSlices - 1) {
+        // If new range covers the navigation window, reset to that window
+        if (newRange >= navSpan) {
             resetSliderZoom();
             return;
         }
@@ -2379,14 +2441,13 @@ public class VideoAnnotationTool {
         int newStart = center - newRange / 2;
         int newEnd = newStart + newRange;
         
-        // Clamp to valid range
-        if (newStart < 1) {
-            newStart = 1;
-            newEnd = 1 + newRange;
+        if (newStart < navMin) {
+            newStart = navMin;
+            newEnd = Math.min(navMax, navMin + newRange);
         }
-        if (newEnd > totalSlices) {
-            newEnd = totalSlices;
-            newStart = Math.max(1, totalSlices - newRange);
+        if (newEnd > navMax) {
+            newEnd = navMax;
+            newStart = Math.max(navMin, navMax - newRange);
         }
         
         sliderZoomStart = newStart;
@@ -2400,12 +2461,12 @@ public class VideoAnnotationTool {
      */
     private void resetSliderZoom() {
         sliderZoomed = false;
-        sliderZoomStart = 1;
-        sliderZoomEnd = totalSlices;
+        sliderZoomStart = navigationMinSlice();
+        sliderZoomEnd = navigationMaxSlice();
         
         if (frameSlider != null && totalSlices > 1) {
-            frameSlider.setMinimum(1);
-            frameSlider.setMaximum(totalSlices);
+            frameSlider.setMinimum(sliderZoomStart);
+            frameSlider.setMaximum(sliderZoomEnd);
             frameSlider.setValue(currentSlice);
             frameSlider.repaint();
         }
@@ -2441,8 +2502,8 @@ public class VideoAnnotationTool {
                 sliderZoomLabel.setVisible(true);
             }
         } else {
-            frameSlider.setMinimum(1);
-            frameSlider.setMaximum(totalSlices);
+            frameSlider.setMinimum(navigationMinSlice());
+            frameSlider.setMaximum(navigationMaxSlice());
             frameSlider.setValue(currentSlice);
             
             if (sliderZoomLabel != null) {
@@ -3236,6 +3297,15 @@ public class VideoAnnotationTool {
      * @param useTurbo If true, use fast LoRA-based turbo fine-tuning
      */
     private void startLocoTrackFineTuningImpl(boolean useTurbo) {
+        if (batchCoordinator.isEnabled()) {
+            JOptionPane.showMessageDialog(frame,
+                "Fine-tuning needs a single merged annotation file for the entire video.\n\n" +
+                "Export merged annotations first, then open the video without clip batching\n" +
+                "or import the merged file after choosing Keep as one clip.",
+                "Merge required",
+                JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
         if (!isGpuAvailable) {
             JOptionPane.showMessageDialog(frame,
                 "Fine-tuning requires GPU mode.\n\n" +
@@ -3593,6 +3663,7 @@ public class VideoAnnotationTool {
                 JSONObject req = new JSONObject();
                 req.put("command", Constants.CMD_FINETUNE_LOCOTRACK);
                 req.put("video_path", workingVideoPath);
+                putBatchFrameRange(req);
                 req.put("annotations_json", annotationsJsonStr);
                 req.put("base_weights", finalBaseWeights.getAbsolutePath());
                 req.put("output_weights", finalOutputWeights.getAbsolutePath());
@@ -4472,6 +4543,25 @@ public class VideoAnnotationTool {
         physicsOptItem.setToolTipText("Use completed tracks to correct drift in incomplete tracks");
         physicsOptItem.addActionListener(e -> runPhysicsInformedOptimization());
         toolsMenu.add(physicsOptItem);
+
+        splitClipsMenuItem = new JMenuItem("  Split video into clips...");
+        splitClipsMenuItem.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        splitClipsMenuItem.setBackground(PANEL_DARK);
+        splitClipsMenuItem.setForeground(TEXT_PRIMARY);
+        splitClipsMenuItem.setBorder(BorderFactory.createEmptyBorder(8, 12, 8, 12));
+        splitClipsMenuItem.setToolTipText("Break a long video into RAM-safe clips");
+        splitClipsMenuItem.addActionListener(e -> showSplitClipsDialog(false));
+        toolsMenu.add(splitClipsMenuItem);
+
+        fillClipsMenuItem = new JMenuItem("  Fill remaining clips...");
+        fillClipsMenuItem.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        fillClipsMenuItem.setBackground(PANEL_DARK);
+        fillClipsMenuItem.setForeground(TEXT_PRIMARY);
+        fillClipsMenuItem.setBorder(BorderFactory.createEmptyBorder(8, 12, 8, 12));
+        fillClipsMenuItem.setToolTipText("Propagate tracks through unvisited clips one at a time");
+        fillClipsMenuItem.addActionListener(e -> fillRemainingClips());
+        fillClipsMenuItem.setEnabled(false);
+        toolsMenu.add(fillClipsMenuItem);
         
         menuBar.add(toolsMenu);
         
@@ -4691,7 +4781,7 @@ public class VideoAnnotationTool {
                     int screenPixelW = (int) Math.ceil(pixelWidth);
                     int screenPixelH = (int) Math.ceil(pixelHeight);
                     
-                    for (Map.Entry<String, Map<Integer, Point>> trackEntry : trackAnnotations.entrySet()) {
+                    for (Map.Entry<String, Map<Integer, Point>> trackEntry : annotationMapsForDisplay().entrySet()) {
                         String trackId = trackEntry.getKey();
                         Point p = trackEntry.getValue().get(currentSlice - 1);
                         if (p != null) {
@@ -5585,8 +5675,19 @@ public class VideoAnnotationTool {
         frameNavPanel.add(pageLabel, BorderLayout.WEST);
         frameNavPanel.add(frameSlider, BorderLayout.CENTER);
         frameNavPanel.add(sliderZoomPanel, BorderLayout.EAST);
-        
-        centerPanel.add(frameNavPanel, BorderLayout.SOUTH);
+
+        batchUiListener = batchListener();
+        batchStrip = VideoBatchPanel.createStrip(batchCoordinator, batchUiListener);
+        batchBanner = VideoBatchPanel.createBanner(batchCoordinator, batchUiListener);
+        JPanel southStack = new JPanel(new BorderLayout());
+        southStack.setOpaque(false);
+        JPanel clipChrome = new JPanel(new BorderLayout());
+        clipChrome.setOpaque(false);
+        clipChrome.add(batchBanner, BorderLayout.NORTH);
+        clipChrome.add(batchStrip, BorderLayout.CENTER);
+        southStack.add(clipChrome, BorderLayout.NORTH);
+        southStack.add(frameNavPanel, BorderLayout.CENTER);
+        centerPanel.add(southStack, BorderLayout.SOUTH);
         
         // Create SAT controls (needed by configuration panel)
         satCheckbox = createStyledCheckbox("SAT");
@@ -5622,8 +5723,8 @@ public class VideoAnnotationTool {
             
             int newSlice = frameSlider.getValue();
             if (newSlice != currentSlice && imp != null) {
-                currentSlice = newSlice;
-                pageLabel.setText(String.format("Frame: %d / %d", currentSlice, totalSlices));
+                currentSlice = clampNavigationSlice(newSlice);
+                updateFrameStatus();
                 
                 if (frameSlider.getValueIsAdjusting()) {
                     // While dragging: update image and coordinate display
@@ -6142,6 +6243,11 @@ public class VideoAnnotationTool {
             showMaskCheckbox.setEnabled(satEnabled);
             showRegionsCheckbox.setEnabled(satEnabled);
             if (satEnabled && imp != null) {
+                if (!allowBatchSat()) {
+                    satCheckbox.setSelected(false);
+                    satEnabled = false;
+                    return;
+                }
                 // Open threshold adjustment dialog when enabling SAT
                 adjustSegmentationThreshold();
                 // Precompute regions for all frames
@@ -6189,10 +6295,13 @@ public class VideoAnnotationTool {
                         "Invalid Frame Number", JOptionPane.WARNING_MESSAGE);
                     return;
                 }
-                currentSlice = frameNum;
+                if (!offerPreviewForOutOfClipFrame(frameNum)) {
+                    return;
+                }
+                currentSlice = clampNavigationSlice(frameNum);
                 loadSliceImage();
                 refreshAnnotationList();
-                pageLabel.setText(String.format("Frame: %d / %d", currentSlice, totalSlices));
+                updateFrameStatus();
                 frameSlider.setValue(currentSlice); // Update slider position
             } catch (NumberFormatException ex) {
                 JOptionPane.showMessageDialog(frame, "Invalid frame number", "Error", JOptionPane.ERROR_MESSAGE);
@@ -6227,16 +6336,17 @@ public class VideoAnnotationTool {
 
                         @Override
                         public void actionPerformed(ActionEvent evt) {
-                            if (slice >= totalSlices) {
+                            int playEnd = navigationMaxSlice();
+                            if (slice >= playEnd) {
                                 ((Timer) evt.getSource()).stop();
                                 playButton.setText("▶");
                                 return;
                             }
                             slice++;
-                            currentSlice = slice;
+                            currentSlice = clampNavigationSlice(slice);
                             loadSliceImage();
                             refreshAnnotationList();
-                            pageLabel.setText(String.format("Frame: %d / %d", currentSlice, totalSlices));
+                            updateFrameStatus();
                             frameSlider.setValue(currentSlice); // Update slider during playback
                         }
                     });
@@ -6629,6 +6739,12 @@ public class VideoAnnotationTool {
         
         if (matchingFiles != null) {
             result = new java.util.ArrayList<>(java.util.Arrays.asList(matchingFiles));
+            VideoBatchPlan.ClipRange clip = batchCoordinator.isWork() ? batchCoordinator.workingRange() : null;
+            if (clip != null) {
+                result.removeIf(file -> !VideoBatchPlan.flowFileMatchesClip(file.getName(), clip));
+            } else if (batchCoordinator.isEnabled()) {
+                result.removeIf(file -> file.getName().matches(".*_f\\d+-\\d+_.*"));
+            }
             // Sort by modification time, newest first
             result.sort((a, b) -> Long.compare(b.lastModified(), a.lastModified()));
         }
@@ -7630,6 +7746,9 @@ public class VideoAnnotationTool {
     }
 
     private void handleTrackInitialization(int imgX, int imgY, int frameNumber) {
+        if (!allowBatchAnnotation("annotate")) {
+            return;
+        }
         // Initialize track on any frame (bidirectional propagation supported)
         if (selectedTrackId == null) {
             JOptionPane.showMessageDialog(frame,
@@ -7716,6 +7835,9 @@ public class VideoAnnotationTool {
     }
 
     private void handleCorrectionClick(int imgX, int imgY) {
+        if (!allowBatchAnnotation("correct a track")) {
+            return;
+        }
         saveState("Add/move anchor point");
         
         // Frame is 1-indexed in display, 0-indexed internally
@@ -7776,6 +7898,9 @@ public class VideoAnnotationTool {
     }
 
     private int getVideoFrameCount(String trackId) {
+        if (batchCoordinator.isWork() && batchCoordinator.workingRange() != null) {
+            return batchCoordinator.workingRange().endFrame + 1;
+        }
         Map<Integer, Point> existingTrack = trackAnnotations.get(trackId);
         if (existingTrack != null && !existingTrack.isEmpty()) {
             return existingTrack.keySet().stream().max(Integer::compareTo).orElse(0) + 1;
@@ -7855,6 +7980,7 @@ public class VideoAnnotationTool {
                 .orElse(anchors.get(anchors.size() - 1));
             int corrFrame = correction.frame;
             localRange = TrackingParameters.computeLocalCorrectionRange(corrFrame, localWindow, totalFrames);
+            localRange = VideoBatchPlan.clipLocalWindow(localRange, batchCoordinator.navigationRange());
             windowStart = localRange.startFrame;
             windowEnd = localRange.endFrame;
             
@@ -8043,6 +8169,7 @@ public class VideoAnnotationTool {
                 args.add("track_anchors");
                 args.add("--tiff");
                 args.add(workingVideoPath);
+                appendBatchFrameArgs(args);
                 args.add("--output-dir");
                 args.add(outputDir);
                 args.add("--video-name");
@@ -8978,9 +9105,10 @@ public class VideoAnnotationTool {
         
         List<String> args = new ArrayList<>();
         args.add("track_seed");
-        args.add("--tiff");
-        args.add(workingVideoPath);
-        args.add("--output-dir");
+                args.add("--tiff");
+                args.add(workingVideoPath);
+                appendBatchFrameArgs(args);
+                args.add("--output-dir");
         args.add(outputDir);
         args.add("--seed-x");
         args.add(String.valueOf(seedX));
@@ -9086,6 +9214,7 @@ public class VideoAnnotationTool {
             JSONObject req = new JSONObject();
             req.put("command", "optimize_track");
             req.put("video_path", workingVideoPath);
+            putBatchFrameRange(req);
             req.put("output_path", outputDir);
             req.put("video_name", videoBaseName);
             req.put("anchors", anchorsArray);
@@ -9123,6 +9252,7 @@ public class VideoAnnotationTool {
             args.add("track_anchors");
             args.add("--tiff");
             args.add(workingVideoPath);
+            appendBatchFrameArgs(args);
             args.add("--output-dir");
             args.add(outputDir);
             args.add("--video-name");
@@ -9222,6 +9352,7 @@ public class VideoAnnotationTool {
             args.add("optimize_tracks");
             args.add("--tiff");
             args.add(workingVideoPath);
+            appendBatchFrameArgs(args);
             args.add("--output-dir");
             args.add(outputDir);
             args.add("--anchors-bundle");
@@ -9308,6 +9439,14 @@ public class VideoAnnotationTool {
      * Uses Delaunay triangulation mesh and IDW interpolation to correct optical flow drift.
      */
     private void runPhysicsInformedOptimization() {
+        if (batchCoordinator.isEnabled() && !batchCoordinator.isWork()) {
+            JOptionPane.showMessageDialog(frame,
+                "Switch to a clip to run physics optimization.\n" +
+                "Only that clip's flow and tracks are in memory.",
+                "Clip preview",
+                JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
         // Count completed and incomplete tracks
         List<String> completedTrackIds = new ArrayList<>();
         List<String> incompleteTrackIds = new ArrayList<>();
@@ -9476,6 +9615,7 @@ public class VideoAnnotationTool {
                 JSONObject req = new JSONObject();
                 req.put("command", "physics_optimize_global");
                 req.put("video_path", workingVideoPath);
+                putBatchFrameRange(req);
                 req.put("output_path", outputDir);
                 req.put("video_name", videoBaseName);
                 req.put("completed_tracks", completedTracksArray);
@@ -9564,11 +9704,216 @@ public class VideoAnnotationTool {
     }
 
     // NEW METHOD: Compute optical flow locally
+    private boolean runComputeFlowProcess(boolean forceRecompute) throws Exception {
+            File scriptFile = getTrackingScript();
+            if (!scriptFile.exists()) {
+                throw new FileNotFoundException("Tracking script not found: " + scriptFile.getAbsolutePath());
+            }
+            
+            String pythonScript = config.getProperty("local.python.script", "");
+            String workDir = config.getProperty("local.work.dir", "/tmp/tracking_temp");
+            String condaEnv = config.getProperty("local.conda.env", "ripple-env");
+            String modelSize = config.getProperty("raft.model.size", "large");
+            String timeout = config.getProperty("local.timeout", "300");
+            String outputDir = getOutputDirectory();
+            
+            // Flow method and locotrack settings (TrackMate-style DoG parameters)
+            String flowMethod = getConfiguredFlowMethod();
+            
+            // Clear previous flow cache and GPU models before computing new flow
+            // This ensures we don't have stale data from a different method
+            clearMemoryBeforeSwitch();
+            
+            // Clear flow visualization on EDT since we're recalculating
+            SwingUtilities.invokeLater(() -> clearFlowVisualizationAndSwitchToVideo());
+            
+            String locotrackDogRadius = config.getProperty("locotrack.dog.radius", "2.5");
+            String locotrackDogThreshold = config.getProperty("locotrack.dog.threshold", "0.0");
+            String locotrackMedianFilter = config.getProperty("locotrack.dog.median.filter", "false");
+            String locotrackSubpixel = config.getProperty("locotrack.dog.subpixel", "true");
+            String locotrackOcclusionThreshold = config.getProperty("locotrack.occlusion.threshold", "0.5");
+            String locotrackWeight = config.getProperty("locotrack.weight", "0.5");
+            String locotrackFlowSmoothing = config.getProperty("locotrack.flow.smoothing", "15.0");
+            String locotrackTemporalSmooth = config.getProperty("locotrack.temporal.smooth", "0.1");
+            String locotrackKernel = config.getProperty("locotrack.kernel", "gaussian_rbf");
+            
+            // Trackpy settings (native trackpy detection)
+            String trackpyDiameter = config.getProperty("trackpy.diameter", "11");
+            String trackpyMinmass = config.getProperty("trackpy.minmass", "0");
+            String trackpySearchRange = config.getProperty("trackpy.search.range", "15");
+            String trackpyMemory = config.getProperty("trackpy.memory", "5");
+            String trackpyRequirePersistent = config.getProperty("trackpy.require.persistent", "false");
+            String trackpySmoothFactor = config.getProperty("trackpy.smooth.factor", "0.1");
+            String trackpyFlowSmoothing = config.getProperty("trackpy.flow.smoothing", "15");
+            String trackpyKernel = config.getProperty("trackpy.kernel", "gaussian_rbf");
+            
+            // DIS settings
+            String disDownsampleFactor = config.getProperty("dis.downsample.factor", "2");
+            
+            // Call bash script WITHOUT seed coordinates to compute optical flow only
+            // Use original video name for output file naming (important for compressed videos)
+            String videoBaseName = new File(currentVideoPath).getName().replaceFirst("\\.[^.]+$", "");
+            
+            List<String> args = new ArrayList<>();
+            args.add("compute_flow");
+            args.add("--tiff");
+            args.add(workingVideoPath);
+            appendBatchFrameArgs(args);
+            args.add("--output-dir");
+            args.add(outputDir);
+            args.add("--video-name");
+            args.add(videoBaseName);
+            args.add("--python-script");
+            args.add(pythonScript);
+            args.add("--work-dir");
+            args.add(workDir);
+            args.add("--conda-env");
+            args.add(condaEnv);
+            args.add("--timeout");
+            args.add(timeout);
+            args.add("--model");
+            args.add(modelSize);
+            args.add("--flow-method");
+            args.add(flowMethod);
+            args.add("--locotrack-dog-radius");
+            args.add(locotrackDogRadius);
+            args.add("--locotrack-dog-threshold");
+            args.add(locotrackDogThreshold);
+            args.add("--locotrack-median-filter");
+            args.add(locotrackMedianFilter);
+            args.add("--locotrack-subpixel");
+            args.add(locotrackSubpixel);
+            args.add("--locotrack-occlusion-threshold");
+            args.add(locotrackOcclusionThreshold);
+            args.add("--locotrack-weight");
+            args.add(locotrackWeight);
+            args.add("--locotrack-flow-smoothing");
+            args.add(locotrackFlowSmoothing);
+            args.add("--locotrack-temporal-smooth");
+            args.add(locotrackTemporalSmooth);
+            args.add("--locotrack-kernel");
+            args.add(locotrackKernel);
+            // Use current frame for LocoTrack seed detection (0-indexed)
+            args.add("--locotrack-seed-frame");
+            args.add(String.valueOf(currentSlice - 1));
+            // Trackpy parameters (native trackpy detection)
+            args.add("--trackpy-diameter");
+            args.add(trackpyDiameter);
+            args.add("--trackpy-minmass");
+            args.add(trackpyMinmass);
+            args.add("--trackpy-search-range");
+            args.add(trackpySearchRange);
+            args.add("--trackpy-memory");
+            args.add(trackpyMemory);
+            args.add("--trackpy-require-persistent");
+            args.add(trackpyRequirePersistent);
+            args.add("--trackpy-smooth-factor");
+            args.add(trackpySmoothFactor);
+            args.add("--trackpy-flow-smoothing");
+            args.add(trackpyFlowSmoothing);
+            args.add("--trackpy-kernel");
+            args.add(trackpyKernel);
+            // DIS parameters
+            args.add("--dis-downsample-factor");
+            args.add(disDownsampleFactor);
+            // Incremental allocation for low-memory systems (applies to all flow methods)
+            String flowIncrementalAlloc = config.getProperty("flow.incremental.allocation", "auto");
+            args.add("--flow-incremental-allocation");
+            args.add(flowIncrementalAlloc);
+            // Pass working resolution for proper cache filtering when video is compressed
+            args.add("--working-width");
+            args.add(String.valueOf(imp.getWidth()));
+            args.add("--working-height");
+            args.add(String.valueOf(imp.getHeight()));
+            // Cache flow to disk setting (keep consistent with Load Existing)
+            args.add("--save-to-disk");
+            args.add(config.getProperty("cache.flow.to.disk", "false"));
+            // Force recompute flag
+            args.add("--force-recompute");
+            args.add(String.valueOf(forceRecompute));
+            
+            List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
+            ProcessBuilder pb = new ProcessBuilder(command);
+            setServerEnvironmentVariables(pb);
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+            
+            // Capture output for error detection (especially GPU_OOM)
+            StringBuilder outputBuilder = new StringBuilder();
+            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+            String line;
+            while ((line = reader.readLine()) != null) {
+                System.out.println("[Flow] " + line);
+                outputBuilder.append(line).append("\n");
+            }
+            
+            int exitCode = process.waitFor();
+            if (exitCode != 0) {
+                String output = outputBuilder.toString();
+                // If the tracking server returned a structured JSON error (from send_command.py),
+                // try to extract a user-friendly message (especially for "Server busy").
+                String serverMsg = null;
+                boolean serverBusy = false;
+                try {
+                    // send_command.py prints pretty JSON; look for a line containing "\"message\":"
+                    for (String outLine : output.split("\\R")) {
+                        String trimmed = outLine.trim();
+                        if (trimmed.startsWith("\"busy\"") && trimmed.contains(":") && trimmed.contains("true")) {
+                            serverBusy = true;
+                        }
+                        if (trimmed.startsWith("\"message\"") && trimmed.contains(":")) {
+                            int firstQuote = trimmed.indexOf('"', trimmed.indexOf(':'));
+                            int lastQuote = trimmed.lastIndexOf('"');
+                            if (firstQuote >= 0 && lastQuote > firstQuote) {
+                                serverMsg = trimmed.substring(firstQuote + 1, lastQuote);
+                            }
+                        }
+                    }
+                } catch (Exception ignore) {
+                    // Fall back to generic handling below
+                }
+
+                // Check for GPU OOM error in output
+                if (output.contains("GPU_OOM")) {
+                    // Extract the GPU_OOM message for the exception
+                    int oomIdx = output.indexOf("GPU_OOM:");
+                    if (oomIdx >= 0) {
+                        int endIdx = output.indexOf("\n", oomIdx);
+                        String oomMsg = endIdx > oomIdx ? 
+                            output.substring(oomIdx, endIdx) : 
+                            output.substring(oomIdx);
+                        throw new IOException(oomMsg);
+                    }
+                }
+
+                if (serverBusy) {
+                    throw new IOException(serverMsg != null && !serverMsg.isBlank()
+                        ? serverMsg
+                        : "Tracking engine is busy - another operation is in progress. Cancel it first or wait.");
+                }
+
+                if (serverMsg != null && !serverMsg.isBlank()) {
+                    throw new IOException(serverMsg);
+                }
+
+                throw new IOException("Local optical flow computation failed with exit code " + exitCode);
+            }
+            
+            return true;
+    }
+
     private void computeOpticalFlowRemote() {
         computeOpticalFlowRemote(false);
     }
     
     private void computeOpticalFlowRemote(boolean forceRecompute) {
+        if (batchCoordinator.isEnabled() && !batchCoordinator.allowsOpticalFlow()) {
+            JOptionPane.showMessageDialog(frame,
+                "Switch to a clip to compute optical flow.",
+                "Clip preview",
+                JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
         if (currentVideoPath == null || imp == null) {
             JOptionPane.showMessageDialog(frame,
                 "No video loaded.",
@@ -9684,200 +10029,7 @@ public class VideoAnnotationTool {
             
             @Override
             protected Boolean doInBackground() throws Exception {
-                File scriptFile = getTrackingScript();
-                if (!scriptFile.exists()) {
-                    throw new FileNotFoundException("Tracking script not found: " + scriptFile.getAbsolutePath());
-                }
-                
-                String pythonScript = config.getProperty("local.python.script", "");
-                String workDir = config.getProperty("local.work.dir", "/tmp/tracking_temp");
-                String condaEnv = config.getProperty("local.conda.env", "ripple-env");
-                String modelSize = config.getProperty("raft.model.size", "large");
-                String timeout = config.getProperty("local.timeout", "300");
-                String outputDir = getOutputDirectory();
-                
-                // Flow method and locotrack settings (TrackMate-style DoG parameters)
-                String flowMethod = getConfiguredFlowMethod();
-                
-                // Clear previous flow cache and GPU models before computing new flow
-                // This ensures we don't have stale data from a different method
-                clearMemoryBeforeSwitch();
-                
-                // Clear flow visualization on EDT since we're recalculating
-                SwingUtilities.invokeLater(() -> clearFlowVisualizationAndSwitchToVideo());
-                
-                String locotrackDogRadius = config.getProperty("locotrack.dog.radius", "2.5");
-                String locotrackDogThreshold = config.getProperty("locotrack.dog.threshold", "0.0");
-                String locotrackMedianFilter = config.getProperty("locotrack.dog.median.filter", "false");
-                String locotrackSubpixel = config.getProperty("locotrack.dog.subpixel", "true");
-                String locotrackOcclusionThreshold = config.getProperty("locotrack.occlusion.threshold", "0.5");
-                String locotrackWeight = config.getProperty("locotrack.weight", "0.5");
-                String locotrackFlowSmoothing = config.getProperty("locotrack.flow.smoothing", "15.0");
-                String locotrackTemporalSmooth = config.getProperty("locotrack.temporal.smooth", "0.1");
-                String locotrackKernel = config.getProperty("locotrack.kernel", "gaussian_rbf");
-                
-                // Trackpy settings (native trackpy detection)
-                String trackpyDiameter = config.getProperty("trackpy.diameter", "11");
-                String trackpyMinmass = config.getProperty("trackpy.minmass", "0");
-                String trackpySearchRange = config.getProperty("trackpy.search.range", "15");
-                String trackpyMemory = config.getProperty("trackpy.memory", "5");
-                String trackpyRequirePersistent = config.getProperty("trackpy.require.persistent", "false");
-                String trackpySmoothFactor = config.getProperty("trackpy.smooth.factor", "0.1");
-                String trackpyFlowSmoothing = config.getProperty("trackpy.flow.smoothing", "15");
-                String trackpyKernel = config.getProperty("trackpy.kernel", "gaussian_rbf");
-                
-                // DIS settings
-                String disDownsampleFactor = config.getProperty("dis.downsample.factor", "2");
-                
-                // Call bash script WITHOUT seed coordinates to compute optical flow only
-                // Use original video name for output file naming (important for compressed videos)
-                String videoBaseName = new File(currentVideoPath).getName().replaceFirst("\\.[^.]+$", "");
-                
-                List<String> args = new ArrayList<>();
-                args.add("compute_flow");
-                args.add("--tiff");
-                args.add(workingVideoPath);
-                args.add("--output-dir");
-                args.add(outputDir);
-                args.add("--video-name");
-                args.add(videoBaseName);
-                args.add("--python-script");
-                args.add(pythonScript);
-                args.add("--work-dir");
-                args.add(workDir);
-                args.add("--conda-env");
-                args.add(condaEnv);
-                args.add("--timeout");
-                args.add(timeout);
-                args.add("--model");
-                args.add(modelSize);
-                args.add("--flow-method");
-                args.add(flowMethod);
-                args.add("--locotrack-dog-radius");
-                args.add(locotrackDogRadius);
-                args.add("--locotrack-dog-threshold");
-                args.add(locotrackDogThreshold);
-                args.add("--locotrack-median-filter");
-                args.add(locotrackMedianFilter);
-                args.add("--locotrack-subpixel");
-                args.add(locotrackSubpixel);
-                args.add("--locotrack-occlusion-threshold");
-                args.add(locotrackOcclusionThreshold);
-                args.add("--locotrack-weight");
-                args.add(locotrackWeight);
-                args.add("--locotrack-flow-smoothing");
-                args.add(locotrackFlowSmoothing);
-                args.add("--locotrack-temporal-smooth");
-                args.add(locotrackTemporalSmooth);
-                args.add("--locotrack-kernel");
-                args.add(locotrackKernel);
-                // Use current frame for LocoTrack seed detection (0-indexed)
-                args.add("--locotrack-seed-frame");
-                args.add(String.valueOf(currentSlice - 1));
-                // Trackpy parameters (native trackpy detection)
-                args.add("--trackpy-diameter");
-                args.add(trackpyDiameter);
-                args.add("--trackpy-minmass");
-                args.add(trackpyMinmass);
-                args.add("--trackpy-search-range");
-                args.add(trackpySearchRange);
-                args.add("--trackpy-memory");
-                args.add(trackpyMemory);
-                args.add("--trackpy-require-persistent");
-                args.add(trackpyRequirePersistent);
-                args.add("--trackpy-smooth-factor");
-                args.add(trackpySmoothFactor);
-                args.add("--trackpy-flow-smoothing");
-                args.add(trackpyFlowSmoothing);
-                args.add("--trackpy-kernel");
-                args.add(trackpyKernel);
-                // DIS parameters
-                args.add("--dis-downsample-factor");
-                args.add(disDownsampleFactor);
-                // Incremental allocation for low-memory systems (applies to all flow methods)
-                String flowIncrementalAlloc = config.getProperty("flow.incremental.allocation", "auto");
-                args.add("--flow-incremental-allocation");
-                args.add(flowIncrementalAlloc);
-                // Pass working resolution for proper cache filtering when video is compressed
-                args.add("--working-width");
-                args.add(String.valueOf(imp.getWidth()));
-                args.add("--working-height");
-                args.add(String.valueOf(imp.getHeight()));
-                // Cache flow to disk setting (keep consistent with Load Existing)
-                args.add("--save-to-disk");
-                args.add(config.getProperty("cache.flow.to.disk", "false"));
-                // Force recompute flag
-                args.add("--force-recompute");
-                args.add(String.valueOf(forceRecompute));
-                
-                List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
-                ProcessBuilder pb = new ProcessBuilder(command);
-                setServerEnvironmentVariables(pb);
-                pb.redirectErrorStream(true);
-                Process process = pb.start();
-                
-                // Capture output for error detection (especially GPU_OOM)
-                StringBuilder outputBuilder = new StringBuilder();
-                BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    System.out.println("[Flow] " + line);
-                    outputBuilder.append(line).append("\n");
-                }
-                
-                int exitCode = process.waitFor();
-                if (exitCode != 0) {
-                    String output = outputBuilder.toString();
-                    // If the tracking server returned a structured JSON error (from send_command.py),
-                    // try to extract a user-friendly message (especially for "Server busy").
-                    String serverMsg = null;
-                    boolean serverBusy = false;
-                    try {
-                        // send_command.py prints pretty JSON; look for a line containing "\"message\":"
-                        for (String outLine : output.split("\\R")) {
-                            String trimmed = outLine.trim();
-                            if (trimmed.startsWith("\"busy\"") && trimmed.contains(":") && trimmed.contains("true")) {
-                                serverBusy = true;
-                            }
-                            if (trimmed.startsWith("\"message\"") && trimmed.contains(":")) {
-                                int firstQuote = trimmed.indexOf('"', trimmed.indexOf(':'));
-                                int lastQuote = trimmed.lastIndexOf('"');
-                                if (firstQuote >= 0 && lastQuote > firstQuote) {
-                                    serverMsg = trimmed.substring(firstQuote + 1, lastQuote);
-                                }
-                            }
-                        }
-                    } catch (Exception ignore) {
-                        // Fall back to generic handling below
-                    }
-
-                    // Check for GPU OOM error in output
-                    if (output.contains("GPU_OOM")) {
-                        // Extract the GPU_OOM message for the exception
-                        int oomIdx = output.indexOf("GPU_OOM:");
-                        if (oomIdx >= 0) {
-                            int endIdx = output.indexOf("\n", oomIdx);
-                            String oomMsg = endIdx > oomIdx ? 
-                                output.substring(oomIdx, endIdx) : 
-                                output.substring(oomIdx);
-                            throw new IOException(oomMsg);
-                        }
-                    }
-
-                    if (serverBusy) {
-                        throw new IOException(serverMsg != null && !serverMsg.isBlank()
-                            ? serverMsg
-                            : "Tracking engine is busy - another operation is in progress. Cancel it first or wait.");
-                    }
-
-                    if (serverMsg != null && !serverMsg.isBlank()) {
-                        throw new IOException(serverMsg);
-                    }
-
-                    throw new IOException("Local optical flow computation failed with exit code " + exitCode);
-                }
-                
-                return true;
+                return runComputeFlowProcess(forceRecompute);
             }
             
             @Override
@@ -9896,6 +10048,7 @@ public class VideoAnnotationTool {
                     Boolean success = get();
                     if (success) {
                         opticalFlowComputed = true;
+                        markWorkingClipFlowComputed();
                         setStatus("Optical flow computed successfully");
                         
                         // Enable flow visualization button
@@ -10072,7 +10225,7 @@ public class VideoAnnotationTool {
         
         // Reload the display
         loadSliceImage();
-        pageLabel.setText(String.format("Frame: %d / %d", currentSlice, totalSlices));
+        updateFrameStatus();
         
         // Recenter the image on screen
         SwingUtilities.invokeLater(() -> {
@@ -10262,6 +10415,7 @@ public class VideoAnnotationTool {
                 args.add("load_flow");
                 args.add("--tiff");
                 args.add(workingVideoPath);
+                appendBatchFrameArgs(args);
                 args.add("--flow-path");
                 args.add(selectedFlowFile.getAbsolutePath());
                 args.add("--flow-method");
@@ -10334,6 +10488,7 @@ public class VideoAnnotationTool {
                     Boolean success = get();
                     if (success) {
                         opticalFlowComputed = true;
+                        markWorkingClipFlowComputed();
                         setStatus("Optical flow loaded from cache (" + flowMethod + ")");
                         
                         // Enable flow visualization button
@@ -10508,6 +10663,7 @@ public class VideoAnnotationTool {
                     JSONObject req = new JSONObject();
                     req.put("command", "propagate_track");
                     req.put("video_path", workingVideoPath);
+                putBatchFrameRange(req);
                     req.put("output_path", outputDir);
                     req.put("video_name", videoBaseName);
                     req.put("seed_x", seedX);
@@ -10546,6 +10702,7 @@ public class VideoAnnotationTool {
                 args.add("track_seed");
                 args.add("--tiff");
                 args.add(workingVideoPath);
+                appendBatchFrameArgs(args);
                 args.add("--output-dir");
                 args.add(outputDir);
                 args.add("--python-script");
@@ -10694,6 +10851,13 @@ public class VideoAnnotationTool {
     }
 
     private void toggleFlowVisualization(JButton toggleButton) {
+        if (batchCoordinator.isEnabled() && !batchCoordinator.allowsOpticalFlow()) {
+            JOptionPane.showMessageDialog(frame,
+                "Switch to a clip to view optical flow.",
+                "Clip preview",
+                JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
         if (flowVisualization == null) {
             // Check if optical flow has been computed
             if (!opticalFlowComputed) {
@@ -10776,6 +10940,7 @@ public class VideoAnnotationTool {
             args.add("preview_dog_detection");
             args.add("--tiff");
             args.add(workingVideoPath);
+            appendBatchFrameArgs(args);
             args.add("--output-dir");
             args.add(outputDir);
             args.add("--radius");
@@ -10925,6 +11090,7 @@ public class VideoAnnotationTool {
             args.add("preview_trackpy_trajectories");
             args.add("--tiff");
             args.add(workingVideoPath);
+            appendBatchFrameArgs(args);
             args.add("--output-dir");
             args.add(outputDir);
             args.add("--diameter");
@@ -11385,6 +11551,7 @@ public class VideoAnnotationTool {
                 args.add("visualize_flow");
                 args.add("--tiff");
                 args.add(workingVideoPath);
+                appendBatchFrameArgs(args);
                 args.add("--output-dir");
                 args.add(outputDir);
                 args.add("--video-name");
@@ -11540,6 +11707,13 @@ public class VideoAnnotationTool {
     }
 
     private void recalculateOpticalFlow() {
+        if (batchCoordinator.isEnabled() && !batchCoordinator.allowsOpticalFlow()) {
+            JOptionPane.showMessageDialog(frame,
+                "Switch to a clip to compute or load optical flow.",
+                "Clip preview",
+                JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
         if (currentVideoPath == null || imp == null) {
             JOptionPane.showMessageDialog(frame,
                 "No video loaded.",
@@ -11659,6 +11833,13 @@ public class VideoAnnotationTool {
     }
 
     private void switchFlowMethod() {
+        if (batchCoordinator.isEnabled() && !batchCoordinator.allowsOpticalFlow()) {
+            JOptionPane.showMessageDialog(frame,
+                "Switch to a clip before changing the optical flow method.",
+                "Clip preview",
+                JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
         if (currentVideoPath == null || imp == null) {
             JOptionPane.showMessageDialog(frame,
                 "No video loaded.",
@@ -11800,6 +11981,7 @@ public class VideoAnnotationTool {
                     Boolean success = get();
                     if (success) {
                         opticalFlowComputed = true;
+                        markWorkingClipFlowComputed();
                         setStatus("Switched to " + finalSelectedMethod.toUpperCase() + " flow method");
                         
                         // IMPORTANT: Clear cached data from the previous flow field
@@ -11903,11 +12085,19 @@ public class VideoAnnotationTool {
             
             String outputDir = getOutputDirectory();
             String videoBaseName = new File(currentVideoPath).getName().replaceFirst("\\.[^.]+$", "");
+            java.util.List<File> cached = filterFlowFilesByResolution(
+                findCachedFlowFiles(currentVideoPath, flowMethod));
+            File preferred = cached.isEmpty() ? null : cached.get(0);
             
             List<String> args = new ArrayList<>();
             args.add("load_flow");
             args.add("--tiff");
             args.add(workingVideoPath);
+            appendBatchFrameArgs(args);
+            if (preferred != null) {
+                args.add("--flow-path");
+                args.add(preferred.getAbsolutePath());
+            }
             args.add("--output-dir");
             args.add(outputDir);
             args.add("--flow-method");
@@ -14354,10 +14544,30 @@ public class VideoAnnotationTool {
             return;
         }
         
-        int confirm = JOptionPane.showConfirmDialog(frame, "Delete entire track \"" + selectedTrackId + "\"?",
-            "Confirm Delete", JOptionPane.YES_NO_OPTION);
-        
-        if (confirm == JOptionPane.YES_OPTION) {
+        boolean deleteAllClips = false;
+        if (batchCoordinator.isEnabled()) {
+            int confirm = JOptionPane.showOptionDialog(
+                frame,
+                "Delete track \"" + selectedTrackId + "\" only in this clip, or in every clip JSON?",
+                "Confirm Delete",
+                JOptionPane.YES_NO_CANCEL_OPTION,
+                JOptionPane.QUESTION_MESSAGE,
+                null,
+                new String[]{"This clip only", "All clips", "Cancel"},
+                "This clip only");
+            if (confirm == 2 || confirm == JOptionPane.CLOSED_OPTION) {
+                return;
+            }
+            deleteAllClips = (confirm == 1);
+        } else {
+            int confirm = JOptionPane.showConfirmDialog(frame, "Delete entire track \"" + selectedTrackId + "\"?",
+                "Confirm Delete", JOptionPane.YES_NO_OPTION);
+            if (confirm != JOptionPane.YES_OPTION) {
+                return;
+            }
+        }
+
+        {
             // Pause timer for the track being deleted to properly accumulate time
             pauseTrackTimer(selectedTrackId);
             saveState("Delete " + selectedTrackId);
@@ -14383,6 +14593,9 @@ public class VideoAnnotationTool {
             trackOriginalAnnotations.remove(selectedTrackId);
             // Clean up occlusion data
             trackOcclusionSegments.remove(selectedTrackId);
+            if (deleteAllClips) {
+                deleteTrackFromAllClipFiles(selectedTrackId);
+            }
             selectedTrackId = null;
             
             // Ensure first track is selected after deletion
@@ -14424,6 +14637,9 @@ public class VideoAnnotationTool {
      * Create a new track. Handles optical flow checks and initializes all track data.
      */
     private void createNewTrack() {
+        if (!allowBatchAnnotation("create a track")) {
+            return;
+        }
         if (!opticalFlowComputed) {
             String flowMethod = getConfiguredFlowMethod();
             java.util.List<File> allCachedFiles = findCachedFlowFiles(currentVideoPath, flowMethod);
@@ -14533,6 +14749,10 @@ public class VideoAnnotationTool {
         // Update trackCounter to be at least nextNum + 1 for compatibility
         if (nextNum >= trackCounter) {
             trackCounter = nextNum + 1;
+        }
+        if (batchCoordinator.getManifest() != null) {
+            batchCoordinator.getManifest().trackCounter = Math.max(
+                batchCoordinator.getManifest().trackCounter, trackCounter);
         }
         refreshAnnotationList();
         imageLabel.repaint();
@@ -15038,6 +15258,10 @@ public class VideoAnnotationTool {
         // 3. ALL tracks are marked as complete
         if (fineTuneButton != null) {
             boolean canFineTune = false;
+            if (batchCoordinator.isEnabled()) {
+                fineTuneButton.setEnabled(false);
+                fineTuneButton.setToolTipText("Export merged annotations before fine-tuning");
+            } else {
             if (imp != null && !trackAnnotations.isEmpty()) {
                 int minTracks = Constants.MIN_TRACKS_FOR_FINETUNING;
                 boolean hasEnoughTracks = trackAnnotations.size() >= minTracks;
@@ -15071,6 +15295,7 @@ public class VideoAnnotationTool {
                 }
             } else {
                 fineTuneButton.setToolTipText("Fine-tune LocoTrack on " + trackAnnotations.size() + " completed tracks");
+            }
             }
         }
         
@@ -16981,6 +17206,8 @@ public class VideoAnnotationTool {
                 pauseTrackTimer(selectedTrackId);
             }
             
+            batchCoordinator.disable();
+            refreshBatchUi();
             trackAnnotations.clear();
             trackColors.clear();
             selectedTrackId = null;
@@ -17070,7 +17297,7 @@ public class VideoAnnotationTool {
             startSliceLoaderThread();
             
             loadSliceImage();
-            pageLabel.setText(String.format("Frame: %d / %d", currentSlice, totalSlices));
+            updateFrameStatus();
             refreshAnnotationList();
             
             SwingUtilities.invokeLater(() -> {
@@ -17078,8 +17305,10 @@ public class VideoAnnotationTool {
                 fitImageToPanel(scrollPane);
             });
             
-            // Prompt to compute optical flow if configured
-            checkAndPromptOpticalFlow();
+            boolean startedBatches = maybeOfferOrResumeBatches();
+            if (!startedBatches) {
+                checkAndPromptOpticalFlow();
+            }
             
             // Exit the outer loop - video loaded successfully
             break fileExplorerLoop;
@@ -17704,13 +17933,12 @@ public class VideoAnnotationTool {
         // Block frame navigation during trim mode (slider handles navigation)
         if (trimModeActive) return;
         
-        int newSlice = currentSlice + delta;
-        newSlice = Math.max(1, Math.min(newSlice, totalSlices));
+        int newSlice = clampNavigationSlice(currentSlice + delta);
         if (newSlice == currentSlice) return;
         
         currentSlice = newSlice;
         loadSliceImageFast();  // Fast update during wheel scroll
-        pageLabel.setText(String.format("Frame: %d / %d", currentSlice, totalSlices));
+        updateFrameStatus();
         frameSlider.setValue(currentSlice);
         // Refresh annotation list immediately for coordinate and anchor updates
         refreshAnnotationList();
@@ -18637,6 +18865,27 @@ public class VideoAnnotationTool {
 
     private void exportAnnotations() {
         if (imp == null) return;
+
+        if (batchCoordinator.isEnabled()) {
+            saveWorkingClipSilent();
+            String[] options = {"Current clip", "Merged entire video", "Cancel"};
+            int choice = JOptionPane.showOptionDialog(
+                frame,
+                "Save the current clip, or export a merged file for the entire video?",
+                "Export annotations",
+                JOptionPane.YES_NO_CANCEL_OPTION,
+                JOptionPane.QUESTION_MESSAGE,
+                null,
+                options,
+                options[0]);
+            if (choice == 1) {
+                exportMergedBatchAnnotations();
+                return;
+            }
+            if (choice != 0) {
+                return;
+            }
+        }
         
         // Check if there's anything to export
         if (trackAnnotations.isEmpty()) {
@@ -19438,6 +19687,10 @@ public class VideoAnnotationTool {
                 lastImportAnnotationsDirectory = selectedFile.getParentFile();
             }
             String filename = selectedFile.getName().toLowerCase();
+            if (selectedFile.getName().endsWith(Constants.BATCH_MANIFEST_SUFFIX)) {
+                resumeBatchesFromManifest(selectedFile);
+                return;
+            }
             
             try {
                 // Read file content for format detection and filename validation
@@ -19562,6 +19815,9 @@ public class VideoAnnotationTool {
                 
                 loadSliceImage();
                 refreshAnnotationList();
+                if (batchCoordinator.isEnabled()) {
+                    splitImportedTracksIntoClips();
+                }
                 JOptionPane.showMessageDialog(frame, "Annotations imported successfully.");
                 return; // Success, exit the loop
                 
@@ -21098,26 +21354,30 @@ public class VideoAnnotationTool {
                 ImageProcessor ip = imp.getProcessor();
                 int width = ip.getWidth();
                 int height = ip.getHeight();
-                boolean[][][] binaryVolume = new boolean[totalSlices][height][width];
+                VideoBatchPlan.ClipRange satClip = batchCoordinator.isWork() ? batchCoordinator.workingRange() : null;
+                satVolumeOffset = satClip == null ? 0 : satClip.startFrame;
+                satVolumeFrames = satClip == null ? totalSlices : satClip.frameCount();
+                boolean[][][] binaryVolume = new boolean[satVolumeFrames][height][width];
                 
-                for (int i = 1; i <= totalSlices; i++) {
-                    imp.setSlice(i);
+                for (int i = 0; i < satVolumeFrames; i++) {
+                    int slice = satVolumeOffset + i + 1;
+                    imp.setSlice(slice);
                     ip = imp.getProcessor();
                     
                     for (int y = 0; y < height; y++) {
                         for (int x = 0; x < width; x++) {
                             float pixelValue = ip.getf(x, y);
-                            binaryVolume[i - 1][y][x] = (pixelValue >= satThresholdMin && pixelValue <= satThresholdMax);
+                            binaryVolume[i][y][x] = (pixelValue >= satThresholdMin && pixelValue <= satThresholdMax);
                         }
                     }
                     
-                    publish((i * 25) / totalSlices); // 0-25%
+                    publish(((i + 1) * 25) / Math.max(1, satVolumeFrames));
                 }
                 
                 // Step 2: Label regions on frame 1 using 2D connectivity (spatial only)
                 publish(30);
                 setStatus("Labeling regions on frame 1...");
-                int[][][] labelVolume = new int[totalSlices][height][width];
+                int[][][] labelVolume = new int[satVolumeFrames][height][width];
                 labelFirstFrame(binaryVolume, labelVolume, width, height);
                 
                 // Step 3: Propagate labels through time using 3D connectivity
@@ -21150,7 +21410,7 @@ public class VideoAnnotationTool {
             
             @Override
             protected void done() {
-                setStatus("Regions computed for all " + totalSlices + " frames. " + 
+                setStatus("Regions computed for " + satVolumeFrames + " frames. " + 
                           frameRegions.size() + " frames have segmented regions.");
                 loadSliceImage();
                 imageLabel.repaint();
@@ -21165,7 +21425,7 @@ public class VideoAnnotationTool {
      * This identifies initial regions without considering temporal propagation.
      */
     private void labelFirstFrame(boolean[][][] binaryVolume, int[][][] labelVolume, int width, int height) {
-        if (totalSlices == 0) return;
+        if (satVolumeFrames == 0) return;
         
         // Get spatial connectivity structure (only dx, dy where dt = 0)
         List<int[]> connectivityOffsets = generateConnectivityStructure();
@@ -21231,7 +21491,7 @@ public class VideoAnnotationTool {
         List<int[]> connectivityOffsets = generateConnectivityStructure();
         
         // Process each frame sequentially from frame 1 onwards
-        for (int t = 1; t < totalSlices; t++) {
+        for (int t = 1; t < satVolumeFrames; t++) {
             // For each pixel in current frame
             for (int y = 0; y < height; y++) {
                 for (int x = 0; x < width; x++) {
@@ -21249,7 +21509,7 @@ public class VideoAnnotationTool {
                         int neighborX = x + dx;
                         
                         // Check bounds
-                        if (neighborT < 0 || neighborT >= totalSlices) continue;
+                        if (neighborT < 0 || neighborT >= satVolumeFrames) continue;
                         if (neighborX < 0 || neighborX >= width) continue;
                         if (neighborY < 0 || neighborY >= height) continue;
                         
@@ -21272,7 +21532,7 @@ public class VideoAnnotationTool {
     private void filterNonPersistentLabels(int[][][] labelVolume, int width, int height) {
         // Build set of labels present in each frame
         List<Set<Integer>> labelsPerFrame = new ArrayList<>();
-        for (int t = 0; t < totalSlices; t++) {
+        for (int t = 0; t < satVolumeFrames; t++) {
             Set<Integer> labelsInFrame = new HashSet<>();
             for (int y = 0; y < height; y++) {
                 for (int x = 0; x < width; x++) {
@@ -21294,7 +21554,7 @@ public class VideoAnnotationTool {
         }
         
         // Zero out non-persistent labels
-        for (int t = 0; t < totalSlices; t++) {
+        for (int t = 0; t < satVolumeFrames; t++) {
             for (int y = 0; y < height; y++) {
                 for (int x = 0; x < width; x++) {
                     int label = labelVolume[t][y][x];
@@ -21313,7 +21573,7 @@ public class VideoAnnotationTool {
         frameRegions.clear();
         framePixelToRegion.clear();
         
-        for (int t = 0; t < totalSlices; t++) {
+        for (int t = 0; t < satVolumeFrames; t++) {
             Map<Integer, SegmentedRegion> regionsInFrame = new HashMap<>();
             int[][] pixelMap = new int[height][width];
             
@@ -21339,8 +21599,8 @@ public class VideoAnnotationTool {
                 region.computeCentroid();
             }
             
-            frameRegions.put(t, regionsInFrame);
-            framePixelToRegion.put(t, pixelMap);
+            frameRegions.put(t + satVolumeOffset, regionsInFrame);
+            framePixelToRegion.put(t + satVolumeOffset, pixelMap);
         }
     }
     
@@ -22893,5 +23153,1220 @@ public class VideoAnnotationTool {
         if (comp instanceof Container) {
             styleComponentRecursively((Container) comp);
         }
+    }
+
+    private VideoBatchPanel.Listener batchListener() {
+        if (batchUiListener != null) {
+            return batchUiListener;
+        }
+        return new VideoBatchPanel.Listener() {
+            @Override
+            public void onPreviewClip(int clipIndex) {
+                previewClip(clipIndex);
+            }
+
+            @Override
+            public void onViewEntireVideo() {
+                viewEntireVideo();
+            }
+
+            @Override
+            public void onSwitchToClip(int clipIndex) {
+                switchToClip(clipIndex);
+            }
+
+            @Override
+            public void onBackToWorkingClip() {
+                backToWorkingClip();
+            }
+        };
+    }
+
+    private boolean maybeOfferOrResumeBatches() {
+        if (imp == null || currentVideoPath == null) {
+            return false;
+        }
+        File manifestFile = VideoBatchManifest.fileFor(batchDirectory(), currentVideoBaseName());
+        if (manifestFile.exists()) {
+            int choice = JOptionPane.showOptionDialog(
+                frame,
+                "This video already has a clip session.\nResume the existing clips without reloading all optical flow?",
+                "Resume clip session",
+                JOptionPane.YES_NO_CANCEL_OPTION,
+                JOptionPane.QUESTION_MESSAGE,
+                null,
+                new String[]{"Resume", "Re-split...", "Ignore"},
+                "Resume");
+            if (choice == 0) {
+                resumeBatchesFromManifest(manifestFile);
+                return true;
+            }
+            if (choice == 1) {
+                showSplitClipsDialog(true);
+                return batchCoordinator.isEnabled();
+            }
+            return false;
+        }
+        long available = queryServerAvailableBytes();
+        int width = imp.getWidth();
+        int height = imp.getHeight();
+        String method = getConfiguredFlowMethod();
+        int disDownsample = parsePositiveInt(config.getProperty("dis.downsample.factor", "2"), 2);
+        long estimated = VideoBatchPlan.estimateFlowBytes(
+            Math.max(0, totalSlices - 1), width, height, method, disDownsample, false);
+        boolean float16 = VideoBatchPlan.shouldUseFloat16(estimated, available);
+        if (float16) {
+            estimated = VideoBatchPlan.estimateFlowBytes(
+                Math.max(0, totalSlices - 1), width, height, method, disDownsample, true);
+        }
+        if (!VideoBatchPlan.shouldPromptSplit(totalSlices, estimated, available)) {
+            return false;
+        }
+        showSplitClipsDialog(false);
+        return batchCoordinator.isEnabled();
+    }
+
+    private void showSplitClipsDialog(boolean fromMenu) {
+        if (imp == null) {
+            JOptionPane.showMessageDialog(frame, "Open a video first.", "Split clips", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        boolean resplit = batchCoordinator.isEnabled() && batchCoordinator.getManifest() != null;
+        if (resplit && fromMenu) {
+            if (VideoBatchPanel.confirmReSplit(frame) != JOptionPane.YES_OPTION) {
+                return;
+            }
+            saveWorkingClipSilent();
+        }
+        long available = queryServerAvailableBytes();
+        int width = imp.getWidth();
+        int height = imp.getHeight();
+        String method = getConfiguredFlowMethod();
+        int disDownsample = parsePositiveInt(config.getProperty("dis.downsample.factor", "2"), 2);
+        long estimated = VideoBatchPlan.estimateFlowBytes(
+            Math.max(0, totalSlices - 1), width, height, method, disDownsample, false);
+        boolean float16 = VideoBatchPlan.shouldUseFloat16(estimated, available);
+        int suggested = VideoBatchPlan.suggestedClipCount(
+            totalSlices, width, height, method, disDownsample, float16, available);
+        VideoBatchPanel.SplitResult result = VideoBatchPanel.showSplitDialog(
+            frame, totalSlices, width, height, method, disDownsample, float16, available, suggested);
+        if (result.cancelled) {
+            return;
+        }
+        if (result.keepSingle) {
+            if (resplit) {
+                mergeExistingClipsIntoMemory();
+                batchCoordinator.disable();
+                refreshBatchUi();
+                applyNavigationLimits();
+            }
+            return;
+        }
+        activateBatches(result.clipCount, resplit);
+    }
+
+    private void activateBatches(int clipCount, boolean resplit) {
+        Map<String, Map<Integer, Point>> existing = new LinkedHashMap<>();
+        Map<String, Color> existingColors = new LinkedHashMap<>(trackColors);
+        Map<String, List<Anchor>> existingAnchors = copyAnchorMap(trackAnchors);
+        if (resplit) {
+            existing.putAll(mergeExistingClipsIntoMemory());
+        } else {
+            existing.putAll(copyTrackMap(trackAnnotations));
+        }
+        List<VideoBatchPlan.ClipRange> ranges = VideoBatchPlan.split(totalSlices, clipCount);
+        VideoBatchManifest manifest = VideoBatchManifest.create(
+            currentVideoBaseName(),
+            ranges,
+            imp.getWidth(),
+            imp.getHeight(),
+            clipCount,
+            currentVideoBaseName(),
+            getConfiguredFlowMethod());
+        manifest.trackCounter = Math.max(trackCounter, manifest.trackCounter);
+        batchCoordinator.activate(manifest, batchDirectory(), currentVideoBaseName());
+        for (VideoBatchPlan.ClipRange range : ranges) {
+            VideoBatchStore.ClipSnapshot snap = new VideoBatchStore.ClipSnapshot();
+            snap.tracks.putAll(VideoBatchPlan.splitTracksForClip(existing, range));
+            snap.colors.putAll(existingColors);
+            for (Map.Entry<String, List<Anchor>> entry : existingAnchors.entrySet()) {
+                List<Anchor> clipped = clipAnchorsToRange(entry.getValue(), range);
+                if (!clipped.isEmpty()) {
+                    snap.anchors.put(entry.getKey(), clipped);
+                }
+            }
+            try {
+                VideoBatchStore.save(
+                    batchCoordinator.annotationFile(range.index),
+                    snap,
+                    currentVideoBaseName(),
+                    range,
+                    totalSlices);
+                manifest.markSaved(range.index, snap.hasAnnotations());
+            } catch (Exception ex) {
+                System.err.println("Failed to write clip JSON: " + ex.getMessage());
+            }
+        }
+        trackAnnotations.clear();
+        trackAnchors.clear();
+        trackColors.clear();
+        trackOptimized.clear();
+        opticalFlowComputed = false;
+        undoStack.clear();
+        redoStack.clear();
+        try {
+            batchCoordinator.saveManifest();
+        } catch (Exception ex) {
+            System.err.println("Failed to save clip manifest: " + ex.getMessage());
+        }
+        previewClip(0);
+        setStatus("Video split into " + ranges.size() + " clips. Preview a clip, then Switch to load its optical flow.");
+    }
+
+    private void refreshBatchUi() {
+        VideoBatchPanel.refreshStrip(batchStrip, batchCoordinator, batchListener());
+        VideoBatchPanel.refreshBanner(batchBanner, batchCoordinator, batchListener());
+        if (fillClipsMenuItem != null) {
+            fillClipsMenuItem.setEnabled(batchCoordinator.isEnabled());
+        }
+        if (frame != null) {
+            frame.revalidate();
+            frame.repaint();
+        }
+    }
+
+    private void applyNavigationLimits() {
+        if (frameSlider == null || totalSlices <= 1) {
+            updateFrameStatus();
+            return;
+        }
+        resetSliderZoom();
+        currentSlice = clampNavigationSlice(currentSlice);
+        frameSlider.setValue(currentSlice);
+        updateFrameStatus();
+        if (imp != null) {
+            loadSliceImage();
+        }
+        imageLabel.repaint();
+    }
+
+    private int clampNavigationSlice(int slice) {
+        return batchCoordinator.clampSlice(slice, totalSlices);
+    }
+
+    private int navigationMinSlice() {
+        VideoBatchPlan.ClipRange range = batchCoordinator.navigationRange();
+        return range == null ? 1 : range.startFrame + 1;
+    }
+
+    private int navigationMaxSlice() {
+        VideoBatchPlan.ClipRange range = batchCoordinator.navigationRange();
+        return range == null ? Math.max(1, totalSlices) : Math.min(totalSlices, range.endFrame + 1);
+    }
+
+    private void updateFrameStatus() {
+        if (pageLabel != null) {
+            pageLabel.setText(VideoBatchPanel.frameStatus(currentSlice, totalSlices, batchCoordinator));
+        }
+    }
+
+    private boolean offerPreviewForOutOfClipFrame(int frame1Based) {
+        VideoBatchPlan.ClipRange range = batchCoordinator.navigationRange();
+        if (range == null) {
+            return true;
+        }
+        int global = frame1Based - 1;
+        if (range.contains(global)) {
+            return true;
+        }
+        int clipIndex = VideoBatchPlan.clipIndexForFrame(batchCoordinator.ranges(), global);
+        if (clipIndex < 0) {
+            return false;
+        }
+        int choice = JOptionPane.showConfirmDialog(
+            frame,
+            "Frame " + frame1Based + " is outside this clip.\nPreview the clip that contains it?",
+            "Outside current clip",
+            JOptionPane.YES_NO_OPTION,
+            JOptionPane.QUESTION_MESSAGE);
+        if (choice == JOptionPane.YES_OPTION) {
+            previewClip(clipIndex);
+            currentSlice = clampNavigationSlice(frame1Based);
+            return true;
+        }
+        return false;
+    }
+
+    private Map<String, Map<Integer, Point>> annotationMapsForDisplay() {
+        if (batchCoordinator.isPreview()) {
+            return batchCoordinator.getPreviewBoundaryAnnotations();
+        }
+        if (batchCoordinator.isEntireVideo()) {
+            return batchCoordinator.getStitchedAnnotations();
+        }
+        return trackAnnotations;
+    }
+
+    private boolean allowBatchAnnotation(String action) {
+        if (batchCoordinator.allowsAnnotation()) {
+            return true;
+        }
+        JOptionPane.showMessageDialog(
+            frame,
+            "Switch to a clip before you " + action + ".\nPreview and Entire video are read-only.",
+            "Clip preview",
+            JOptionPane.INFORMATION_MESSAGE);
+        return false;
+    }
+
+    private boolean allowBatchSat() {
+        if (batchCoordinator.allowsSat()) {
+            return true;
+        }
+        JOptionPane.showMessageDialog(
+            frame,
+            "SAT is only available while working on a clip.\nIt is disabled in preview and Entire video to save RAM.",
+            "SAT unavailable",
+            JOptionPane.INFORMATION_MESSAGE);
+        satEnabled = false;
+        if (satCheckbox != null) {
+            satCheckbox.setSelected(false);
+        }
+        return false;
+    }
+
+    private void appendBatchFrameArgs(List<String> args) {
+        VideoBatchPlan.ClipRange range = batchCoordinator.isWork() ? batchCoordinator.workingRange() : null;
+        if (range == null || args == null) {
+            return;
+        }
+        args.add("--frame-start");
+        args.add(String.valueOf(range.startFrame));
+        args.add("--frame-end");
+        args.add(String.valueOf(range.endFrame));
+    }
+
+    private void putBatchFrameRange(JSONObject req) {
+        VideoBatchPlan.ClipRange range = batchCoordinator.isWork() ? batchCoordinator.workingRange() : null;
+        if (range == null || req == null) {
+            return;
+        }
+        req.put("frame_start", range.startFrame);
+        req.put("frame_end", range.endFrame);
+    }
+
+    private String currentVideoBaseName() {
+        if (currentVideoPath == null) {
+            return "video";
+        }
+        String name = new File(currentVideoPath).getName();
+        int dot = name.lastIndexOf('.');
+        return dot > 0 ? name.substring(0, dot) : name;
+    }
+
+    private File batchDirectory() {
+        return new File(getOutputDirectory());
+    }
+
+    private void previewClip(int clipIndex) {
+        if (batchCoordinator.getManifest() == null) {
+            return;
+        }
+        batchCoordinator.enterPreview(clipIndex);
+        refreshPreviewBoundaries();
+        applyNavigationLimits();
+        currentSlice = clampNavigationSlice(batchCoordinator.previewRange().startFrame + 1);
+        if (frameSlider != null) {
+            frameSlider.setValue(currentSlice);
+        }
+        loadSliceImage();
+        refreshBatchUi();
+        updateFrameStatus();
+        setStatus("Previewing clip " + (clipIndex + 1) + ". Switch to load optical flow.");
+    }
+
+    private void viewEntireVideo() {
+        if (!batchCoordinator.isEnabled() && (batchCoordinator.getManifest() == null
+            || batchCoordinator.getManifest().batchCount <= 1)) {
+            return;
+        }
+        batchCoordinator.enterEntireVideo();
+        refreshStitchedAnnotations();
+        applyNavigationLimits();
+        refreshBatchUi();
+        updateFrameStatus();
+        setStatus("Viewing entire video. Annotations are read-only.");
+    }
+
+    private void switchToClip(int clipIndex) {
+        if (imp == null || currentVideoPath == null) {
+            return;
+        }
+        if (batchSwitchInProgress) {
+            return;
+        }
+        if (batchCoordinator.isWork() && batchCoordinator.workingClipIndex() == clipIndex
+            && opticalFlowComputed) {
+            refreshBatchUi();
+            return;
+        }
+        if (!prepareSwitchToClip(clipIndex)) {
+            return;
+        }
+        runSwitchFlowAndPropagateAsync(clipIndex);
+    }
+
+    private void backToWorkingClip() {
+        int working = batchCoordinator.workingClipIndex();
+        if (working < 0) {
+            viewEntireVideo();
+            return;
+        }
+        batchCoordinator.enterWork(working);
+        applyNavigationLimits();
+        refreshBatchUi();
+        updateFrameStatus();
+        imageLabel.repaint();
+    }
+
+    private boolean prepareSwitchToClip(int clipIndex) {
+        if (batchCoordinator.isWork() && batchCoordinator.workingClipIndex() >= 0
+            && batchCoordinator.workingClipIndex() != clipIndex) {
+            if (!saveWorkingClipSilent()) {
+                JOptionPane.showMessageDialog(frame,
+                    "Could not save the current clip before switching.",
+                    "Switch failed",
+                    JOptionPane.ERROR_MESSAGE);
+                return false;
+            }
+        }
+        VideoBatchStore.ClipSnapshot orig = null;
+        try {
+            batchCoordinator.enterWork(clipIndex);
+            loadClipIntoMemory(clipIndex);
+            orig = snapshotFromMemory();
+            syncAdjacentClipJson(clipIndex);
+        } catch (Exception ex) {
+            ex.printStackTrace();
+            JOptionPane.showMessageDialog(frame,
+                "Failed to load clip annotations:\n" + ex.getMessage(),
+                "Switch failed",
+                JOptionPane.ERROR_MESSAGE);
+            return false;
+        }
+        pendingSwitchOriginal = orig;
+        VideoBatchPlan.ClipRange range = batchCoordinator.workingRange();
+        if (range != null) {
+            currentSlice = range.startFrame + 1;
+        }
+        applyNavigationLimits();
+        refreshBatchUi();
+        opticalFlowComputed = false;
+        return true;
+    }
+
+    private VideoBatchStore.ClipSnapshot pendingSwitchOriginal;
+
+    private void runSwitchFlowAndPropagateAsync(int clipIndex) {
+        batchSwitchInProgress = true;
+        final JDialog progressDialog = new JDialog(frame, "Switching clip", true);
+        progressDialog.setUndecorated(true);
+        progressDialog.setDefaultCloseOperation(JDialog.DO_NOTHING_ON_CLOSE);
+        JLabel message = new JLabel("Loading clip " + (clipIndex + 1) + " optical flow...");
+        message.setBorder(BorderFactory.createEmptyBorder(24, 28, 24, 28));
+        progressDialog.add(message);
+        progressDialog.pack();
+        progressDialog.setLocationRelativeTo(frame);
+
+        SwingWorker<Boolean, String> worker = new SwingWorker<Boolean, String>() {
+            @Override
+            protected Boolean doInBackground() throws Exception {
+                clearMemoryBeforeSwitch();
+                publish("Loading optical flow for clip " + (clipIndex + 1) + "...");
+                ensureWorkingClipFlowLoaded();
+                publish("Propagating tracks...");
+                propagateOnSwitch(clipIndex, pendingSwitchOriginal);
+                return true;
+            }
+
+            @Override
+            protected void process(List<String> chunks) {
+                if (!chunks.isEmpty()) {
+                    message.setText(chunks.get(chunks.size() - 1));
+                    setStatus(chunks.get(chunks.size() - 1));
+                }
+            }
+
+            @Override
+            protected void done() {
+                try {
+                    Boolean ok = get();
+                    opticalFlowComputed = Boolean.TRUE.equals(ok);
+                    if (opticalFlowComputed) {
+                        markWorkingClipFlowComputed();
+                        saveWorkingClipSilent();
+                        undoStack.clear();
+                        redoStack.clear();
+                        setStatus("Working on clip " + (clipIndex + 1));
+                    }
+                } catch (Exception ex) {
+                    opticalFlowComputed = false;
+                    setStatus("Switch failed: " + ex.getMessage());
+                    JOptionPane.showMessageDialog(frame,
+                        "Failed to switch clips:\n" + ex.getMessage(),
+                        "Switch failed",
+                        JOptionPane.ERROR_MESSAGE);
+                } finally {
+                    batchSwitchInProgress = false;
+                    pendingSwitchOriginal = null;
+                    refreshBatchUi();
+                    refreshAnnotationList();
+                    loadSliceImage();
+                    progressDialog.dispose();
+                }
+            }
+        };
+        worker.execute();
+        progressDialog.setVisible(true);
+    }
+
+    private void ensureWorkingClipFlowLoaded() throws Exception {
+        String method = getConfiguredFlowMethod();
+        java.util.List<File> cached = filterFlowFilesByResolution(findCachedFlowFiles(currentVideoPath, method));
+        if (!cached.isEmpty()) {
+            if (!loadFlowIntoServer(method)) {
+                throw new IOException("Failed to load cached clip optical flow");
+            }
+            return;
+        }
+        if (!runComputeFlowProcess(false)) {
+            throw new IOException("Failed to compute clip optical flow");
+        }
+    }
+
+    private boolean saveWorkingClipSilent() {
+        if (!batchCoordinator.isWork() || batchCoordinator.workingRange() == null) {
+            return true;
+        }
+        try {
+            VideoBatchStore.ClipSnapshot snap = snapshotFromMemory();
+            VideoBatchStore.save(
+                batchCoordinator.annotationFile(batchCoordinator.workingClipIndex()),
+                snap,
+                currentVideoBaseName(),
+                batchCoordinator.workingRange(),
+                totalSlices);
+            if (batchCoordinator.getManifest() != null) {
+                batchCoordinator.getManifest().trackCounter = Math.max(
+                    batchCoordinator.getManifest().trackCounter, trackCounter);
+                batchCoordinator.getManifest().markSaved(batchCoordinator.workingClipIndex(), snap.hasAnnotations());
+                batchCoordinator.saveManifest();
+            }
+            return true;
+        } catch (Exception ex) {
+            System.err.println("Failed to save working clip: " + ex.getMessage());
+            return false;
+        }
+    }
+
+    private void loadClipIntoMemory(int clipIndex) throws Exception {
+        VideoBatchStore.ClipSnapshot snap = VideoBatchStore.load(batchCoordinator.annotationFile(clipIndex));
+        applySnapshotToMemory(snap);
+        if (batchCoordinator.getManifest() != null) {
+            trackCounter = Math.max(trackCounter, batchCoordinator.getManifest().trackCounter);
+        }
+    }
+
+    private VideoBatchStore.ClipSnapshot snapshotFromMemory() {
+        VideoBatchStore.ClipSnapshot snap = new VideoBatchStore.ClipSnapshot();
+        VideoBatchPlan.ClipRange range = batchCoordinator.workingRange();
+        if (range != null) {
+            snap.batchIndex = range.index;
+            snap.startFrame = range.startFrame;
+            snap.endFrame = range.endFrame;
+        }
+        snap.totalFrames = totalSlices;
+        snap.tracks.putAll(copyTrackMap(trackAnnotations));
+        snap.colors.putAll(trackColors);
+        snap.anchors.putAll(copyAnchorMap(trackAnchors));
+        snap.optimized.putAll(trackOptimized);
+        return snap;
+    }
+
+    private void applySnapshotToMemory(VideoBatchStore.ClipSnapshot snap) {
+        trackAnnotations.clear();
+        trackColors.clear();
+        trackAnchors.clear();
+        trackOptimized.clear();
+        if (snap == null) {
+            return;
+        }
+        trackAnnotations.putAll(copyTrackMap(snap.tracks));
+        trackColors.putAll(snap.colors);
+        trackAnchors.putAll(copyAnchorMap(snap.anchors));
+        trackOptimized.putAll(snap.optimized);
+        for (String trackId : trackAnnotations.keySet()) {
+            trackAnchors.computeIfAbsent(trackId, k -> new ArrayList<>());
+            trackOptimized.putIfAbsent(trackId, false);
+            if (!trackColors.containsKey(trackId)) {
+                trackColors.put(trackId, generateRandomColor());
+            }
+        }
+    }
+
+    private void syncAdjacentClipJson(int clipIndex) throws Exception {
+        VideoBatchStore.ClipSnapshot current = snapshotFromMemory();
+        for (int neighbor : batchCoordinator.neighborIndexes(clipIndex)) {
+            VideoBatchStore.ClipSnapshot neighborSnap = VideoBatchStore.load(batchCoordinator.annotationFile(neighbor));
+            int overlap = batchCoordinator.overlapFrame(neighbor, clipIndex);
+            VideoBatchStore.syncOverlapSnapshots(neighborSnap, current, overlap);
+        }
+        applySnapshotToMemory(current);
+        for (int neighbor : batchCoordinator.neighborIndexes(clipIndex)) {
+            VideoBatchStore.ClipSnapshot neighborSnap = VideoBatchStore.load(batchCoordinator.annotationFile(neighbor));
+            int overlap = batchCoordinator.overlapFrame(clipIndex, neighbor);
+            VideoBatchStore.syncOverlapSnapshots(current, neighborSnap, overlap);
+            VideoBatchStore.save(
+                batchCoordinator.annotationFile(neighbor),
+                neighborSnap,
+                currentVideoBaseName(),
+                batchCoordinator.getManifest().rangeAt(neighbor),
+                totalSlices);
+            if (batchCoordinator.getManifest() != null) {
+                batchCoordinator.getManifest().markSaved(neighbor, neighborSnap.hasAnnotations());
+            }
+        }
+        VideoBatchStore.save(
+            batchCoordinator.annotationFile(clipIndex),
+            current,
+            currentVideoBaseName(),
+            batchCoordinator.workingRange(),
+            totalSlices);
+        if (batchCoordinator.getManifest() != null) {
+            batchCoordinator.getManifest().markSaved(clipIndex, current.hasAnnotations());
+            batchCoordinator.saveManifest();
+        }
+    }
+
+    private void propagateOnSwitch(int clipIndex, VideoBatchStore.ClipSnapshot original) throws Exception {
+        VideoBatchPlan.ClipRange clip = batchCoordinator.workingRange();
+        if (clip == null) {
+            return;
+        }
+        Set<String> trackIds = new LinkedHashSet<>(trackAnnotations.keySet());
+        if (original != null) {
+            trackIds.addAll(original.tracks.keySet());
+        }
+        for (int neighbor : batchCoordinator.neighborIndexes(clipIndex)) {
+            VideoBatchStore.ClipSnapshot neighborSnap = VideoBatchStore.load(batchCoordinator.annotationFile(neighbor));
+            trackIds.addAll(neighborSnap.tracks.keySet());
+        }
+        for (String trackId : trackIds) {
+            if (batchFillCancelled.get()) {
+                return;
+            }
+            Map<Integer, Point> currentPoints = trackAnnotations.getOrDefault(trackId, new LinkedHashMap<>());
+            Map<Integer, Point> originalPoints = original == null
+                ? Collections.emptyMap()
+                : original.tracks.getOrDefault(trackId, Collections.emptyMap());
+            boolean interior = VideoBatchPlan.hasInteriorAnnotations(originalPoints, clip);
+            boolean overlapChanged = false;
+            Point seed = null;
+            int seedFrame = -1;
+            for (int neighbor : batchCoordinator.neighborIndexes(clipIndex)) {
+                int overlap = batchCoordinator.overlapFrame(neighbor, clipIndex);
+                if (overlap < 0) {
+                    continue;
+                }
+                Point after = currentPoints.get(overlap);
+                Point before = originalPoints.get(overlap);
+                if (VideoBatchPlan.pointsDiffer(before, after)) {
+                    overlapChanged = true;
+                }
+                if (after != null) {
+                    seed = after;
+                    seedFrame = overlap;
+                    upsertOverlapAnchor(trackId, overlap, after);
+                }
+            }
+            VideoBatchPlan.SwitchAction action = VideoBatchPlan.decideSwitchAction(interior, overlapChanged);
+            if (action == VideoBatchPlan.SwitchAction.SKIP) {
+                continue;
+            }
+            if (action == VideoBatchPlan.SwitchAction.SEED_PROPAGATE) {
+                if (seed == null) {
+                    continue;
+                }
+                Map<Integer, Point> points = runTrackSeedNow(trackId, seed.x, seed.y, seedFrame);
+                clipPointsToRange(points, clip);
+                if (!points.isEmpty()) {
+                    trackAnnotations.put(trackId, points);
+                    trackOptimized.put(trackId, true);
+                }
+            } else if (action == VideoBatchPlan.SwitchAction.REOPTIMIZE_WITH_ANCHORS) {
+                List<Anchor> anchors = trackAnchors.get(trackId);
+                if (anchors == null || anchors.isEmpty()) {
+                    continue;
+                }
+                Map<Integer, Point> points = runTrackAnchorsNow(trackId, anchors);
+                clipPointsToRange(points, clip);
+                if (!points.isEmpty()) {
+                    trackAnnotations.put(trackId, points);
+                    trackOptimized.put(trackId, true);
+                }
+            }
+        }
+    }
+
+    private void upsertOverlapAnchor(String trackId, int frame, Point point) {
+        List<Anchor> anchors = trackAnchors.computeIfAbsent(trackId, k -> new ArrayList<>());
+        anchors.removeIf(anchor -> anchor != null && anchor.frame == frame);
+        anchors.add(new Anchor(frame, point.x, point.y));
+        anchors.sort((a, b) -> Integer.compare(a.frame, b.frame));
+    }
+
+    private void clipPointsToRange(Map<Integer, Point> points, VideoBatchPlan.ClipRange clip) {
+        if (points == null || clip == null) {
+            return;
+        }
+        points.entrySet().removeIf(entry -> entry.getKey() == null || !clip.contains(entry.getKey()));
+    }
+
+    private Map<Integer, Point> runTrackSeedNow(String trackId, int seedX, int seedY, int seedFrame) throws Exception {
+        String outputDir = getOutputDirectory();
+        String videoBaseName = currentVideoBaseName();
+        if (canUseDirectTrackingIpc()) {
+            JSONObject req = new JSONObject();
+            req.put("command", "propagate_track");
+            req.put("video_path", workingVideoPath);
+            putBatchFrameRange(req);
+            req.put("output_path", outputDir);
+            req.put("video_name", videoBaseName);
+            req.put("seed_x", seedX);
+            req.put("seed_y", seedY);
+            req.put("seed_frame", seedFrame);
+            req.put("use_blob_detection", Boolean.parseBoolean(config.getProperty("dis.use.blob.detection", "false")));
+            req.put("blob_search_radius", Integer.parseInt(config.getProperty("dis.blob.search.radius", "15")));
+            req.put("blob_radius", Double.parseDouble(config.getProperty("dis.blob.radius", "5.0")));
+            JSONObject resp = sendTrackingServerRequest(req);
+            ensureOkResponse(resp);
+            File jsonFile = new File(outputDir, videoBaseName + "_annotations.json");
+            return parseAnnotationsJson(jsonFile);
+        }
+        File scriptFile = getTrackingScript();
+        List<String> args = new ArrayList<>();
+        args.add("track_seed");
+        args.add("--tiff");
+        args.add(workingVideoPath);
+        appendBatchFrameArgs(args);
+        args.add("--output-dir");
+        args.add(outputDir);
+        args.add("--video-name");
+        args.add(videoBaseName);
+        args.add("--seed-x");
+        args.add(String.valueOf(seedX));
+        args.add("--seed-y");
+        args.add(String.valueOf(seedY));
+        args.add("--seed-frame");
+        args.add(String.valueOf(seedFrame));
+        List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
+        ProcessBuilder pb = new ProcessBuilder(command);
+        setServerEnvironmentVariables(pb);
+        pb.redirectErrorStream(true);
+        Process process = pb.start();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                System.out.println("[ClipSeed] " + line);
+            }
+        }
+        if (process.waitFor() != 0) {
+            throw new IOException("Clip seed propagation failed");
+        }
+        return parseAnnotationsJson(new File(outputDir, videoBaseName + "_annotations.json"));
+    }
+
+    private Map<Integer, Point> runTrackAnchorsNow(String trackId, List<Anchor> anchors) throws Exception {
+        String outputDir = getOutputDirectory();
+        String videoBaseName = currentVideoBaseName();
+        File anchorsFile = new File(outputDir, "anchors_clip_temp.json");
+        JSONArray anchorsArray = new JSONArray();
+        for (Anchor anchor : anchors) {
+            if (anchor == null) {
+                continue;
+            }
+            JSONObject obj = new JSONObject();
+            obj.put("frame", anchor.frame);
+            obj.put("x", anchor.x);
+            obj.put("y", anchor.y);
+            anchorsArray.put(obj);
+        }
+        try (FileWriter writer = new FileWriter(anchorsFile)) {
+            writer.write(anchorsArray.toString(2));
+        }
+        File scriptFile = getTrackingScript();
+        String correctionMethod = config.getProperty("correction.method", "full_blend");
+        List<String> args = new ArrayList<>();
+        args.add("track_anchors");
+        args.add("--tiff");
+        args.add(workingVideoPath);
+        appendBatchFrameArgs(args);
+        args.add("--output-dir");
+        args.add(outputDir);
+        args.add("--video-name");
+        args.add(videoBaseName);
+        args.add("--anchors");
+        args.add(anchorsFile.getAbsolutePath());
+        args.add("--correction-method");
+        args.add(correctionMethod);
+        args.add("--blob-search-radius");
+        args.add(config.getProperty("dis.blob.search.radius", "15"));
+        args.add("--blob-radius");
+        args.add(config.getProperty("dis.blob.radius", "5.0"));
+        args.add("--corridor-width");
+        args.add(config.getProperty("corridor.width", "adaptive"));
+        args.add("--linear-interp-threshold");
+        args.add(config.getProperty("correction.linear.interp.threshold", "0"));
+        List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
+        ProcessBuilder pb = new ProcessBuilder(command);
+        setServerEnvironmentVariables(pb);
+        pb.redirectErrorStream(true);
+        Process process = pb.start();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                System.out.println("[ClipAnchors] " + line);
+            }
+        }
+        if (process.waitFor() != 0) {
+            throw new IOException("Clip anchor optimization failed");
+        }
+        anchorsFile.delete();
+        File jsonFile = new File(outputDir, videoBaseName + "_annotations.json");
+        Map<Integer, Point> points = parseAnnotationsJson(jsonFile);
+        return points;
+    }
+
+    private void fillRemainingClips() {
+        if (!batchCoordinator.isEnabled() || batchCoordinator.getManifest() == null) {
+            JOptionPane.showMessageDialog(frame, "Split the video into clips first.", "Fill clips",
+                JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        int confirm = JOptionPane.showConfirmDialog(
+            frame,
+            "Walk every clip in order, loading one optical-flow array at a time.\n" +
+                "New tracks seed-propagate; existing interior corrections are kept.\n\nContinue?",
+            "Fill remaining clips",
+            JOptionPane.YES_NO_OPTION);
+        if (confirm != JOptionPane.YES_OPTION) {
+            return;
+        }
+        batchFillCancelled.set(false);
+        int count = batchCoordinator.getManifest().batchCount;
+        final JDialog progressDialog = new JDialog(frame, "Fill clips", true);
+        progressDialog.setUndecorated(true);
+        JLabel message = new JLabel("Filling clips...");
+        JButton cancel = new JButton("Cancel");
+        cancel.addActionListener(e -> batchFillCancelled.set(true));
+        JPanel panel = new JPanel(new BorderLayout(8, 8));
+        panel.setBorder(BorderFactory.createEmptyBorder(20, 24, 20, 24));
+        panel.add(message, BorderLayout.CENTER);
+        panel.add(cancel, BorderLayout.SOUTH);
+        progressDialog.add(panel);
+        progressDialog.pack();
+        progressDialog.setLocationRelativeTo(frame);
+
+        SwingWorker<Void, String> worker = new SwingWorker<Void, String>() {
+            @Override
+            protected Void doInBackground() throws Exception {
+                for (int i = 0; i < count; i++) {
+                    if (batchFillCancelled.get()) {
+                        break;
+                    }
+                    publish("Switching to clip " + (i + 1) + " of " + count + "...");
+                    final int clipIndex = i;
+                    AtomicBoolean prepared = new AtomicBoolean(false);
+                    SwingUtilities.invokeAndWait(() -> prepared.set(prepareSwitchToClip(clipIndex)));
+                    if (!prepared.get()) {
+                        throw new IOException("Could not prepare clip " + (i + 1));
+                    }
+                    clearMemoryBeforeSwitch();
+                    ensureWorkingClipFlowLoaded();
+                    propagateOnSwitch(clipIndex, pendingSwitchOriginal);
+                    SwingUtilities.invokeAndWait(() -> {
+                        opticalFlowComputed = true;
+                        saveWorkingClipSilent();
+                        undoStack.clear();
+                        redoStack.clear();
+                    });
+                }
+                return null;
+            }
+
+            @Override
+            protected void process(List<String> chunks) {
+                if (!chunks.isEmpty()) {
+                    message.setText(chunks.get(chunks.size() - 1));
+                    setStatus(chunks.get(chunks.size() - 1));
+                }
+            }
+
+            @Override
+            protected void done() {
+                try {
+                    get();
+                    setStatus(batchFillCancelled.get() ? "Fill remaining clips cancelled" : "Filled remaining clips");
+                } catch (Exception ex) {
+                    JOptionPane.showMessageDialog(frame, "Fill failed:\n" + ex.getMessage(),
+                        "Fill clips", JOptionPane.ERROR_MESSAGE);
+                } finally {
+                    pendingSwitchOriginal = null;
+                    refreshBatchUi();
+                    refreshAnnotationList();
+                    loadSliceImage();
+                    progressDialog.dispose();
+                }
+            }
+        };
+        worker.execute();
+        progressDialog.setVisible(true);
+    }
+
+    private void exportMergedBatchAnnotations() {
+        saveWorkingClipSilent();
+        Map<String, Map<Integer, Point>> backupTracks = copyTrackMap(trackAnnotations);
+        Map<String, Color> backupColors = new LinkedHashMap<>(trackColors);
+        Map<String, List<Anchor>> backupAnchors = copyAnchorMap(trackAnchors);
+        Map<String, Boolean> backupOptimized = new LinkedHashMap<>(trackOptimized);
+        try {
+            refreshStitchedAnnotations();
+            trackAnnotations.clear();
+            trackAnnotations.putAll(copyTrackMap(batchCoordinator.getStitchedAnnotations()));
+            trackColors.clear();
+            trackColors.putAll(batchCoordinator.getStitchedColors());
+            mergeAnchorsFromAllClips();
+            if (trackAnnotations.isEmpty()) {
+                JOptionPane.showMessageDialog(frame, "No tracks to export.", "Export", JOptionPane.INFORMATION_MESSAGE);
+                return;
+            }
+            ExportOptionsResult exportOptions = showExportOptionsDialog();
+            if (exportOptions == null) {
+                return;
+            }
+            if (exportOptions.content == ExportContent.BOTH) {
+                File savedDir = exportToFormat(exportOptions.format, ExportContent.RICH, "_rich", null);
+                if (savedDir != null) {
+                    exportToFormat(exportOptions.format, ExportContent.TRAJECTORIES_ONLY, "_trajectories", savedDir);
+                }
+            } else {
+                String suffix = exportOptions.content == ExportContent.TRAJECTORIES_ONLY ? "_trajectories" : "";
+                exportToFormat(exportOptions.format, exportOptions.content, suffix, null);
+            }
+        } catch (Exception ex) {
+            JOptionPane.showMessageDialog(frame, "Failed to export merged annotations: " + ex.getMessage(),
+                "Export", JOptionPane.ERROR_MESSAGE);
+        } finally {
+            trackAnnotations.clear();
+            trackAnnotations.putAll(backupTracks);
+            trackColors.clear();
+            trackColors.putAll(backupColors);
+            trackAnchors.clear();
+            trackAnchors.putAll(backupAnchors);
+            trackOptimized.clear();
+            trackOptimized.putAll(backupOptimized);
+        }
+    }
+
+    private void splitImportedTracksIntoClips() {
+        if (!batchCoordinator.isEnabled() || batchCoordinator.getManifest() == null) {
+            return;
+        }
+        Map<String, Map<Integer, Point>> full = copyTrackMap(trackAnnotations);
+        Map<String, Color> colors = new LinkedHashMap<>(trackColors);
+        Map<String, List<Anchor>> anchors = copyAnchorMap(trackAnchors);
+        for (VideoBatchPlan.ClipRange range : batchCoordinator.ranges()) {
+            VideoBatchStore.ClipSnapshot snap = new VideoBatchStore.ClipSnapshot();
+            snap.tracks.putAll(VideoBatchPlan.splitTracksForClip(full, range));
+            snap.colors.putAll(colors);
+            for (Map.Entry<String, List<Anchor>> entry : anchors.entrySet()) {
+                List<Anchor> clipped = clipAnchorsToRange(entry.getValue(), range);
+                if (!clipped.isEmpty()) {
+                    snap.anchors.put(entry.getKey(), clipped);
+                }
+            }
+            try {
+                VideoBatchStore.save(
+                    batchCoordinator.annotationFile(range.index),
+                    snap,
+                    currentVideoBaseName(),
+                    range,
+                    totalSlices);
+                batchCoordinator.getManifest().markSaved(range.index, snap.hasAnnotations());
+            } catch (Exception ex) {
+                System.err.println("Failed to split imported tracks into clip " + range.index + ": " + ex.getMessage());
+            }
+        }
+        if (batchCoordinator.getManifest() != null) {
+            batchCoordinator.getManifest().trackCounter = Math.max(
+                batchCoordinator.getManifest().trackCounter, trackCounter);
+            try {
+                batchCoordinator.saveManifest();
+            } catch (Exception ignored) {
+            }
+        }
+        if (batchCoordinator.isWork()) {
+            try {
+                loadClipIntoMemory(batchCoordinator.workingClipIndex());
+            } catch (Exception ignored) {
+            }
+        } else if (batchCoordinator.isPreview()) {
+            refreshPreviewBoundaries();
+        } else if (batchCoordinator.isEntireVideo()) {
+            refreshStitchedAnnotations();
+        }
+    }
+
+    private void refreshStitchedAnnotations() {
+        List<Map<String, Map<Integer, Point>>> clips = new ArrayList<>();
+        List<Long> saved = new ArrayList<>();
+        Map<String, Color> colors = new LinkedHashMap<>();
+        if (batchCoordinator.getManifest() != null) {
+            for (VideoBatchManifest.ClipEntry entry : batchCoordinator.getManifest().batches) {
+                try {
+                    VideoBatchStore.ClipSnapshot snap;
+                    if (batchCoordinator.isWork() && entry.index == batchCoordinator.workingClipIndex()) {
+                        snap = snapshotFromMemory();
+                    } else {
+                        snap = VideoBatchStore.load(batchCoordinator.annotationFile(entry.index));
+                    }
+                    clips.add(snap.tracks);
+                    saved.add(entry.lastSavedMs);
+                    colors.putAll(snap.colors);
+                } catch (Exception ex) {
+                    clips.add(Collections.emptyMap());
+                    saved.add(0L);
+                }
+            }
+        }
+        batchCoordinator.setStitched(VideoBatchPlan.mergeClipTracks(clips, saved), colors);
+    }
+
+    private void refreshPreviewBoundaries() {
+        VideoBatchPlan.ClipRange clip = batchCoordinator.previewRange();
+        if (clip == null) {
+            return;
+        }
+        Map<String, Map<Integer, Point>> tracks = new LinkedHashMap<>();
+        Map<String, Color> colors = new LinkedHashMap<>();
+        try {
+            VideoBatchStore.ClipSnapshot snap = VideoBatchStore.load(batchCoordinator.annotationFile(clip.index));
+            tracks.putAll(snap.tracks);
+            colors.putAll(snap.colors);
+        } catch (Exception ignored) {
+        }
+        if (batchCoordinator.workingClipIndex() == clip.index) {
+            for (Map.Entry<String, Map<Integer, Point>> entry : trackAnnotations.entrySet()) {
+                tracks.put(entry.getKey(), copyPoints(entry.getValue()));
+            }
+            colors.putAll(trackColors);
+        } else if (batchCoordinator.workingClipIndex() >= 0) {
+            int overlap = batchCoordinator.overlapFrame(batchCoordinator.workingClipIndex(), clip.index);
+            if (overlap >= 0) {
+                VideoBatchPlan.syncOverlapFrame(trackAnnotations, tracks, overlap);
+            }
+        }
+        batchCoordinator.setPreviewBoundaries(tracks, colors, clip);
+    }
+
+    private void resumeBatchesFromManifest(File manifestFile) {
+        try {
+            VideoBatchManifest manifest = VideoBatchManifest.load(manifestFile);
+            if (manifest.totalFrames > 0 && totalSlices > 0 && manifest.totalFrames != totalSlices) {
+                int choice = JOptionPane.showConfirmDialog(
+                    frame,
+                    "The saved clip session has " + manifest.totalFrames +
+                        " frames, but this video has " + totalSlices + ".\nResume anyway?",
+                    "Frame count mismatch",
+                    JOptionPane.YES_NO_OPTION,
+                    JOptionPane.WARNING_MESSAGE);
+                if (choice != JOptionPane.YES_OPTION) {
+                    return;
+                }
+            }
+            File directory = manifestFile.getParentFile() != null ? manifestFile.getParentFile() : batchDirectory();
+            batchCoordinator.activate(manifest, directory, currentVideoBaseName());
+            trackCounter = Math.max(trackCounter, manifest.trackCounter);
+            opticalFlowComputed = false;
+            previewClip(0);
+            setStatus("Resumed clip session. Preview a clip, then Switch to load its optical flow.");
+        } catch (Exception ex) {
+            JOptionPane.showMessageDialog(frame, "Failed to resume clip session:\n" + ex.getMessage(),
+                "Resume failed", JOptionPane.ERROR_MESSAGE);
+        }
+    }
+
+    private Map<String, Map<Integer, Point>> mergeExistingClipsIntoMemory() {
+        refreshStitchedAnnotations();
+        Map<String, Map<Integer, Point>> merged = copyTrackMap(batchCoordinator.getStitchedAnnotations());
+        if (!trackAnnotations.isEmpty()) {
+            List<Map<String, Map<Integer, Point>>> parts = new ArrayList<>();
+            parts.add(merged);
+            parts.add(copyTrackMap(trackAnnotations));
+            List<Long> times = new ArrayList<>();
+            times.add(0L);
+            times.add(System.currentTimeMillis());
+            merged = VideoBatchPlan.mergeClipTracks(parts, times);
+        }
+        trackAnnotations.clear();
+        trackAnnotations.putAll(merged);
+        trackColors.putAll(batchCoordinator.getStitchedColors());
+        return merged;
+    }
+
+    private void mergeAnchorsFromAllClips() {
+        Map<String, List<Anchor>> merged = new LinkedHashMap<>();
+        if (batchCoordinator.getManifest() == null) {
+            return;
+        }
+        for (VideoBatchManifest.ClipEntry entry : batchCoordinator.getManifest().batches) {
+            try {
+                VideoBatchStore.ClipSnapshot snap = (batchCoordinator.isWork()
+                    && entry.index == batchCoordinator.workingClipIndex())
+                    ? snapshotFromMemory()
+                    : VideoBatchStore.load(batchCoordinator.annotationFile(entry.index));
+                for (Map.Entry<String, List<Anchor>> track : snap.anchors.entrySet()) {
+                    List<Anchor> dest = merged.computeIfAbsent(track.getKey(), k -> new ArrayList<>());
+                    if (track.getValue() == null) {
+                        continue;
+                    }
+                    for (Anchor anchor : track.getValue()) {
+                        dest.removeIf(existing -> existing != null && existing.frame == anchor.frame);
+                        dest.add(anchor);
+                    }
+                    dest.sort((a, b) -> Integer.compare(a.frame, b.frame));
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        trackAnchors.clear();
+        trackAnchors.putAll(merged);
+    }
+
+    private void deleteTrackFromAllClipFiles(String trackId) {
+        if (batchCoordinator.getManifest() == null || trackId == null) {
+            return;
+        }
+        for (VideoBatchManifest.ClipEntry entry : batchCoordinator.getManifest().batches) {
+            try {
+                File file = batchCoordinator.annotationFile(entry.index);
+                VideoBatchStore.ClipSnapshot snap = VideoBatchStore.load(file);
+                snap.tracks.remove(trackId);
+                snap.anchors.remove(trackId);
+                snap.colors.remove(trackId);
+                snap.optimized.remove(trackId);
+                VideoBatchStore.save(file, snap, currentVideoBaseName(), entry.toRange(), totalSlices);
+                batchCoordinator.getManifest().markSaved(entry.index, snap.hasAnnotations());
+            } catch (Exception ex) {
+                System.err.println("Failed to delete " + trackId + " from clip " + entry.index + ": " + ex.getMessage());
+            }
+        }
+        try {
+            batchCoordinator.saveManifest();
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void markWorkingClipFlowComputed() {
+        if (batchCoordinator.getManifest() == null || !batchCoordinator.isWork()) {
+            return;
+        }
+        VideoBatchManifest.ClipEntry entry = batchCoordinator.getManifest().entryAt(batchCoordinator.workingClipIndex());
+        if (entry != null) {
+            entry.flowComputed = true;
+        }
+        try {
+            batchCoordinator.saveManifest();
+        } catch (Exception ignored) {
+        }
+    }
+
+    private long queryServerAvailableBytes() {
+        try {
+            if (canUseDirectTrackingIpc() && isServerRunning()) {
+                JSONObject req = new JSONObject();
+                req.put("command", Constants.CMD_MEMORY_STATUS);
+                JSONObject resp = sendTrackingServerRequest(req);
+                if (resp.has("available_bytes") && !resp.isNull("available_bytes")) {
+                    return resp.getLong("available_bytes");
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return getAvailableMemoryBytes();
+    }
+
+    private int parsePositiveInt(String value, int fallback) {
+        try {
+            return Math.max(1, Integer.parseInt(value.trim()));
+        } catch (Exception ex) {
+            return fallback;
+        }
+    }
+
+    private Map<String, Map<Integer, Point>> copyTrackMap(Map<String, Map<Integer, Point>> source) {
+        Map<String, Map<Integer, Point>> copy = new LinkedHashMap<>();
+        if (source == null) {
+            return copy;
+        }
+        for (Map.Entry<String, Map<Integer, Point>> entry : source.entrySet()) {
+            copy.put(entry.getKey(), copyPoints(entry.getValue()));
+        }
+        return copy;
+    }
+
+    private Map<Integer, Point> copyPoints(Map<Integer, Point> source) {
+        Map<Integer, Point> copy = new LinkedHashMap<>();
+        if (source == null) {
+            return copy;
+        }
+        for (Map.Entry<Integer, Point> entry : source.entrySet()) {
+            if (entry.getKey() != null && entry.getValue() != null) {
+                copy.put(entry.getKey(), new Point(entry.getValue()));
+            }
+        }
+        return copy;
+    }
+
+    private Map<String, List<Anchor>> copyAnchorMap(Map<String, List<Anchor>> source) {
+        Map<String, List<Anchor>> copy = new LinkedHashMap<>();
+        if (source == null) {
+            return copy;
+        }
+        for (Map.Entry<String, List<Anchor>> entry : source.entrySet()) {
+            List<Anchor> anchors = new ArrayList<>();
+            if (entry.getValue() != null) {
+                for (Anchor anchor : entry.getValue()) {
+                    if (anchor != null) {
+                        anchors.add(new Anchor(anchor.frame, anchor.x, anchor.y));
+                    }
+                }
+            }
+            copy.put(entry.getKey(), anchors);
+        }
+        return copy;
+    }
+
+    private List<Anchor> clipAnchorsToRange(List<Anchor> anchors, VideoBatchPlan.ClipRange range) {
+        List<Anchor> clipped = new ArrayList<>();
+        if (anchors == null || range == null) {
+            return clipped;
+        }
+        for (Anchor anchor : anchors) {
+            if (anchor != null && range.contains(anchor.frame)) {
+                clipped.add(new Anchor(anchor.frame, anchor.x, anchor.y));
+            }
+        }
+        return clipped;
     }
 }

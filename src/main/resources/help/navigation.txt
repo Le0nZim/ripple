@@ -1,1 +1,25 @@
-Coming soon...
+NAVIGATION
+
+The frame slider, playback, mouse wheel, jump buttons, and Go To all
+move through the video. Frame numbers in the UI are 1-based.
+
+CLIP LIMITS
+
+After you split a video, preview and work modes clamp navigation to that
+clip. Playback stays inside the clip. Slider zoom is nested inside the
+clip range (or the full video in Entire video mode).
+
+If you type a Go To frame that is outside the current clip, RIPPLE
+offers to preview the clip that contains it.
+
+ENTIRE VIDEO
+
+The Entire video chip unlocks the slider so you can watch the whole
+movie. Annotations are read-only (stitched from every clip JSON plus
+the unsaved working clip). Optical flow, SAT, and new tracks stay off.
+
+PREVIEW VS WORK
+
+Selecting a clip chip is preview only: cheap, no flow load. The banner
+has Switch to this clip (commit: save previous, load this clip’s flow)
+and Back / Entire video.

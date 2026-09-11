@@ -1,1 +1,35 @@
-Coming soon...
+IMPORT AND EXPORT
+
+EXPORT
+
+Save writes the usual annotation file. In clip mode you can export:
+
+- Current clip — this clip’s JSON (global frame numbers).
+- Merged entire video — one file for the whole movie. On the shared
+  overlap frame, the last-saved clip wins.
+
+Video export can use the merge without loading every clip’s flow.
+
+Clip files sit next to the video:
+  {video}_ripple_batches.json
+  {video}_batch01_annotations.json
+  {video}_batch02_annotations.json
+  …
+
+IMPORT
+
+- A full-video JSON is split by clip range (overlap frames are copied
+  into both neighbors).
+- A clip JSON is applied to the matching / current clip.
+- Opening a {video}_ripple_batches.json file resumes the clip session.
+
+RESUME
+
+If a manifest already sits next to the video, Open offers Resume
+(restore the clip plan, do not reload all flows), Re-split, or Ignore.
+
+Re-splitting remaps existing global points into the new ranges. You
+must Switch each clip to propagate again.
+
+Fine-tuning needs a merged entire-video JSON. Export the merge first;
+Train is disabled while clip batching is active.

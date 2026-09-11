@@ -58,6 +58,8 @@ from pathlib import Path
 from functools import lru_cache
 from time import perf_counter as _pc
 
+import video_batch
+
 # ============================================================================
 # CRITICAL: Parse --gpu argument BEFORE importing torch/CUDA libraries
 # CUDA_VISIBLE_DEVICES must be set before any CUDA initialization occurs
@@ -2690,6 +2692,50 @@ class TrackingServer:
                 print(f"   CUDA cache cleared")
         
         self._current_video_path = new_video_path
+
+    def _request_frame_range(self, request, total_frames=None):
+        return video_batch.resolve_frame_range(request, total_frames)
+
+    def _flow_key(self, video_path, request=None, extra="", frame_start=None, frame_end=None):
+        if request is not None and frame_start is None and frame_end is None:
+            frame_start, frame_end = video_batch.resolve_frame_range(request)
+        return video_batch.flow_cache_key(video_path, frame_start, frame_end, extra)
+
+    def _get_cached_flow(self, video_path, request=None, extra=""):
+        key = self._flow_key(video_path, request=request, extra=extra)
+        entry = self.flow_cache.get(key)
+        if entry:
+            return entry
+        return self.flow_cache.get(video_path)
+
+    def _remember_flow(self, video_path, entry, request=None, extra="", frame_start=None, frame_end=None):
+        key = self._flow_key(
+            video_path, request=request, extra=extra,
+            frame_start=frame_start, frame_end=frame_end,
+        )
+        self.flow_cache[key] = entry
+        self.flow_cache[video_path] = entry
+        metadata = entry.get("metadata")
+        if metadata is not None:
+            self.video_metadata[key] = metadata
+            self.video_metadata[video_path] = metadata
+        return entry
+
+    def _memory_status(self, request):
+        payload = video_batch.memory_status_payload()
+        flow_bytes = 0
+        for entry in self.flow_cache.values():
+            flows = entry.get("flows_np") if isinstance(entry, dict) else None
+            if flows is None:
+                continue
+            if hasattr(flows, "nbytes"):
+                flow_bytes += int(flows.nbytes)
+            elif hasattr(flows, "_data") and hasattr(flows._data, "nbytes"):
+                flow_bytes += int(flows._data.nbytes)
+        payload["flow_cache_entries"] = len(self.flow_cache)
+        payload["flow_cache_bytes"] = flow_bytes
+        payload["flow_cache_keys"] = [str(k) for k in self.flow_cache.keys()]
+        return payload
     
     def _clear_video_accessor_cache(self):
         """Clear the video accessor cache and close any open file handles."""
@@ -2855,9 +2901,14 @@ class TrackingServer:
             param_suffix = ""
         else:
             param_suffix = ""
+
+        range_token = video_batch.flow_range_token(
+            params.get("frame_start"), params.get("frame_end")
+        )
+        range_suffix = f"_{range_token}" if range_token else ""
         
         # Construct final filename
-        filename = f"{video_name}_{method}{size_suffix}{param_suffix}_optical_flow.npz"
+        filename = f"{video_name}_{method}{size_suffix}{param_suffix}{range_suffix}_optical_flow.npz"
         return os.path.join(directory, filename)
     
     def _find_existing_flow_file(self, base_output_path, method, target_width=None, target_height=None, **params):
@@ -2946,6 +2997,18 @@ class TrackingServer:
             print(f"  No {method} flow file found matching resolution "
                   f"{'%dx%d' % (target_width, target_height) if target_width else 'original'}")
             return None
+
+        frame_start = params.get("frame_start") if params else None
+        frame_end = params.get("frame_end") if params else None
+        range_filtered = [
+            f for f in filtered_files
+            if video_batch.filename_matches_range(os.path.basename(f), frame_start, frame_end)
+        ]
+        if video_batch.has_frame_range(frame_start, frame_end) and not range_filtered:
+            print(f"  No {method} flow file found matching clip frames {frame_start}-{frame_end}")
+            return None
+        if range_filtered:
+            filtered_files = range_filtered
         
         # CRITICAL: Filter by parameters if provided
         # Build expected parameter pattern based on method and params
@@ -3384,6 +3447,8 @@ class TrackingServer:
                     response = {"status": "ok", "message": "pong"}
                 elif command == "get_gpu_info":
                     response = self._get_gpu_info()
+                elif command == "memory_status":
+                    response = self._memory_status(request)
                 elif command == "clear_cache":
                     response = self._clear_cache(request)
                 elif command == "unload_gpu_models" or command == "clear_memory":
@@ -3934,7 +3999,7 @@ class TrackingServer:
             "elapsed_time": total_time
         }
 
-    def _store_flow_entry(self, video_path, flows, metadata=None, force_float32=False):
+    def _store_flow_entry(self, video_path, flows, metadata=None, force_float32=False, cache_key=None):
         """Store optical flow in cache with memory-efficient float16 compression.
         
         Args:
@@ -3942,6 +4007,7 @@ class TrackingServer:
             flows: Flow array (T-1, H, W, 2)
             metadata: Optional metadata dict
             force_float32: If True, disable float16 compression (for testing)
+            cache_key: Optional range-aware cache key
         
         Returns:
             Cache entry dict
@@ -3975,8 +4041,12 @@ class TrackingServer:
         if metadata:
             entry["metadata"] = metadata
             self.video_metadata[video_path] = metadata
+            if cache_key:
+                self.video_metadata[cache_key] = metadata
 
         self.flow_cache[video_path] = entry
+        if cache_key:
+            self.flow_cache[cache_key] = entry
         return entry
     
     @staticmethod
@@ -3996,13 +4066,16 @@ class TrackingServer:
             return float(value)
         raise ValueError(f"Unsupported corridor width type: {type(value).__name__}")
     
-    def _load_video_raw_and_normalized(self, video_path, target_width=None, target_height=None):
+    def _load_video_raw_and_normalized(self, video_path, target_width=None, target_height=None,
+                                       frame_start=None, frame_end=None):
         """Load video and return both raw and normalized versions.
         
         Args:
             video_path: Path to video file (TIFF or AVI)
             target_width: Optional target width for resizing. If None or <=0, no resizing.
             target_height: Optional target height for resizing. If None or <=0, no resizing.
+            frame_start: Optional inclusive 0-based start frame.
+            frame_end: Optional inclusive 0-based end frame.
         
         Returns:
             tuple: (raw_video, normalized_video, is_avi, original_shape, resized_shape)
@@ -4013,6 +4086,40 @@ class TrackingServer:
             - resized_shape: shape after any resize applied
         """
         video_path_str = str(video_path)
+        if video_batch.has_frame_range(frame_start, frame_end):
+            print(f"Loading video slice frames {frame_start}-{frame_end}: {video_path_str}")
+            should_resize = (target_width is not None and target_width > 0 and
+                             target_height is not None and target_height > 0)
+            if video_path_str.lower().endswith(".avi"):
+                raw_video, full_t = video_batch.load_avi_range(video_path_str, frame_start, frame_end)
+                orig_shape = (full_t,) + raw_video.shape[1:3]
+                if should_resize:
+                    import mediapy as media
+                    raw_video = media.resize_video(raw_video, (target_height, target_width))
+                normalized_video = raw_video.astype(np.float32) / 255.0
+                return raw_video, normalized_video, True, orig_shape, raw_video.shape[:3]
+
+            vol, full_t, full_h, full_w = video_batch.load_tiff_range(
+                video_path_str, frame_start, frame_end
+            )
+            orig_shape = (full_t, full_h, full_w)
+            if should_resize:
+                import cv2
+                T = vol.shape[0]
+                if vol.shape[1] != target_height or vol.shape[2] != target_width:
+                    resized = np.zeros((T, target_height, target_width), dtype=np.float32)
+                    for t in range(T):
+                        if t % 5 == 0:
+                            self._check_cancelled("Video resizing")
+                        resized[t] = cv2.resize(
+                            vol[t], (target_width, target_height), interpolation=cv2.INTER_LINEAR
+                        )
+                    vol = resized
+            raw_video = vol
+            vmin, vmax = float(vol.min()), float(vol.max())
+            den = max(vmax - vmin, 1e-6)
+            normalized_video = (vol - vmin) / den
+            return raw_video, normalized_video, False, orig_shape, (vol.shape[0], vol.shape[1], vol.shape[2])
         
         # Determine if resizing is requested
         should_resize = (target_width is not None and target_width > 0 and 
@@ -4127,10 +4234,12 @@ class TrackingServer:
         T, H, W = vol.shape
         return raw_video, normalized_video, False, orig_shape, (T, H, W)
 
-    def _load_and_normalize_video(self, video_path, target_width=None, target_height=None):
+    def _load_and_normalize_video(self, video_path, target_width=None, target_height=None,
+                                  frame_start=None, frame_end=None):
         """Backward-compatible wrapper: return only normalized video."""
         raw_video, normalized_video, is_avi, orig_shape, resized_shape = self._load_video_raw_and_normalized(
-            video_path, target_width=target_width, target_height=target_height
+            video_path, target_width=target_width, target_height=target_height,
+            frame_start=frame_start, frame_end=frame_end
         )
         return normalized_video, is_avi, orig_shape
     
@@ -4153,6 +4262,9 @@ class TrackingServer:
             force_recompute = bool(force_recompute)
         
         print(f"[RAFT FLOW] force_recompute={force_recompute}")
+        frame_start, frame_end = self._request_frame_range(request)
+        if frame_start is not None:
+            print(f"[RAFT FLOW] frame range: {frame_start}-{frame_end}")
 
         # Allow caller to pass output_path as a directory ("--output-dir")
         output_path = self._normalize_flow_output_path(request, output_path)
@@ -4161,7 +4273,7 @@ class TrackingServer:
         self._clear_flow_cache_for_new_video(video_path)
         
         # Check in-memory cache first - verify method matches
-        cache_entry = self.flow_cache.get(video_path)
+        cache_entry = self._get_cached_flow(video_path, request)
         cached_method = cache_entry.get("metadata", {}).get("method", "raft") if cache_entry else None
         
         if cache_entry and not force_recompute and cached_method == "raft":
@@ -4171,7 +4283,8 @@ class TrackingServer:
         elif output_path and not force_recompute:
             # Find existing flow file matching resolution (exact path or pattern match)
             disk_path = output_path if os.path.exists(output_path) else self._find_existing_flow_file(
-                output_path, 'raft', target_width=target_width, target_height=target_height)
+                output_path, 'raft', target_width=target_width, target_height=target_height,
+                frame_start=frame_start, frame_end=frame_end)
             
             if disk_path and os.path.exists(disk_path):
                 print(f"Loading flow from disk cache: {disk_path}")
@@ -4184,7 +4297,9 @@ class TrackingServer:
                     disk_method = str(data.get('method', 'raft')) if 'method' in data.files else 'raft'
                     if disk_method != 'raft':
                         print(f"Disk cache has method '{disk_method}', need 'raft'. Recomputing...")
-                        flows = self._compute_flow_from_video(video_path, output_path, target_width, target_height)
+                        flows = self._compute_flow_from_video(
+                            video_path, output_path, target_width, target_height,
+                            frame_start=frame_start, frame_end=frame_end)
                     else:
                         # CRITICAL: Validate resolution matches current working video
                         if 'resized_shape' in data.files:
@@ -4197,7 +4312,9 @@ class TrackingServer:
                                 if flow_W != target_width or flow_H != target_height:
                                     print(f"⚠ Resolution mismatch: cached flow is {flow_W}x{flow_H}, "
                                           f"need {target_width}x{target_height}. Recomputing...")
-                                    flows = self._compute_flow_from_video(video_path, output_path, target_width, target_height)
+                                    flows = self._compute_flow_from_video(
+                            video_path, output_path, target_width, target_height,
+                            frame_start=frame_start, frame_end=frame_end)
                                 else:
                                     if 'original_shape' in data:
                                         metadata = {
@@ -4239,15 +4356,21 @@ class TrackingServer:
                 except Exception as e:
                     print(f"Failed to load from disk cache: {e}")
                     print("Computing RAFT flow from scratch...")
-                    flows = self._compute_flow_from_video(video_path, output_path, target_width, target_height)
+                    flows = self._compute_flow_from_video(
+                        video_path, output_path, target_width, target_height,
+                        frame_start=frame_start, frame_end=frame_end)
             else:
                 if cached_method and cached_method != "raft":
                     print(f"Cache has method '{cached_method}', switching to RAFT...")
-            flows = self._compute_flow_from_video(video_path, output_path if save_to_disk else None, target_width, target_height)
+            flows = self._compute_flow_from_video(
+                video_path, output_path if save_to_disk else None, target_width, target_height,
+                frame_start=frame_start, frame_end=frame_end)
         else:
             if cached_method and cached_method != "raft":
                 print(f"Cache has method '{cached_method}', switching to RAFT...")
-            flows = self._compute_flow_from_video(video_path, output_path if save_to_disk else None, target_width, target_height)
+            flows = self._compute_flow_from_video(
+                video_path, output_path if save_to_disk else None, target_width, target_height,
+                frame_start=frame_start, frame_end=frame_end)
         response = {
             "status": "ok",
             "message": "RAFT optical flow computed",
@@ -4266,7 +4389,8 @@ class TrackingServer:
         
         return response
     
-    def _compute_flow_from_video(self, video_path, output_path=None, target_width=None, target_height=None):
+    def _compute_flow_from_video(self, video_path, output_path=None, target_width=None, target_height=None,
+                                 frame_start=None, frame_end=None):
         """Helper to compute RAFT flow from video file.
         
         Args:
@@ -4274,6 +4398,8 @@ class TrackingServer:
             output_path: Optional path to save computed flow
             target_width: Optional target width for resizing
             target_height: Optional target height for resizing
+            frame_start: Optional inclusive 0-based start frame
+            frame_end: Optional inclusive 0-based end frame
             
         Note: If the video resolution would exceed available GPU memory, this method
               will automatically downscale to a safe resolution.
@@ -4281,16 +4407,24 @@ class TrackingServer:
         print(f"Computing RAFT optical flow for {video_path}")
         if target_width and target_height:
             print(f"Using target resolution: {target_width}x{target_height}")
+        if frame_start is not None:
+            print(f"Using frame range: {frame_start}-{frame_end}")
         start_time = _pc()
         
         # First, peek at video dimensions without loading full data
         video_path_str = str(video_path)
         if video_path_str.lower().endswith('.avi'):
-            # For AVI, we need to load to get dimensions
-            import mediapy as media
-            video_peek = media.read_video(video_path_str)
-            orig_T, orig_H, orig_W = video_peek.shape[:3]
-            del video_peek
+            # Peek AVI dimensions without loading every frame when possible
+            cap = cv2.VideoCapture(video_path_str)
+            orig_T = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+            orig_W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
+            orig_H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 0
+            cap.release()
+            if orig_T <= 0 or orig_W <= 0:
+                import mediapy as media
+                video_peek = media.read_video(video_path_str)
+                orig_T, orig_H, orig_W = video_peek.shape[:3]
+                del video_peek
         else:
             # For TIFF, use tifffile to get shape without loading
             with tifffile.TiffFile(video_path_str) as tif:
@@ -4325,7 +4459,8 @@ class TrackingServer:
                 print(f"     Consider compressing video to smaller resolution.")
         
         raw_video, v01, is_avi, orig_shape, resized_shape = self._load_video_raw_and_normalized(
-            video_path, target_width=target_width, target_height=target_height
+            video_path, target_width=target_width, target_height=target_height,
+            frame_start=frame_start, frame_end=frame_end
         )
         
         if is_avi:
@@ -4442,7 +4577,11 @@ class TrackingServer:
             print(f"  ✓ Flow downscaled to original resolution")
 
         # Cache the flow in memory
-        entry = self._store_flow_entry(video_path, flows, metadata=metadata)
+        raft_key = self._flow_key(video_path, frame_start=frame_start, frame_end=frame_end)
+        if video_batch.has_frame_range(frame_start, frame_end):
+            metadata["frame_start"] = int(frame_start)
+            metadata["frame_end"] = int(frame_end)
+        entry = self._store_flow_entry(video_path, flows, metadata=metadata, cache_key=raft_key)
         flows_np = entry["flows_np"]
         
         # Save to file if requested (also save metadata including method)
@@ -4451,7 +4590,9 @@ class TrackingServer:
             actual_output_path = self._build_flow_filename(
                 output_path, 'raft', 
                 resized_shape=resized_shape,
-                original_shape=orig_shape
+                original_shape=orig_shape,
+                frame_start=frame_start,
+                frame_end=frame_end
             )
             # Get raw array for saving (handles MemoryEfficientFlowArray)
             flows_to_save = flows_np.get_raw() if hasattr(flows_np, 'get_raw') else flows_np
@@ -4546,7 +4687,11 @@ class TrackingServer:
         DS = downsample_factor
         
         # Cache key includes downsample factor
-        cache_key = f"{video_path}_dis_ds{downsample_factor}"
+        frame_start, frame_end = self._request_frame_range(request)
+        cache_key = self._flow_key(
+            video_path, extra=f"dis_ds{downsample_factor}",
+            frame_start=frame_start, frame_end=frame_end
+        )
         print(f"[DIS FLOW] Cache key: {cache_key}")
         print(f"[DIS FLOW] force_recompute (after parsing): {force_recompute}")
         
@@ -4589,7 +4734,8 @@ class TrackingServer:
         if output_path and not force_recompute:
             disk_path = self._find_existing_flow_file(
                 output_path, 'dis', target_width=target_width, target_height=target_height,
-                downsample_factor=downsample_factor)
+                downsample_factor=downsample_factor,
+                frame_start=frame_start, frame_end=frame_end)
             if disk_path and os.path.exists(disk_path):
                 print(f"Loading DIS flow from disk cache: {disk_path}")
                 try:
@@ -4674,11 +4820,18 @@ class TrackingServer:
         # Use memory-efficient frame-by-frame loading for large TIFF files
         # This avoids loading the entire video into memory at once
         if is_avi:
-            # For AVI, use mediapy which handles large files better
-            print(f"Loading AVI with mediapy: {video_path_str}")
-            video = media.read_video(video_path_str)
-            orig_shape = video.shape[:3]
-            T, H, W = orig_shape[0], orig_shape[1], orig_shape[2]
+            if video_batch.has_frame_range(frame_start, frame_end):
+                print(f"Loading AVI slice {frame_start}-{frame_end} with OpenCV: {video_path_str}")
+                video, full_t = video_batch.load_avi_range(video_path_str, frame_start, frame_end)
+                H, W = video.shape[1], video.shape[2]
+                orig_shape = (full_t, H, W)
+                T = video.shape[0]
+            else:
+                # For AVI, use mediapy which handles large files better
+                print(f"Loading AVI with mediapy: {video_path_str}")
+                video = media.read_video(video_path_str)
+                orig_shape = video.shape[:3]
+                T, H, W = orig_shape[0], orig_shape[1], orig_shape[2]
             
             if should_resize:
                 target_H, target_W = target_height, target_width
@@ -4810,6 +4963,14 @@ class TrackingServer:
         # H, W are the frame dimensions (after any target resize from Java UI)
         H, W = target_H, target_W
         
+        # Apply clip range before allocating flow arrays
+        clip_start = 0 if frame_start is None else max(0, int(frame_start))
+        if frame_end is not None and not (is_avi and video_batch.has_frame_range(frame_start, frame_end)):
+            full_t = orig_shape[0] if orig_shape else T
+            clip_end = min(int(frame_end), full_t - 1)
+            T = max(2, clip_end - clip_start + 1)
+            resized_shape = (T, target_H, target_W)
+
         # CRITICAL MEMORY OPTIMIZATION: 
         # Store flow at DOWNSAMPLED resolution (H//DS, W//DS), NOT upscaled to full resolution.
         # This reduces memory by DS^2 factor (e.g., DS=2 -> 4x less memory).
@@ -4881,7 +5042,13 @@ class TrackingServer:
         print(f"  Storing at: {flow_W}x{flow_H}")
         
         # Pre-load first frame
-        prev_frame = get_frame_gray(0)
+        if is_avi and video_batch.has_frame_range(frame_start, frame_end):
+            def get_frame_gray_clip(t):
+                return get_frame_gray(t - clip_start)
+            _get_gray = get_frame_gray_clip
+        else:
+            _get_gray = get_frame_gray
+        prev_frame = _get_gray(clip_start)
         
         # Safety: validate first frame is single-channel uint8
         if prev_frame is None or prev_frame.size == 0:
@@ -4896,7 +5063,7 @@ class TrackingServer:
             # Allow responsive cancellation during long per-frame loops
             self._check_cancelled("DIS flow computation")
             # Get current and next frame
-            curr_frame = get_frame_gray(t + 1)
+            curr_frame = _get_gray(clip_start + t + 1)
             
             # Safety: ensure frames are single-channel uint8 for DIS
             if curr_frame is not None and curr_frame.ndim == 3:
@@ -4960,6 +5127,9 @@ class TrackingServer:
             # Scale factor to convert flow coords to input coords: multiply flow coords by this
             'flow_to_input_scale': DS,
         }
+        if video_batch.has_frame_range(frame_start, frame_end):
+            metadata['frame_start'] = int(frame_start)
+            metadata['frame_end'] = int(frame_end)
         self.video_metadata[video_path] = metadata
         
         # Clean up zarr store if used
@@ -4987,6 +5157,8 @@ class TrackingServer:
                 resized_shape=resized_shape,
                 original_shape=orig_shape,
                 downsample_factor=DS,
+                frame_start=frame_start,
+                frame_end=frame_end,
             )
             # Get raw array for saving (handles MemoryEfficientFlowArray)
             flows_to_save = flows_np.get_raw() if hasattr(flows_np, 'get_raw') else flows_np
@@ -5076,7 +5248,11 @@ class TrackingServer:
         output_path = self._normalize_flow_output_path(request, output_path)
         self._clear_flow_cache_for_new_video(video_path)
         
-        cache_key = f"{video_path}_dis_fast"
+        frame_start, frame_end = self._request_frame_range(request)
+        cache_key = self._flow_key(
+            video_path, extra="dis_fast",
+            frame_start=frame_start, frame_end=frame_end
+        )
         print(f"[DIS ULTRAFAST] Cache key: {cache_key}")
         
         # Check in-memory cache
@@ -5105,7 +5281,8 @@ class TrackingServer:
         # Check disk cache
         if output_path and not force_recompute:
             disk_path = self._find_existing_flow_file(
-                output_path, 'dis_fast', target_width=target_width, target_height=target_height)
+                output_path, 'dis_fast', target_width=target_width, target_height=target_height,
+                frame_start=frame_start, frame_end=frame_end)
             if disk_path and os.path.exists(disk_path):
                 print(f"Loading DIS Ultrafast flow from disk cache: {disk_path}")
                 try:
@@ -5153,11 +5330,18 @@ class TrackingServer:
         tiff_store = None
         
         if is_avi:
-            import mediapy as media
-            print(f"Loading AVI with mediapy: {video_path_str}")
-            video = media.read_video(video_path_str)
-            orig_shape = video.shape[:3]
-            T, H, W = orig_shape[0], orig_shape[1], orig_shape[2]
+            if video_batch.has_frame_range(frame_start, frame_end):
+                print(f"Loading AVI slice {frame_start}-{frame_end} with OpenCV: {video_path_str}")
+                video, full_t = video_batch.load_avi_range(video_path_str, frame_start, frame_end)
+                H, W = video.shape[1], video.shape[2]
+                orig_shape = (full_t, H, W)
+                T = video.shape[0]
+            else:
+                import mediapy as media
+                print(f"Loading AVI with mediapy: {video_path_str}")
+                video = media.read_video(video_path_str)
+                orig_shape = video.shape[:3]
+                T, H, W = orig_shape[0], orig_shape[1], orig_shape[2]
             
             if should_resize:
                 target_H, target_W = target_height, target_width
@@ -5239,6 +5423,13 @@ class TrackingServer:
         # Full resolution — no downsampling
         flow_H = target_H
         flow_W = target_W
+
+        clip_start = 0 if frame_start is None else max(0, int(frame_start))
+        if frame_end is not None and not (is_avi and video_batch.has_frame_range(frame_start, frame_end)):
+            full_t = orig_shape[0] if orig_shape else T
+            clip_end = min(int(frame_end), full_t - 1)
+            T = max(2, clip_end - clip_start + 1)
+            resized_shape = (T, target_H, target_W)
         
         num_flow_frames = T - 1
         expected_mem_gb = num_flow_frames * flow_H * flow_W * 2 * 4 / 1e9
@@ -5269,12 +5460,17 @@ class TrackingServer:
                 use_incremental = True
                 flow_maps = [None] * num_flow_frames
         
-        prev_frame = get_frame_gray(0)
+        if is_avi and video_batch.has_frame_range(frame_start, frame_end):
+            def _get_gray_fast(t):
+                return get_frame_gray(t - clip_start)
+        else:
+            _get_gray_fast = get_frame_gray
+        prev_frame = _get_gray_fast(clip_start)
         
         for t in range(num_flow_frames):
             self._check_cancelled("DIS Ultrafast flow computation")
             
-            curr_frame = get_frame_gray(t + 1)
+            curr_frame = _get_gray_fast(clip_start + t + 1)
             flow = dis.calc(prev_frame, curr_frame, None)
             
             if use_incremental:
@@ -5332,6 +5528,8 @@ class TrackingServer:
                 output_path, 'dis_fast',
                 resized_shape=resized_shape,
                 original_shape=orig_shape,
+                frame_start=frame_start,
+                frame_end=frame_end,
             )
             flows_to_save = flows_np.get_raw() if hasattr(flows_np, 'get_raw') else flows_np
             np.savez(
@@ -5843,15 +6041,20 @@ class TrackingServer:
         cache_video = request.get("cache_video", False)  # Whether to cache video in memory
         
         # Get or compute flows
-        entry = self.flow_cache.get(video_path)
+        frame_start, frame_end = self._request_frame_range(request)
+        entry = self._get_cached_flow(video_path, request)
         if not entry:
             self._compute_flow(request)
-            entry = self.flow_cache.get(video_path)
+            entry = self._get_cached_flow(video_path, request)
         if not entry:
             raise RuntimeError("Optical flow unavailable after recompute")
 
         flows = entry["flows_np"]
         metadata = entry.get("metadata", {})
+        if frame_start is None:
+            frame_start = metadata.get("frame_start")
+            frame_end = metadata.get("frame_end")
+        seed_frame = video_batch.to_local_frame(seed_frame, frame_start)
         
         # Get flow scale for DIS (flow stored at reduced resolution)
         flow_scale = metadata.get("flow_to_input_scale", 1)
@@ -5906,7 +6109,9 @@ class TrackingServer:
 
 
         # Export to JSON with resolution metadata
-        self._export_track_json(track, output_path, "Track1_RAFT_Baseline", video_path)
+        self._export_track_json(
+            track, output_path, "Track1_RAFT_Baseline", video_path, frame_start=frame_start
+        )
         
         return {
             "status": "ok",
@@ -5959,15 +6164,19 @@ class TrackingServer:
         linear_interp_threshold = request.get("linear_interp_threshold", 0)
         
         # Get or compute flows
-        entry = self.flow_cache.get(video_path)
+        frame_start, frame_end = self._request_frame_range(request)
+        entry = self._get_cached_flow(video_path, request)
         if not entry:
             self._compute_flow(request)
-            entry = self.flow_cache.get(video_path)
+            entry = self._get_cached_flow(video_path, request)
         if not entry:
             raise RuntimeError("Optical flow unavailable after recompute")
 
         flows = entry["flows_np"]
         metadata = entry.get("metadata", {})
+        if frame_start is None:
+            frame_start = metadata.get("frame_start")
+            frame_end = metadata.get("frame_end")
         
         # Get flow dimensions
         Tm1, flow_H, flow_W, _ = flows.shape
@@ -5995,7 +6204,7 @@ class TrackingServer:
             frame = anchor["frame"]
             x = anchor["x"]
             y = anchor["y"]
-            anchors.append((frame, x, y))
+            anchors.append((video_batch.to_local_frame(frame, frame_start), x, y))
         
         # Sort anchors by frame (bidirectional propagation - anchor can start at any frame)
         anchors = sorted(anchors, key=lambda a: a[0])
@@ -6116,7 +6325,9 @@ class TrackingServer:
             )
         
         # Export to JSON with resolution metadata
-        self._export_track_json(track, output_path, "Track1_Optimized", video_path)
+        self._export_track_json(
+            track, output_path, "Track1_Optimized", video_path, frame_start=frame_start
+        )
         
         return {
             "status": "ok",
@@ -6161,15 +6372,19 @@ class TrackingServer:
         if not tracks_spec:
             raise ValueError("No tracks provided for batch optimization")
 
-        entry = self.flow_cache.get(video_path)
+        frame_start, frame_end = self._request_frame_range(request)
+        entry = self._get_cached_flow(video_path, request)
         if not entry:
-            self._compute_flow({"video_path": video_path, "force_recompute": False})
-            entry = self.flow_cache.get(video_path)
+            self._compute_flow(request)
+            entry = self._get_cached_flow(video_path, request)
         if not entry:
             raise RuntimeError("Optical flow unavailable after recompute")
 
         flows = entry["flows_np"]
         metadata = entry.get("metadata", {})
+        if frame_start is None:
+            frame_start = metadata.get("frame_start")
+            frame_end = metadata.get("frame_end")
         
         # Get flow dimensions
         Tm1, flow_H, flow_W, _ = flows.shape
@@ -6259,7 +6474,11 @@ class TrackingServer:
 
                 anchors = []
                 for anchor in anchors_json:
-                    anchors.append((int(anchor["frame"]), float(anchor["x"]), float(anchor["y"])))
+                    anchors.append((
+                        video_batch.to_local_frame(int(anchor["frame"]), frame_start),
+                        float(anchor["x"]),
+                        float(anchor["y"]),
+                    ))
                 anchors = sorted(anchors, key=lambda a: a[0])
 
                 if use_legacy:
@@ -6342,7 +6561,7 @@ class TrackingServer:
 
         if output_path:
             # Export with resolution metadata
-            self._export_tracks_json(tracks_out, output_path, video_path)
+            self._export_tracks_json(tracks_out, output_path, video_path, frame_start=frame_start)
 
         cache_overall = self.segment_cache.stats()
 
@@ -6351,13 +6570,13 @@ class TrackingServer:
             "message": f"Optimized {len(tracks_out)} track(s)",
             "correction_method": correction_method,
             "output_path": output_path,
-            "tracks": [self._track_to_json(track_np, track_id) for track_id, track_np in tracks_out],
+            "tracks": [self._track_to_json(track_np, track_id, frame_start=frame_start) for track_id, track_np in tracks_out],
             "per_track": per_track_info,
             "cache_stats": cache_overall,
             "elapsed_time": f"{total_elapsed:.2f}s",
         }
     
-    def _track_to_json(self, track, track_id, scale_x=1.0, scale_y=1.0):
+    def _track_to_json(self, track, track_id, scale_x=1.0, scale_y=1.0, frame_start=None):
         """Convert track array to JSON format.
         
         Args:
@@ -6365,11 +6584,12 @@ class TrackingServer:
             track_id: String identifier for the track
             scale_x: Scale factor to convert x coordinates to original resolution
             scale_y: Scale factor to convert y coordinates to original resolution
+            frame_start: Optional global offset so exported frames stay global
         """
         frames_list = []
         for t in range(len(track)):
             frames_list.append({
-                "frame": int(t),
+                "frame": video_batch.to_global_frame(t, frame_start),
                 "x": int(round(track[t, 0] * scale_x)),
                 "y": int(round(track[t, 1] * scale_y)),
             })
@@ -6379,7 +6599,7 @@ class TrackingServer:
             "frames": frames_list,
         }
 
-    def _export_tracks_json(self, tracks, output_path, video_path=None):
+    def _export_tracks_json(self, tracks, output_path, video_path=None, frame_start=None):
         """Export tracks to JSON with coordinates in ORIGINAL resolution.
         
         All coordinates are automatically scaled to the original video resolution.
@@ -6411,7 +6631,7 @@ class TrackingServer:
             "metadata": {
                 "total_frames": len(tracks[0][1]) if tracks else 0
             },
-            "tracks": [self._track_to_json(track_np, track_id, scale_x, scale_y) for track_id, track_np in tracks]
+            "tracks": [self._track_to_json(track_np, track_id, scale_x, scale_y, frame_start) for track_id, track_np in tracks]
         }
         
         # Store source filename for validation (only check that remains)
@@ -6422,8 +6642,8 @@ class TrackingServer:
         with open(output_path, "w") as f:
             json.dump(payload, f, indent=2)
 
-    def _export_track_json(self, track, output_path, track_id, video_path=None):
-        self._export_tracks_json([(track_id, track)], output_path, video_path)
+    def _export_track_json(self, track, output_path, track_id, video_path=None, frame_start=None):
+        self._export_tracks_json([(track_id, track)], output_path, video_path, frame_start=frame_start)
     
     def _load_flow(self, request):
         """Load a pre-computed optical flow file into the cache.
@@ -6438,6 +6658,7 @@ class TrackingServer:
         video_path = request["video_path"]
         flow_path = request["flow_path"]
         method = request.get("method", "raft")
+        frame_start, frame_end = self._request_frame_range(request)
         
         # Clear old flow cache if switching to a different video
         self._clear_flow_cache_for_new_video(video_path)
@@ -6451,9 +6672,13 @@ class TrackingServer:
         print(f"Loading {method.upper()} flow from: {flow_path}")
         
         try:
-            data = np.load(flow_path, allow_pickle=False)
+            data = np.load(flow_path, allow_pickle=False, mmap_mode='r')
+            raw_flows = data['flows']
+            if video_batch.has_frame_range(frame_start, frame_end):
+                raw_flows = video_batch.slice_flow_to_range(raw_flows, frame_start, frame_end)
+                print(f"  Sliced flow to frames {frame_start}-{frame_end}: {raw_flows.shape}")
             # Memory-efficient loading with automatic float16 compression
-            flows = load_flows_memory_efficient(data['flows'])
+            flows = load_flows_memory_efficient(np.array(raw_flows))
             
             # Load metadata - handle all fields that may be saved
             metadata = {
@@ -6492,13 +6717,18 @@ class TrackingServer:
             if 'resized_shape' in metadata:
                 print(f"  Input dims: {metadata['resized_shape']}, Flow dims: {flows.shape[1:3]}")
             
-            # Store in cache under the video_path key
-            self.flow_cache[video_path] = {
+            if video_batch.has_frame_range(frame_start, frame_end):
+                metadata['frame_start'] = int(frame_start)
+                metadata['frame_end'] = int(frame_end)
+            cache_key = self._flow_key(video_path, frame_start=frame_start, frame_end=frame_end)
+            self.flow_cache[cache_key] = {
                 "flows_np": flows,
                 "timestamp": _pc(),
                 "metadata": metadata
             }
+            self.flow_cache[video_path] = self.flow_cache[cache_key]
             self.video_metadata[video_path] = metadata
+            self.video_metadata[cache_key] = metadata
             
             print(f"✓ {method.upper()} flow loaded into cache ({flows.shape})")
             
@@ -6530,12 +6760,15 @@ class TrackingServer:
         video_name = request.get("video_name")  # Optional video name override
         save_to_disk = request.get("save_to_disk", True)  # Default True - viz files are user-triggered
         
-        entry = self.flow_cache.get(video_path)
+        entry = self._get_cached_flow(video_path, request)
         if not entry:
             # No flow cached - compute RAFT flow as default
             print(f"No cached flow found, computing RAFT flow for visualization...")
-            self._compute_flow_from_video(video_path)
-            entry = self.flow_cache.get(video_path)
+            frame_start, frame_end = self._request_frame_range(request)
+            self._compute_flow_from_video(
+                video_path, frame_start=frame_start, frame_end=frame_end
+            )
+            entry = self._get_cached_flow(video_path, request)
         if not entry:
             raise RuntimeError("Optical flow unavailable")
 
@@ -7293,11 +7526,15 @@ class TrackingServer:
         # Cache key includes parameters that affect the output
         # This ensures recalculation when user changes kernel, smoothing, seed frame, etc.
         seed_frames_str = str(seed_frames) if seed_frames else "[0]"
-        cache_key = (
-            f"{video_path}_locotrack_"
-            f"r{radius_px:.2f}_t{threshold:.3f}_"
-            f"k{kernel}_fs{flow_smoothing:.1f}_ts{temporal_smooth_factor:.2f}_"
-            f"md{median_filter}_sp{subpixel}_inv{invert}_sf{seed_frames_str}"
+        frame_start, frame_end = self._request_frame_range(request)
+        cache_key = self._flow_key(
+            video_path,
+            extra=(
+                f"locotrack_r{radius_px:.2f}_t{threshold:.3f}_"
+                f"k{kernel}_fs{flow_smoothing:.1f}_ts{temporal_smooth_factor:.2f}_"
+                f"md{median_filter}_sp{subpixel}_inv{invert}_sf{seed_frames_str}"
+            ),
+            frame_start=frame_start, frame_end=frame_end,
         )
         
         print(f"[LocoTrack] Parameters: radius={radius_px:.2f}, kernel={kernel}, flow_smoothing={flow_smoothing}")
@@ -7316,7 +7553,8 @@ class TrackingServer:
                 radius=radius_px, threshold=threshold, kernel=kernel,
                 flow_smoothing=flow_smoothing, temporal_smooth_factor=temporal_smooth_factor,
                 median_filter=median_filter, subpixel=subpixel, invert=invert,
-                seed_frames=seed_frames if seed_frames else [0]
+                seed_frames=seed_frames if seed_frames else [0],
+                frame_start=frame_start, frame_end=frame_end
             )
             if disk_path and os.path.exists(disk_path):
                 print(f"[LocoTrack] Loading from disk cache: {disk_path}")
@@ -7389,7 +7627,12 @@ class TrackingServer:
             start_time = _pc()
             
             # Load video (raw + normalized). DoG uses raw intensities; tracking uses normalized.
-            raw_video, v01, is_avi, orig_shape, resized_shape = self._load_video_raw_and_normalized(video_path)
+            raw_video, v01, is_avi, orig_shape, resized_shape = self._load_video_raw_and_normalized(
+                video_path, target_width=target_width, target_height=target_height,
+                frame_start=frame_start, frame_end=frame_end
+            )
+            if video_batch.has_frame_range(frame_start, frame_end) and seed_frames:
+                seed_frames = [max(0, int(s) - int(frame_start)) for s in seed_frames]
 
             if is_avi:
                 # Convert to grayscale for model; keep raw grayscale for DoG
@@ -7479,7 +7722,9 @@ class TrackingServer:
                     seed_frames=seed_frames if seed_frames else [0],
                     median_filter=median_filter,
                     subpixel=subpixel,
-                    invert=invert
+                    invert=invert,
+                    frame_start=frame_start,
+                    frame_end=frame_end
                 )
                 # Get raw array for saving (handles MemoryEfficientFlowArray)
                 flows_to_save = flows.get_raw() if hasattr(flows, 'get_raw') else flows
@@ -7628,6 +7873,11 @@ class TrackingServer:
                 f"k{kernel}_fs{flow_smoothing:.1f}_sf{smooth_factor:.2f}"
             )
             print(f"[Trackpy] Parameters: radius={radius:.2f}, threshold={threshold}, kernel={kernel}")
+        frame_start, frame_end = self._request_frame_range(request)
+        cache_key = self._flow_key(
+            video_path, extra=cache_key[len(str(video_path)) + 1:],
+            frame_start=frame_start, frame_end=frame_end
+        )
         print(f"[Trackpy] Cache key: {cache_key}")
         
         # Check cache
@@ -7643,7 +7893,8 @@ class TrackingServer:
                 radius=radius, threshold=threshold, search_range=search_range, memory=memory,
                 kernel=kernel, flow_smoothing=flow_smoothing, smooth_factor=smooth_factor,
                 median_filter=median_filter_enabled, subpixel=subpixel, invert=invert,
-                diameter=diameter, minmass=minmass, use_legacy_detection=use_legacy_detection
+                diameter=diameter, minmass=minmass, use_legacy_detection=use_legacy_detection,
+                frame_start=frame_start, frame_end=frame_end
             )
             if disk_path and os.path.exists(disk_path):
                 print(f"[Trackpy] Loading from disk cache: {disk_path}")
@@ -7719,7 +7970,10 @@ class TrackingServer:
             start_time = _pc()
             
             # Load video
-            raw_video, v01, is_avi, orig_shape, resized_shape = self._load_video_raw_and_normalized(video_path)
+            raw_video, v01, is_avi, orig_shape, resized_shape = self._load_video_raw_and_normalized(
+                video_path, target_width=target_width, target_height=target_height,
+                frame_start=frame_start, frame_end=frame_end
+            )
             
             if is_avi:
                 # Convert RGB to grayscale
@@ -7804,7 +8058,9 @@ class TrackingServer:
                     smooth_factor=smooth_factor,
                     median_filter=median_filter_enabled,
                     subpixel=subpixel,
-                    invert=invert
+                    invert=invert,
+                    frame_start=frame_start,
+                    frame_end=frame_end
                 )
                 # Get raw array for saving (handles MemoryEfficientFlowArray)
                 flows_to_save = flows.get_raw() if hasattr(flows, 'get_raw') else flows
