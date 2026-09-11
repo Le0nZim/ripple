@@ -36,6 +36,13 @@ cd "$SCRIPT_DIR"
 
 # Configuration
 CONDA_ENV_NAME="ripple-env"
+RIPPLE_REQUIRED_JAVA_MAJOR=17
+
+# Shared validation helpers
+# shellcheck source=scripts/lib/java_env_check.sh
+source "${SCRIPT_DIR}/scripts/lib/java_env_check.sh"
+# shellcheck source=scripts/lib/conda_env_check.sh
+source "${SCRIPT_DIR}/scripts/lib/conda_env_check.sh"
 
 # =============================================================================
 # STEP 1: Check System Requirements
@@ -70,79 +77,80 @@ else
     echo -e "  ${YELLOW}!${NC} Unknown OS: $OS"
 fi
 
-# Check Java
+# Check Java / Maven toolchain (JDK 17+ required; Maven must use the same JDK)
 if ! command -v java &> /dev/null && [[ "$OS" == "Darwin" ]]; then
-    JAVA_HOME_CANDIDATE=$(/usr/libexec/java_home 2>/dev/null || true)
+    JAVA_HOME_CANDIDATE=$(/usr/libexec/java_home -v "${RIPPLE_REQUIRED_JAVA_MAJOR}" 2>/dev/null || /usr/libexec/java_home 2>/dev/null || true)
     if [[ -n "$JAVA_HOME_CANDIDATE" ]]; then
         export JAVA_HOME="$JAVA_HOME_CANDIDATE"
         export PATH="$JAVA_HOME/bin:$PATH"
         echo -e "  ${YELLOW}!${NC} Java found via java_home; using it for this session"
-        
-        # Persist JAVA_HOME and PATH in ~/.zshrc
-        ZSHRC="$HOME/.zshrc"
-        touch "$ZSHRC"
-        if ! grep -q "# RIPPLE JAVA" "$ZSHRC"; then
-            {
-                echo ""
-                echo "# RIPPLE JAVA"
-                echo "export JAVA_HOME=\"\$(/usr/libexec/java_home)\""
-                echo "export PATH=\"\$JAVA_HOME/bin:\$PATH\""
-            } >> "$ZSHRC"
-        else
-            # Update existing block
-            sed -i '' '/# RIPPLE JAVA/,+2c\
-            # RIPPLE JAVA\
-            export JAVA_HOME="$(/usr/libexec/java_home)"\
-            export PATH="$JAVA_HOME/bin:$PATH"' "$ZSHRC"
-        fi
-        echo -e "  ${GREEN}✓${NC} Updated ~/.zshrc with JAVA_HOME and PATH"
     fi
 fi
 
-if command -v java &> /dev/null; then
-    JAVA_VERSION=$(java -version 2>&1 | head -n1 | cut -d'"' -f2 | cut -d'.' -f1)
-    if [[ "$JAVA_VERSION" -ge 11 ]]; then
-        echo -e "  ${GREEN}✓${NC} Java $JAVA_VERSION"
-    else
-        echo -e "  ${YELLOW}!${NC} Java $JAVA_VERSION (11+ recommended)"
-    fi
-else
+echo "  Checking Java toolchain (JDK ${RIPPLE_REQUIRED_JAVA_MAJOR}+ required)..."
+if ! validate_java_toolchain 1; then
     if [[ "$OS" == "Darwin" ]]; then
-        echo -e "  ${RED}✗${NC} Java not found"
-        echo "    Download and install JDK 25:"
-        echo "    https://download.oracle.com/java/25/latest/jdk-25_macos-aarch64_bin.dmg"
-        echo "    After install, run: /usr/libexec/java_home -V"
-        echo "    Add to ~/.zshrc:" 
-        echo "      export JAVA_HOME=\"\$(/usr/libexec/java_home -v VERSION)\""
-        echo "      export PATH=\"\$JAVA_HOME/bin:\$PATH\""
-        echo "    Then: source ~/.zshrc && java -version"
-        exit 1
+        echo -e "  ${RED}✗${NC} Compatible JDK ${RIPPLE_REQUIRED_JAVA_MAJOR}+ not found"
+        echo "    Install a JDK ${RIPPLE_REQUIRED_JAVA_MAJOR}+ and ensure java, javac, and Maven agree."
+        echo "    After install: /usr/libexec/java_home -V"
+        echo "    export JAVA_HOME=\"\$(/usr/libexec/java_home -v ${RIPPLE_REQUIRED_JAVA_MAJOR})\""
+        echo "    export PATH=\"\$JAVA_HOME/bin:\$PATH\""
     else
-        echo -e "  ${RED}✗${NC} Java not found"
-        echo "    Please install Java 11 or newer (OpenJDK recommended)"
-        echo "    Ubuntu/Debian: sudo apt install openjdk-17-jdk"
-        exit 1
+        echo -e "  ${RED}✗${NC} Compatible JDK ${RIPPLE_REQUIRED_JAVA_MAJOR}+ not found"
+        echo "    Ubuntu/WSL fix:"
+        echo "      sudo apt update"
+        echo "      sudo apt install -y openjdk-17-jdk maven"
+        echo "      sudo update-alternatives --config java"
+        echo "      sudo update-alternatives --config javac"
+        echo "      export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64"
+        echo "      export PATH=\"\$JAVA_HOME/bin:\$PATH\""
     fi
+    exit 1
 fi
+echo -e "  ${GREEN}✓${NC} JDK ${RIPPLE_REQUIRED_JAVA_MAJOR}+ toolchain validated"
 
 # Check Conda (handle Homebrew, Miniforge, Miniconda, Anaconda)
-if ! command -v conda &> /dev/null; then
-    # Try common conda installation paths
-    CONDA_PATHS=(
+find_conda_exe() {
+    # Direct paths first
+    local CONDA_PATHS=(
         "$HOME/miniconda3/bin/conda"
         "$HOME/anaconda3/bin/conda"
         "$HOME/miniforge3/bin/conda"
         "$HOME/mambaforge/bin/conda"
         "/opt/homebrew/Caskroom/miniconda/base/bin/conda"
         "/opt/homebrew/Caskroom/miniforge/base/bin/conda"
+        "/opt/homebrew/Caskroom/mambaforge/base/bin/conda"
         "/usr/local/Caskroom/miniconda/base/bin/conda"
+        "/usr/local/Caskroom/miniforge/base/bin/conda"
     )
     for cpath in "${CONDA_PATHS[@]}"; do
         if [[ -x "$cpath" ]]; then
-            eval "$($cpath shell.bash hook)"
-            break
+            echo "$cpath"
+            return 0
         fi
     done
+    
+    # Try Homebrew Caskroom with version directories (e.g., /opt/homebrew/Caskroom/miniconda/24.1.2-0/base)
+    for pattern in "/opt/homebrew/Caskroom/miniconda"/*/base/bin/conda \
+                   "/opt/homebrew/Caskroom/miniforge"/*/base/bin/conda \
+                   "/opt/homebrew/Caskroom/mambaforge"/*/base/bin/conda \
+                   "/usr/local/Caskroom/miniconda"/*/base/bin/conda \
+                   "/usr/local/Caskroom/miniforge"/*/base/bin/conda; do
+        for cpath in $pattern; do
+            if [[ -x "$cpath" ]]; then
+                echo "$cpath"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+if ! command -v conda &> /dev/null; then
+    CONDA_EXE=$(find_conda_exe)
+    if [[ -n "$CONDA_EXE" ]]; then
+        eval "$($CONDA_EXE shell.bash hook)"
+    fi
 fi
 
 if ! command -v conda &> /dev/null && [[ "$OS" == "Darwin" ]]; then
@@ -308,7 +316,8 @@ else
     
     if [[ -f "$ENV_FILE" ]]; then
         # Create environment from file, but override the name
-        conda env create -f "$ENV_FILE" -n "${CONDA_ENV_NAME}" -y
+        # Note: conda env create doesn't support -y, it auto-confirms by default
+        conda env create -f "$ENV_FILE" -n "${CONDA_ENV_NAME}"
     else
         # Fallback: create minimal environment and install via pip
         echo "  Environment file not found, creating minimal environment..."
@@ -324,23 +333,20 @@ fi
 # =============================================================================
 echo -e "\n${BLUE}[5/6] Installing dependencies...${NC}"
 
-# Match Windows quickstart.bat behavior: only install if trackpy missing
-if python -c "import trackpy" 2>/dev/null; then
+# Validate or repair dependencies for the selected install mode
+set +e
+validate_conda_environment "$GPU_MODE" "$CONDA_ENV_NAME" "$SCRIPT_DIR"
+ENV_STATUS=$?
+set -e
+
+if [[ "$ENV_STATUS" -eq 0 ]]; then
     echo -e "  ${GREEN}✓${NC} Dependencies already installed"
-else
-    pip install --upgrade pip wheel setuptools -q
-    if [[ "$GPU_MODE" == "gpu" ]]; then
-        if [[ -f "requirements/requirements-gpu.txt" ]]; then
-            echo "  Installing GPU packages (this may take a few minutes)..."
-            pip install -r requirements/requirements-gpu.txt -q
-        else
-            pip install -r requirements/requirements-cpu.txt -q
-        fi
-    else
-        echo "  Installing CPU packages..."
-        pip install -r requirements/requirements-cpu.txt -q
-    fi
+elif [[ "$ENV_STATUS" -eq 2 ]]; then
+    repair_conda_environment "$GPU_MODE" "$SCRIPT_DIR"
     echo -e "  ${GREEN}✓${NC} Dependencies installed"
+else
+    echo -e "  ${RED}✗${NC} Conda environment validation failed"
+    exit 1
 fi
 
 # =============================================================================
@@ -441,31 +447,62 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # Initialize conda (handle Homebrew, Miniforge, and other installations)
-if ! command -v conda &> /dev/null; then
-    CONDA_PATHS=(
+find_conda() {
+    # Direct paths first
+    local CONDA_PATHS=(
         "$HOME/miniconda3/bin/conda"
         "$HOME/anaconda3/bin/conda"
         "$HOME/miniforge3/bin/conda"
         "$HOME/mambaforge/bin/conda"
         "/opt/homebrew/Caskroom/miniconda/base/bin/conda"
         "/opt/homebrew/Caskroom/miniforge/base/bin/conda"
+        "/opt/homebrew/Caskroom/mambaforge/base/bin/conda"
         "/usr/local/Caskroom/miniconda/base/bin/conda"
+        "/usr/local/Caskroom/miniforge/base/bin/conda"
     )
     for cpath in "${CONDA_PATHS[@]}"; do
         if [[ -x "$cpath" ]]; then
-            eval "$($cpath shell.bash hook)"
-            break
+            echo "$cpath"
+            return 0
         fi
     done
+    
+    # Try Homebrew Caskroom with version directories
+    for pattern in "/opt/homebrew/Caskroom/miniconda"/*/base/bin/conda \
+                   "/opt/homebrew/Caskroom/miniforge"/*/base/bin/conda \
+                   "/opt/homebrew/Caskroom/mambaforge"/*/base/bin/conda \
+                   "/usr/local/Caskroom/miniconda"/*/base/bin/conda \
+                   "/usr/local/Caskroom/miniforge"/*/base/bin/conda; do
+        for cpath in $pattern; do
+            if [[ -x "$cpath" ]]; then
+                echo "$cpath"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+if ! command -v conda &> /dev/null; then
+    CONDA_EXE=$(find_conda)
+    if [[ -n "$CONDA_EXE" ]]; then
+        eval "$($CONDA_EXE shell.bash hook)"
+    fi
 fi
 
-CONDA_BASE=$(conda info --base 2>/dev/null)
-if [[ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]]; then
-    source "$CONDA_BASE/etc/profile.d/conda.sh"
-elif [[ -f "$CONDA_BASE/etc/profile.d/mamba.sh" ]]; then
-    source "$CONDA_BASE/etc/profile.d/mamba.sh"
+if command -v conda &> /dev/null; then
+    CONDA_BASE=$(conda info --base 2>/dev/null)
+    if [[ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]]; then
+        source "$CONDA_BASE/etc/profile.d/conda.sh"
+    elif [[ -f "$CONDA_BASE/etc/profile.d/mamba.sh" ]]; then
+        source "$CONDA_BASE/etc/profile.d/mamba.sh"
+    else
+        eval "$(conda shell.bash hook)"
+    fi
 else
-    eval "$(conda shell.bash hook)"
+    echo "ERROR: conda not found. Please ensure conda is installed and in your PATH."
+    echo "       Or run: bash quickstart.sh to set up the environment."
+    exit 1
 fi
 LAUNCHER_EOF
 

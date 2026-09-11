@@ -85,6 +85,7 @@ find_conda_bin() {
         "/opt/miniconda3/bin/conda"
         "/opt/homebrew/Caskroom/miniconda/base/bin/conda"
         "/opt/homebrew/Caskroom/miniforge/base/bin/conda"
+        "/opt/homebrew/Caskroom/mambaforge/base/bin/conda"
         "/usr/local/Caskroom/miniconda/base/bin/conda"
         "/usr/local/Caskroom/miniforge/base/bin/conda"
     )
@@ -95,6 +96,21 @@ find_conda_bin() {
             echo "$c"
             return 0
         fi
+    done
+
+    # Try Homebrew Caskroom with version directories
+    local pattern
+    for pattern in "/opt/homebrew/Caskroom/miniconda"/*/base/bin/conda \
+                   "/opt/homebrew/Caskroom/miniforge"/*/base/bin/conda \
+                   "/opt/homebrew/Caskroom/mambaforge"/*/base/bin/conda \
+                   "/usr/local/Caskroom/miniconda"/*/base/bin/conda \
+                   "/usr/local/Caskroom/miniforge"/*/base/bin/conda; do
+        for c in $pattern; do
+            if [[ -x "$c" ]]; then
+                echo "$c"
+                return 0
+            fi
+        done
     done
 
     return 1

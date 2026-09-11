@@ -309,7 +309,12 @@ public class VideoAnnotationTool {
     private static Color ACCENT_BLUE_HOVER = new Color(82, 150, 255); // Hover state
     private static Color ACCENT_GREEN = new Color(52, 168, 83);       // Success/positive
     private static Color ACCENT_RED = new Color(234, 67, 53);         // Delete/negative
+    private static Color ACCENT_ORANGE = new Color(255, 152, 0);      // Object occlusion
     private static Color ACCENT_YELLOW = new Color(251, 188, 4);      // Warning/attention
+
+    // Occlusion type constants
+    private static final int OCCLUSION_OUT_OF_PLANE = 0;  // Out of plane - no educated guess possible (red, X marker)
+    private static final int OCCLUSION_OBJECT = 1;        // Object occlusion - overlapping objects (orange, + marker)
     private static Color TEXT_PRIMARY_COLOR;
     private static Color TEXT_SECONDARY_COLOR;
     private static Color TEXT_DISABLED_COLOR;
@@ -679,9 +684,11 @@ public class VideoAnnotationTool {
     
     // Occlusion segments state (for LocoTrack fine-tuning)
     // Stores OCCLUSION segments (frames where object is NOT visible)
-    // Each segment is an int[2] array: [startFrame, endFrame] inclusive (0-indexed)
+    // Each segment is an int[3] array: [startFrame, endFrame, type] inclusive (0-indexed)
+    // type: 0 = OCCLUSION_OUT_OF_PLANE (out of plane), 1 = OCCLUSION_OBJECT (object occlusion)
     // Frames INSIDE these segments are occluded; frames OUTSIDE are visible
-    private final Map<String, List<int[]>> trackOcclusionSegments = new HashMap<>();  // List of [start, end] occlusion segments
+    // Legacy int[2] arrays (no type) are treated as OCCLUSION_OUT_OF_PLANE for backward compatibility
+    private final Map<String, List<int[]>> trackOcclusionSegments = new HashMap<>();  // List of [start, end, type] occlusion segments
     // Legacy alias for compatibility - now refers to occlusion segments (inverted logic handled in code)
     private final Map<String, List<int[]>> trackVisibleSegments = trackOcclusionSegments;  // Alias for backward compatibility
     
@@ -690,14 +697,16 @@ public class VideoAnnotationTool {
     private String occlusionModeTrackId = null;            // Track being edited for occlusions
     private int occlusionModeMinFrame = 0;                 // Track's minimum frame (0-indexed)
     private int occlusionModeMaxFrame = 0;                 // Track's maximum frame (0-indexed)
-    private List<int[]> occlusionModeSegments = null;      // Current OCCLUSION segments being edited (frames where object is hidden)
+    private List<int[]> occlusionModeSegments = null;      // Current OCCLUSION segments being edited [start, end, type]
     private int occlusionModePendingStart = -1;            // Start frame of pending occlusion segment (-1 if not pending)
+    private int occlusionModeSelectedType = OCCLUSION_OUT_OF_PLANE; // Currently selected occlusion type from dropdown
     private int occlusionModeDraggingSegmentIdx = -1;      // Index of segment being dragged (-1 if none)
     private boolean occlusionModeDraggingStart = false;    // True if dragging start of segment
     private boolean occlusionModeDraggingEnd = false;      // True if dragging end of segment
     private JPanel occlusionModeControlPanel = null;       // Control panel shown during occlusion mode
     private JLabel occlusionModeInfoLabel = null;          // Label showing occlusion info
     private JButton occlusionModeAddButton = null;         // Add/End occlusion segment button (changes state)
+    private JComboBox<String> occlusionModeTypeCombo = null; // Dropdown for occlusion type selection
     private int frameBeforeOcclusionMode = 1;              // Frame that was shown before entering occlusion mode
     
     // Batch operation buttons in tracks header
@@ -916,7 +925,8 @@ public class VideoAnnotationTool {
             for (Map.Entry<String, List<int[]>> entry : original.entrySet()) {
                 List<int[]> segmentsCopy = new ArrayList<>();
                 for (int[] segment : entry.getValue()) {
-                    segmentsCopy.add(new int[]{segment[0], segment[1]});
+                    // Handle both legacy int[2] and new int[3] (with type) arrays
+                    segmentsCopy.add(java.util.Arrays.copyOf(segment, Math.max(segment.length, 3)));
                 }
                 copy.put(entry.getKey(), segmentsCopy);
             }
@@ -2142,12 +2152,13 @@ public class VideoAnnotationTool {
                 continue;
             }
             
-            // Clip segment to fit within trim range
+            // Clip segment to fit within trim range, preserving type
             int newStart = Math.max(seg[0], trimStart);
             int newEnd = Math.min(seg[1], trimEnd);
+            int type = seg.length >= 3 ? seg[2] : OCCLUSION_OUT_OF_PLANE;
             
             if (newStart <= newEnd) {
-                adjustedSegments.add(new int[]{newStart, newEnd});
+                adjustedSegments.add(new int[]{newStart, newEnd, type});
             }
         }
         
@@ -2699,6 +2710,7 @@ public class VideoAnnotationTool {
         occlusionModeMinFrame = minFrame;
         occlusionModeMaxFrame = maxFrame;
         occlusionModePendingStart = -1;  // No pending segment initially
+        occlusionModeSelectedType = OCCLUSION_OUT_OF_PLANE;  // Default to out-of-plane
         occlusionModeDraggingSegmentIdx = -1;
         occlusionModeDraggingStart = false;
         occlusionModeDraggingEnd = false;
@@ -2706,10 +2718,11 @@ public class VideoAnnotationTool {
         // Load existing OCCLUSION segments (frames where object is hidden)
         // If no segments exist, default is empty list (object fully visible throughout)
         if (trackOcclusionSegments.containsKey(trackId)) {
-            // Deep copy existing segments for editing
+            // Deep copy existing segments for editing (handle legacy int[2] and new int[3])
             occlusionModeSegments = new ArrayList<>();
             for (int[] seg : trackOcclusionSegments.get(trackId)) {
-                occlusionModeSegments.add(new int[]{seg[0], seg[1]});
+                int type = seg.length >= 3 ? seg[2] : OCCLUSION_OUT_OF_PLANE;
+                occlusionModeSegments.add(new int[]{seg[0], seg[1], type});
             }
         } else {
             // Default: no occlusions (empty list = object is visible throughout)
@@ -2727,7 +2740,7 @@ public class VideoAnnotationTool {
         imageLabel.repaint();
         refreshAnnotationList();
         
-        setStatus("Occlusion mode: Mark frames where object becomes occluded (hidden). Green = visible, Red = occluded.");
+        setStatus("Occlusion mode: Mark frames where object becomes occluded (hidden). Green = visible, Red = out-of-plane, Orange = object occlusion.");
     }
     
     /**
@@ -2763,11 +2776,30 @@ public class VideoAnnotationTool {
         trackLabel.setFont(new Font("Segoe UI", Font.BOLD, 12));
         trackLabel.setForeground(TEXT_PRIMARY);
         
+        // Occlusion type dropdown
+        occlusionModeTypeCombo = new JComboBox<>(new String[]{"Out of Plane", "Object Occlusion"});
+        occlusionModeTypeCombo.setSelectedIndex(occlusionModeSelectedType);
+        occlusionModeTypeCombo.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+        occlusionModeTypeCombo.setBackground(PANEL_DARK);
+        occlusionModeTypeCombo.setForeground(TEXT_PRIMARY);
+        occlusionModeTypeCombo.setFocusable(false);
+        occlusionModeTypeCombo.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        occlusionModeTypeCombo.setToolTipText("Select occlusion type: Out of Plane (no trajectory guess possible) or Object Occlusion (overlapping objects)");
+        occlusionModeTypeCombo.setPreferredSize(new Dimension(140, 24));
+        occlusionModeTypeCombo.addActionListener(e -> {
+            occlusionModeSelectedType = occlusionModeTypeCombo.getSelectedIndex();
+            // Update Start button color to match selected type
+            if (occlusionModePendingStart < 0 && occlusionModeAddButton != null) {
+                occlusionModeAddButton.setBackground(occlusionModeSelectedType == OCCLUSION_OBJECT ? ACCENT_ORANGE : new Color(180, 80, 80));
+            }
+        });
+
         JPanel leftPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
         leftPanel.setOpaque(true);
         leftPanel.setBackground(PANEL_DARK);
         leftPanel.add(trackIndicator);
         leftPanel.add(trackLabel);
+        leftPanel.add(occlusionModeTypeCombo);
         leftPanel.add(occlusionModeInfoLabel);
         
         // Buttons on the right
@@ -2777,7 +2809,7 @@ public class VideoAnnotationTool {
         
         // Start/End Occlusion Segment button - changes state based on pending segment
         occlusionModeAddButton = new JButton("Start Occlusion");
-        occlusionModeAddButton.setBackground(new Color(180, 80, 80));  // Red-ish for occlusion
+        occlusionModeAddButton.setBackground(occlusionModeSelectedType == OCCLUSION_OBJECT ? ACCENT_ORANGE : new Color(180, 80, 80));  // Color matches type
         occlusionModeAddButton.setForeground(Color.WHITE);
         occlusionModeAddButton.setFocusPainted(false);
         occlusionModeAddButton.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
@@ -2850,6 +2882,9 @@ public class VideoAnnotationTool {
             // Start the pending occlusion at current frame
             occlusionModePendingStart = currentFrame;
             
+            // Disable type combo while segment is pending
+            if (occlusionModeTypeCombo != null) occlusionModeTypeCombo.setEnabled(false);
+            
             // Update button appearance
             occlusionModeAddButton.setText("End Occlusion");
             occlusionModeAddButton.setBackground(ACCENT_GREEN);
@@ -2886,8 +2921,8 @@ public class VideoAnnotationTool {
                 }
             }
             
-            // Add the new occlusion segment
-            occlusionModeSegments.add(new int[]{startFrame, endFrame});
+            // Add the new occlusion segment with selected type
+            occlusionModeSegments.add(new int[]{startFrame, endFrame, occlusionModeSelectedType});
             
             // Sort segments by start frame
             occlusionModeSegments.sort((a, b) -> Integer.compare(a[0], b[0]));
@@ -2895,9 +2930,12 @@ public class VideoAnnotationTool {
             // Reset pending state
             occlusionModePendingStart = -1;
             
+            // Re-enable type combo
+            if (occlusionModeTypeCombo != null) occlusionModeTypeCombo.setEnabled(true);
+            
             // Update button appearance
             occlusionModeAddButton.setText("Start Occlusion");
-            occlusionModeAddButton.setBackground(new Color(180, 80, 80));
+            occlusionModeAddButton.setBackground(occlusionModeSelectedType == OCCLUSION_OBJECT ? ACCENT_ORANGE : new Color(180, 80, 80));
             occlusionModeAddButton.setToolTipText("Mark current frame as start of occlusion (object disappears)");
             
             updateOcclusionModeInfoLabel();
@@ -2915,8 +2953,17 @@ public class VideoAnnotationTool {
         
         int totalFrames = occlusionModeMaxFrame - occlusionModeMinFrame + 1;
         int occludedFrames = 0;
+        int oopFrames = 0;
+        int objFrames = 0;
         for (int[] seg : occlusionModeSegments) {
-            occludedFrames += (seg[1] - seg[0] + 1);
+            int segFrames = seg[1] - seg[0] + 1;
+            occludedFrames += segFrames;
+            int segType = seg.length >= 3 ? seg[2] : OCCLUSION_OUT_OF_PLANE;
+            if (segType == OCCLUSION_OBJECT) {
+                objFrames += segFrames;
+            } else {
+                oopFrames += segFrames;
+            }
         }
         int visibleFrames = totalFrames - occludedFrames;
         
@@ -2932,8 +2979,11 @@ public class VideoAnnotationTool {
             occlusionModeInfoLabel.setText(text.toString());
             occlusionModeInfoLabel.setForeground(ACCENT_GREEN);
         } else {
-            text.append(occlusionModeSegments.size()).append(" occlusion segment(s): ")
-                .append(occludedFrames).append(" hidden, ").append(visibleFrames).append(" visible");
+            text.append(occlusionModeSegments.size()).append(" segment(s): ");
+            if (oopFrames > 0) text.append(oopFrames).append(" OoP");
+            if (oopFrames > 0 && objFrames > 0) text.append(", ");
+            if (objFrames > 0) text.append(objFrames).append(" Obj");
+            text.append(" hidden, ").append(visibleFrames).append(" visible");
             occlusionModeInfoLabel.setText(text.toString());
             occlusionModeInfoLabel.setForeground(ACCENT_YELLOW);
         }
@@ -2960,7 +3010,7 @@ public class VideoAnnotationTool {
         if (foundIdx < 0) {
             JOptionPane.showMessageDialog(frame,
                 "Current frame is not inside an occlusion segment.\n\n" +
-                "Navigate to a frame within an occlusion segment (shown in red) to remove it.",
+                "Navigate to a frame within an occlusion segment (shown in red or orange) to remove it.",
                 "No Segment at Current Frame",
                 JOptionPane.INFORMATION_MESSAGE);
             return;
@@ -3000,14 +3050,15 @@ public class VideoAnnotationTool {
         // Save state for undo
         saveState("Mark occlusions for " + trackId);
         
-        // Store the segments (now these are OCCLUSION segments, not visible segments)
+        // Store the segments (now these are OCCLUSION segments with type, not visible segments)
         if (occlusionModeSegments.isEmpty()) {
             // No occlusions - remove from map entirely
             trackOcclusionSegments.remove(trackId);
         } else {
             List<int[]> segments = new ArrayList<>();
             for (int[] seg : occlusionModeSegments) {
-                segments.add(new int[]{seg[0], seg[1]});
+                int type = seg.length >= 3 ? seg[2] : OCCLUSION_OUT_OF_PLANE;
+                segments.add(new int[]{seg[0], seg[1], type});
             }
             trackOcclusionSegments.put(trackId, segments);
         }
@@ -3045,6 +3096,26 @@ public class VideoAnnotationTool {
         
         return occludedFrames;
     }
+
+    /**
+     * Calculate the number of occluded frames of a specific type for a track.
+     * @param trackId The track ID
+     * @param type OCCLUSION_OUT_OF_PLANE or OCCLUSION_OBJECT
+     * @return number of frames with the given occlusion type
+     */
+    private int calculateOccludedFramesByType(String trackId, int type) {
+        List<int[]> segments = trackOcclusionSegments.get(trackId);
+        if (segments == null || segments.isEmpty()) return 0;
+        
+        int count = 0;
+        for (int[] seg : segments) {
+            int segType = seg.length >= 3 ? seg[2] : OCCLUSION_OUT_OF_PLANE;
+            if (segType == type) {
+                count += (seg[1] - seg[0] + 1);
+            }
+        }
+        return count;
+    }
     
     /**
      * Cancel occlusion mode without saving changes.
@@ -3072,6 +3143,7 @@ public class VideoAnnotationTool {
         occlusionModeTrackId = null;
         occlusionModeSegments = null;
         occlusionModePendingStart = -1;
+        occlusionModeSelectedType = OCCLUSION_OUT_OF_PLANE;
         occlusionModeDraggingSegmentIdx = -1;
         occlusionModeDraggingStart = false;
         occlusionModeDraggingEnd = false;
@@ -3082,6 +3154,7 @@ public class VideoAnnotationTool {
             occlusionModeControlPanel = null;
             occlusionModeInfoLabel = null;
             occlusionModeAddButton = null;
+            occlusionModeTypeCombo = null;
         }
         frameNavPanel.add(pageLabel, BorderLayout.WEST);
         frameNavPanel.revalidate();
@@ -3105,19 +3178,28 @@ public class VideoAnnotationTool {
      * @return true if the frame is occluded, false if visible
      */
     private boolean isFrameOccluded(String trackId, int frame) {
+        return getOcclusionType(trackId, frame) >= 0;
+    }
+
+    /**
+     * Get the occlusion type for a frame of a track.
+     * 
+     * @param trackId The track ID
+     * @param frame The frame number (0-indexed)
+     * @return OCCLUSION_OUT_OF_PLANE (0) or OCCLUSION_OBJECT (1), or -1 if not occluded
+     */
+    private int getOcclusionType(String trackId, int frame) {
         List<int[]> segments = trackOcclusionSegments.get(trackId);
         if (segments == null || segments.isEmpty()) {
-            // No occlusion data = assume all visible
-            return false;
+            return -1;  // Not occluded
         }
         
-        // Frame is occluded if it's inside any occlusion segment
         for (int[] seg : segments) {
             if (frame >= seg[0] && frame <= seg[1]) {
-                return true;  // Frame is within an occlusion segment
+                return seg.length >= 3 ? seg[2] : OCCLUSION_OUT_OF_PLANE;
             }
         }
-        return false;  // Frame is outside all occlusion segments (visible)
+        return -1;  // Frame is outside all occlusion segments (visible)
     }
 
     /**
@@ -3352,6 +3434,8 @@ public class VideoAnnotationTool {
                     JSONObject segObj = new JSONObject();
                     segObj.put("start", seg[0]);
                     segObj.put("end", seg[1]);
+                    int type = seg.length >= 3 ? seg[2] : OCCLUSION_OUT_OF_PLANE;
+                    segObj.put("type", type == OCCLUSION_OBJECT ? "object" : "out_of_plane");
                     segmentsArray.put(segObj);
                 }
                 trackObj.put("occlusion_segments", segmentsArray);
@@ -4669,67 +4753,100 @@ public class VideoAnnotationTool {
                                     }
                                 }
                                 
-                                // Draw X marker for occluded frames
-                                if (isFrameOccluded(trackId, currentSlice - 1)) {
-                                    g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-                                    // Draw X slightly inset from the shape bounds
-                                    int xInset = Math.max(2, (int)(sw * 0.15));
-                                    int xLeft = sx1 + xInset;
-                                    int xRight = sx1 + sw - xInset;
-                                    int xTop = sy1 + xInset;
-                                    int xBottom = sy1 + sh - xInset;
-                                    // Draw dark outline first for contrast
-                                    g2d.setColor(new Color(0, 0, 0, 180));
-                                    g2d.setStroke(new BasicStroke(Math.max(4.0f, (float)(pixelWidth / 1.5)), 
-                                                                   BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
-                                    g2d.drawLine(xLeft, xTop, xRight, xBottom);
-                                    g2d.drawLine(xLeft, xBottom, xRight, xTop);
-                                    // Draw X in track color on top
-                                    g2d.setColor(color);
-                                    g2d.setStroke(new BasicStroke(Math.max(2.0f, (float)(pixelWidth / 2.0)), 
-                                                                   BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
-                                    g2d.drawLine(xLeft, xTop, xRight, xBottom);
-                                    g2d.drawLine(xLeft, xBottom, xRight, xTop);
+                                // Draw occlusion marker for occluded frames
+                                // X = out-of-plane, + = object occlusion
+                                {
+                                    int occMarkerType = getOcclusionType(trackId, currentSlice - 1);
+                                    if (occMarkerType >= 0) {
+                                        g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                                        int xInset = Math.max(2, (int)(sw * 0.15));
+                                        int xLeft = sx1 + xInset;
+                                        int xRight = sx1 + sw - xInset;
+                                        int xTop = sy1 + xInset;
+                                        int xBottom = sy1 + sh - xInset;
+                                        int xMidX = sx1 + sw / 2;
+                                        int xMidY = sy1 + sh / 2;
+                                        // Draw dark outline first for contrast
+                                        g2d.setColor(new Color(0, 0, 0, 180));
+                                        g2d.setStroke(new BasicStroke(Math.max(4.0f, (float)(pixelWidth / 1.5)), 
+                                                                       BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                                        if (occMarkerType == OCCLUSION_OBJECT) {
+                                            // + marker for object occlusion
+                                            g2d.drawLine(xMidX, xTop, xMidX, xBottom);
+                                            g2d.drawLine(xLeft, xMidY, xRight, xMidY);
+                                        } else {
+                                            // X marker for out-of-plane
+                                            g2d.drawLine(xLeft, xTop, xRight, xBottom);
+                                            g2d.drawLine(xLeft, xBottom, xRight, xTop);
+                                        }
+                                        // Draw marker in track color on top
+                                        g2d.setColor(color);
+                                        g2d.setStroke(new BasicStroke(Math.max(2.0f, (float)(pixelWidth / 2.0)), 
+                                                                       BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                                        if (occMarkerType == OCCLUSION_OBJECT) {
+                                            g2d.drawLine(xMidX, xTop, xMidX, xBottom);
+                                            g2d.drawLine(xLeft, xMidY, xRight, xMidY);
+                                        } else {
+                                            g2d.drawLine(xLeft, xTop, xRight, xBottom);
+                                            g2d.drawLine(xLeft, xBottom, xRight, xTop);
+                                        }
+                                    }
                                 }
                             } else {
                                 // Non-selected track without persistent mode: just draw single pixel point
                                 g2d.fillRect(screenX, screenY, screenPixelW, screenPixelH);
                                 
-                                // Draw small X marker for occluded frames (scaled to cursor size)
-                                if (isFrameOccluded(trackId, currentSlice - 1)) {
-                                    g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-                                    // Calculate X size based on cursor size setting (for consistency)
-                                    int halfB = (hoverCursorSize - 1) / 2;
-                                    int halfA = hoverCursorSize / 2;
-                                    int px1 = p.x - halfB;
-                                    int py1 = p.y - halfB;
-                                    int px2 = p.x + halfA + 1;
-                                    int py2 = p.y + halfA + 1;
-                                    
-                                    int sx1 = dstX + (int) Math.floor(px1 * pixelWidth);
-                                    int sy1 = dstY + (int) Math.floor(py1 * pixelHeight);
-                                    int sx2 = dstX + (int) Math.floor(px2 * pixelWidth);
-                                    int sy2 = dstY + (int) Math.floor(py2 * pixelHeight);
-                                    int sw = sx2 - sx1;
-                                    int sh = sy2 - sy1;
-                                    
-                                    int xInset = Math.max(2, (int)(sw * 0.15));
-                                    int xLeft = sx1 + xInset;
-                                    int xRight = sx1 + sw - xInset;
-                                    int xTop = sy1 + xInset;
-                                    int xBottom = sy1 + sh - xInset;
-                                    // Draw dark outline first
-                                    g2d.setColor(new Color(0, 0, 0, 180));
-                                    g2d.setStroke(new BasicStroke(Math.max(3.0f, (float)(pixelWidth / 2.0)), 
-                                                                   BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
-                                    g2d.drawLine(xLeft, xTop, xRight, xBottom);
-                                    g2d.drawLine(xLeft, xBottom, xRight, xTop);
-                                    // Draw X in track color
-                                    g2d.setColor(color);
-                                    g2d.setStroke(new BasicStroke(Math.max(1.5f, (float)(pixelWidth / 3.0)), 
-                                                                   BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
-                                    g2d.drawLine(xLeft, xTop, xRight, xBottom);
-                                    g2d.drawLine(xLeft, xBottom, xRight, xTop);
+                                // Draw occlusion marker for non-selected tracks (scaled to cursor size)
+                                // X = out-of-plane, + = object occlusion
+                                {
+                                    int occMarkerType = getOcclusionType(trackId, currentSlice - 1);
+                                    if (occMarkerType >= 0) {
+                                        g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                                        // Calculate marker size based on cursor size setting (for consistency)
+                                        int halfB = (hoverCursorSize - 1) / 2;
+                                        int halfA = hoverCursorSize / 2;
+                                        int px1 = p.x - halfB;
+                                        int py1 = p.y - halfB;
+                                        int px2 = p.x + halfA + 1;
+                                        int py2 = p.y + halfA + 1;
+                                        
+                                        int sx1 = dstX + (int) Math.floor(px1 * pixelWidth);
+                                        int sy1 = dstY + (int) Math.floor(py1 * pixelHeight);
+                                        int sx2 = dstX + (int) Math.floor(px2 * pixelWidth);
+                                        int sy2 = dstY + (int) Math.floor(py2 * pixelHeight);
+                                        int sw = sx2 - sx1;
+                                        int sh = sy2 - sy1;
+                                        
+                                        int xInset = Math.max(2, (int)(sw * 0.15));
+                                        int xLeft = sx1 + xInset;
+                                        int xRight = sx1 + sw - xInset;
+                                        int xTop = sy1 + xInset;
+                                        int xBottom = sy1 + sh - xInset;
+                                        int xMidX = sx1 + sw / 2;
+                                        int xMidY = sy1 + sh / 2;
+                                        // Draw dark outline first
+                                        g2d.setColor(new Color(0, 0, 0, 180));
+                                        g2d.setStroke(new BasicStroke(Math.max(3.0f, (float)(pixelWidth / 2.0)), 
+                                                                       BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                                        if (occMarkerType == OCCLUSION_OBJECT) {
+                                            g2d.drawLine(xMidX, xTop, xMidX, xBottom);
+                                            g2d.drawLine(xLeft, xMidY, xRight, xMidY);
+                                        } else {
+                                            g2d.drawLine(xLeft, xTop, xRight, xBottom);
+                                            g2d.drawLine(xLeft, xBottom, xRight, xTop);
+                                        }
+                                        // Draw marker in track color
+                                        g2d.setColor(color);
+                                        g2d.setStroke(new BasicStroke(Math.max(1.5f, (float)(pixelWidth / 3.0)), 
+                                                                       BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                                        if (occMarkerType == OCCLUSION_OBJECT) {
+                                            g2d.drawLine(xMidX, xTop, xMidX, xBottom);
+                                            g2d.drawLine(xLeft, xMidY, xRight, xMidY);
+                                        } else {
+                                            g2d.drawLine(xLeft, xTop, xRight, xBottom);
+                                            g2d.drawLine(xLeft, xBottom, xRight, xTop);
+                                        }
+                                    }
                                 }
                             }
                             
@@ -5158,19 +5275,20 @@ public class VideoAnnotationTool {
                     g2.setColor(new Color(ACCENT_GREEN.getRed(), ACCENT_GREEN.getGreen(), ACCENT_GREEN.getBlue(), 120));
                     g2.fillRoundRect(rangeMinX, trackY - 6, rangeMaxX - rangeMinX, 12, 6, 6);
                     
-                    // Draw occlusion segments (RED overlays - frames where object is hidden)
-                    g2.setColor(new Color(ACCENT_RED.getRed(), ACCENT_RED.getGreen(), ACCENT_RED.getBlue(), 200));
-                    
+                    // Draw occlusion segments (color varies by type: RED for out-of-plane, ORANGE for object)
                     for (int[] seg : occlusionModeSegments) {
                         int segStart = seg[0] + 1;  // Convert to 1-indexed
                         int segEnd = seg[1] + 1;
+                        int segType = seg.length >= 3 ? seg[2] : OCCLUSION_OUT_OF_PLANE;
+                        Color segColor = segType == OCCLUSION_OBJECT ? ACCENT_ORANGE : ACCENT_RED;
                         
                         double segStartRatio = (double)(segStart - getMinimum()) / Math.max(1, getMaximum() - getMinimum());
                         double segEndRatio = (double)(segEnd - getMinimum()) / Math.max(1, getMaximum() - getMinimum());
                         int segStartX = trackLeft + (int)(segStartRatio * trackWidth);
                         int segEndX = trackLeft + (int)(segEndRatio * trackWidth);
                         
-                        // Draw occlusion segment (red)
+                        // Draw occlusion segment in type-appropriate color
+                        g2.setColor(new Color(segColor.getRed(), segColor.getGreen(), segColor.getBlue(), 200));
                         g2.fillRoundRect(segStartX, trackY - 7, Math.max(4, segEndX - segStartX), 14, 6, 6);
                         
                         // Draw segment boundary markers
@@ -5178,13 +5296,13 @@ public class VideoAnnotationTool {
                         g2.setStroke(new BasicStroke(2, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
                         g2.drawLine(segStartX, trackY - 9, segStartX, trackY + 9);
                         g2.drawLine(segEndX, trackY - 9, segEndX, trackY + 9);
-                        g2.setColor(new Color(ACCENT_RED.getRed(), ACCENT_RED.getGreen(), ACCENT_RED.getBlue(), 200));
                     }
                     
                     // Draw pending occlusion segment indicator (dashed line from start to current)
                     if (occlusionModePendingStart >= 0) {
                         int pendingStart = occlusionModePendingStart + 1;  // Convert to 1-indexed
                         int currentFrame = getValue();
+                        Color pendingColor = occlusionModeSelectedType == OCCLUSION_OBJECT ? ACCENT_ORANGE : ACCENT_RED;
                         
                         double pendingStartRatio = (double)(pendingStart - getMinimum()) / Math.max(1, getMaximum() - getMinimum());
                         double currentRatio = (double)(currentFrame - getMinimum()) / Math.max(1, getMaximum() - getMinimum());
@@ -5196,11 +5314,11 @@ public class VideoAnnotationTool {
                         int leftX = Math.min(pendingStartX, currentX);
                         int rightX = Math.max(pendingStartX, currentX);
                         
-                        g2.setColor(new Color(ACCENT_RED.getRed(), ACCENT_RED.getGreen(), ACCENT_RED.getBlue(), 100));
+                        g2.setColor(new Color(pendingColor.getRed(), pendingColor.getGreen(), pendingColor.getBlue(), 100));
                         g2.fillRoundRect(leftX, trackY - 6, rightX - leftX, 12, 4, 4);
                         
                         // Dashed border
-                        g2.setColor(ACCENT_RED);
+                        g2.setColor(pendingColor);
                         g2.setStroke(new BasicStroke(2, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND, 
                                                       1.0f, new float[]{4.0f, 4.0f}, 0.0f));
                         g2.drawRoundRect(leftX, trackY - 6, rightX - leftX, 12, 4, 4);
@@ -5215,17 +5333,18 @@ public class VideoAnnotationTool {
                     double currentRatio = (double)(currentFrame - getMinimum()) / Math.max(1, getMaximum() - getMinimum());
                     int currentX = trackLeft + (int)(currentRatio * trackWidth);
                     
-                    // Check if current frame is visible or occluded
-                    boolean isOccluded = false;
+                    // Check if current frame is visible or occluded (and which type)
+                    int occType = -1;  // -1 = visible
                     for (int[] seg : occlusionModeSegments) {
                         if (currentFrame - 1 >= seg[0] && currentFrame - 1 <= seg[1]) {
-                            isOccluded = true;
+                            occType = seg.length >= 3 ? seg[2] : OCCLUSION_OUT_OF_PLANE;
                             break;
                         }
                     }
                     
-                    // Draw current frame indicator (green if visible, red if occluded)
-                    g2.setColor(isOccluded ? ACCENT_RED : ACCENT_GREEN);
+                    // Draw current frame indicator (green if visible, red if OoP, orange if object occlusion)
+                    Color indicatorColor = occType < 0 ? ACCENT_GREEN : (occType == OCCLUSION_OBJECT ? ACCENT_ORANGE : ACCENT_RED);
+                    g2.setColor(indicatorColor);
                     g2.setStroke(new BasicStroke(1));
                     g2.fillOval(currentX - 7, trackY - 9, 14, 18);
                     g2.setColor(Color.WHITE);
@@ -6674,6 +6793,8 @@ public class VideoAnnotationTool {
         } else if ("dis".equals(method)) {
             String dsFactor = config.getProperty("dis.downsample.factor", "2");
             return "_dis_ds" + dsFactor;
+        } else if ("dis_fast".equals(method)) {
+            return "_dis_fast";
         }
         return "_" + method;
     }
@@ -6757,6 +6878,10 @@ public class VideoAnnotationTool {
         if ("dis".equals(method)) {
             String dsFactor = config.getProperty("dis.downsample.factor", "2");
             return filename.contains("_dis_ds" + dsFactor);
+        }
+        
+        if ("dis_fast".equals(method)) {
+            return filename.contains("_dis_fast");
         }
         
         // For other methods, check if filename contains the expected parameter pattern
@@ -7619,6 +7744,17 @@ public class VideoAnnotationTool {
         }
     }
 
+    private int getVideoFrameCount(String trackId) {
+        Map<Integer, Point> existingTrack = trackAnnotations.get(trackId);
+        if (existingTrack != null && !existingTrack.isEmpty()) {
+            return existingTrack.keySet().stream().max(Integer::compareTo).orElse(0) + 1;
+        }
+        if (imp != null) {
+            return imp.getNSlices();
+        }
+        return 0;
+    }
+
     private void optimizeTrackWithAnchors(String trackId) {
         // Default: no specific correction frame (use global mode behavior)
         optimizeTrackWithAnchors(trackId, -1);
@@ -7659,60 +7795,42 @@ public class VideoAnnotationTool {
         
         // Check if local correction mode is enabled
         boolean localMode = Boolean.parseBoolean(config.getProperty("correction.local.mode", "false"));
-        int localWindow = Integer.parseInt(config.getProperty("correction.local.window", "11"));
-        // Ensure window is odd
-        if (localWindow % 2 == 0) localWindow++;
-        int halfWindow = localWindow / 2;
+        int totalFrames = getVideoFrameCount(trackId);
+        int localWindow = TrackingParameters.normalizeLocalWindow(
+            config.getProperty("correction.local.window", String.valueOf(TrackingParameters.DEFAULT_LOCAL_WINDOW)),
+            totalFrames,
+            TrackingParameters.DEFAULT_LOCAL_WINDOW);
         
-        System.out.println("[DEBUG] localMode=" + localMode + ", localWindow=" + localWindow + ", halfWindow=" + halfWindow);
+        System.out.println("[DEBUG] localMode=" + localMode + ", localWindow=" + localWindow + " frames");
         
         // Get existing track data
         Map<Integer, Point> existingTrack = trackAnnotations.get(trackId);
-        
-        // Check if track is already optimized (has existing track data beyond just anchors)
-        boolean trackHasData = existingTrack != null && existingTrack.size() > anchors.size();
+        boolean useLocalCorrection = TrackingParameters.shouldUseLocalCorrection(
+            localMode, existingTrack, correctionFrame);
         
         // Prepare anchors for optimization
         List<Anchor> effectiveAnchors;
+        TrackingParameters.LocalCorrectionRange localRange = null;
         int windowStart = 0;
-        // Use existingTrack size for frame count (more reliable than imp.getNSlices() which can return 1 in certain view modes)
-        int totalFrames = (existingTrack != null && !existingTrack.isEmpty()) 
-            ? existingTrack.keySet().stream().max(Integer::compareTo).orElse(0) + 1 
-            : imp.getNSlices();
-        int windowEnd = totalFrames - 1;
+        int windowEnd = Math.max(0, totalFrames - 1);
         
-        // Local mode triggers when: enabled, track has existing data, and we want to do a local fix
-        // Use correctionFrame if provided, otherwise fall back to last anchor
-        if (localMode && trackHasData) {
-            // Local correction mode: Only optimize a window around the correction
-            int corrFrame;
-            Anchor correction;
-            
-            if (correctionFrame >= 0) {
-                // Use the specific correction frame that was just clicked
-                corrFrame = correctionFrame;
-                // Find the anchor at this frame
-                correction = anchors.stream()
-                    .filter(a -> a.frame == corrFrame)
-                    .findFirst()
-                    .orElse(anchors.get(anchors.size() - 1));
-            } else {
-                // Fallback: use the last anchor (by frame order)
-                correction = anchors.get(anchors.size() - 1);
-                corrFrame = correction.frame;
-            }
+        // Local mode triggers when enabled, the track already has propagated data,
+        // and the caller supplied the frame that was just corrected.
+        if (useLocalCorrection) {
+            final int lookupFrame = correctionFrame;
+            Anchor correction = anchors.stream()
+                .filter(a -> a.frame == lookupFrame)
+                .findFirst()
+                .orElse(anchors.get(anchors.size() - 1));
+            int corrFrame = correction.frame;
+            localRange = TrackingParameters.computeLocalCorrectionRange(corrFrame, localWindow, totalFrames);
+            windowStart = localRange.startFrame;
+            windowEnd = localRange.endFrame;
             
             System.out.println("[DEBUG] corrFrame=" + corrFrame + " (from correctionFrame param: " + correctionFrame + ")");
-            System.out.println("[DEBUG] halfWindow=" + halfWindow);
             System.out.println("[DEBUG] totalFrames=" + totalFrames);
-            
-            // Calculate window boundaries
-            System.out.println("[DEBUG] BEFORE: windowStart=" + windowStart + ", windowEnd=" + windowEnd);
-            windowStart = Math.max(0, corrFrame - halfWindow);
-            System.out.println("[DEBUG] After windowStart calc: " + windowStart);
-            windowEnd = Math.min(totalFrames - 1, corrFrame + halfWindow);
-            System.out.println("[DEBUG] After windowEnd calc: " + windowEnd);
-            System.out.println("[DEBUG] FINAL: windowStart=" + windowStart + ", windowEnd=" + windowEnd);
+            System.out.println("[DEBUG] Local correction range: "
+                + TrackingParameters.formatLocalCorrectionRange(localRange));
             
             // Create effective anchors with virtual boundary anchors
             effectiveAnchors = new ArrayList<>();
@@ -7735,20 +7853,29 @@ public class VideoAnnotationTool {
             // Sort by frame
             effectiveAnchors.sort((a, b) -> Integer.compare(a.frame, b.frame));
             
-            setStatus("Local correction: optimizing frames " + (windowStart + 1) + "-" + (windowEnd + 1) + "...");
+            setStatus("Local correction: optimizing "
+                + TrackingParameters.formatLocalCorrectionRange(localRange) + "...");
         } else {
             // Global correction mode: Use all anchors
             effectiveAnchors = anchors;
-            setStatus("Optimizing track...");
+            if (localMode && correctionFrame < 0) {
+                setStatus("Optimizing track (global correction; no correction frame specified)...");
+            } else if (localMode) {
+                setStatus("Optimizing track (global correction; track not ready for local mode)...");
+            } else {
+                setStatus("Optimizing track...");
+            }
         }
         
         final int finalWindowStart = windowStart;
         final int finalWindowEnd = windowEnd;
-        final boolean finalLocalMode = localMode && trackHasData;
+        final boolean finalLocalMode = useLocalCorrection;
+        final TrackingParameters.LocalCorrectionRange finalLocalRange = localRange;
         final List<Anchor> finalEffectiveAnchors = effectiveAnchors;
         
         // Save original track state for potential revert
-        final Map<Integer, Point> originalTrackData = new HashMap<>(trackAnnotations.getOrDefault(trackId, new HashMap<>()));
+        final Map<Integer, Point> originalTrackData =
+            TrackingParameters.deepCopyPoints(trackAnnotations.getOrDefault(trackId, new HashMap<>()));
         
         // Cancellation flag
         final AtomicBoolean cancelled = new AtomicBoolean(false);
@@ -7914,6 +8041,7 @@ public class VideoAnnotationTool {
                 
                 List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
                 ProcessBuilder pb = new ProcessBuilder(command);
+                setServerEnvironmentVariables(pb);
                 pb.redirectErrorStream(true);
                 Process process = pb.start();
                 
@@ -7992,20 +8120,19 @@ public class VideoAnnotationTool {
                     System.out.println("[DEBUG] Original track points: " + originalTrackData.size());
                     
                     if (finalLocalMode) {
-                        // Local correction mode: Merge only the window into existing track
-                        finalPoints = new HashMap<>(originalTrackData);
-                        
-                        // Replace only frames within the window
+                        finalPoints = TrackingParameters.mergeLocalCorrection(
+                            originalTrackData, optimizedPoints, finalLocalRange);
                         int replaced = 0;
                         for (int frame = finalWindowStart; frame <= finalWindowEnd; frame++) {
                             if (optimizedPoints.containsKey(frame)) {
-                                finalPoints.put(frame, optimizedPoints.get(frame));
                                 replaced++;
                             }
                         }
-                        System.out.println("[DEBUG] Replaced " + replaced + " points in window");
+                        System.out.println("[DEBUG] Replaced " + replaced + " points in "
+                            + TrackingParameters.formatLocalCorrectionRange(finalLocalRange));
                         
-                        setStatus("Local correction applied (frames " + (finalWindowStart + 1) + "-" + (finalWindowEnd + 1) + ")");
+                        setStatus("Local correction applied ("
+                            + TrackingParameters.formatLocalCorrectionRange(finalLocalRange) + ")");
                     } else {
                         // Global mode: Replace entire track
                         finalPoints = optimizedPoints;
@@ -8021,8 +8148,10 @@ public class VideoAnnotationTool {
                     
                     trackAnnotations.put(trackId, finalPoints);
                     
-                    // Re-apply smoothing if it was enabled (keeps user's preference)
-                    reapplyTrackSmoothingIfEnabled(trackId);
+                    // Global smoothing would rewrite the entire trajectory; skip after local correction.
+                    if (!finalLocalMode) {
+                        reapplyTrackSmoothingIfEnabled(trackId);
+                    }
                     
                     // Mark track as optimized after optimization (single-seed mode)
                     if (!isMultiSeedMode()) {
@@ -8354,6 +8483,7 @@ public class VideoAnnotationTool {
             System.out.println("[Cancel] Sending cancel command to server: " + String.join(" ", command));
             
             ProcessBuilder pb = new ProcessBuilder(command);
+            setServerEnvironmentVariables(pb);
             pb.redirectErrorStream(true);
             Process process = pb.start();
             
@@ -8390,6 +8520,7 @@ public class VideoAnnotationTool {
             List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
 
             ProcessBuilder pb = new ProcessBuilder(command);
+            setServerEnvironmentVariables(pb);
             pb.redirectErrorStream(true);
             Process process = pb.start();
 
@@ -8539,15 +8670,59 @@ public class VideoAnnotationTool {
         return !isWindowsOS();
     }
 
+    /**
+     * Resolve the actual Unix socket path used by the tracking server.
+     * 
+     * CRITICAL: This must mirror the shell script's pick_runtime_dir() + override logic.
+     * The shell script resolves the default "/tmp/ripple-env.sock" to
+     * "$XDG_RUNTIME_DIR/ripple-env.sock" when XDG_RUNTIME_DIR is set.
+     * 
+     * If the user has set a custom (non-default) path in config, that is honored.
+     * Otherwise we resolve exactly as the shell script does.
+     */
+    private String resolveRippleSocketPath() {
+        String sockName = "ripple-env.sock";
+        String defaultPath = "/tmp/" + sockName;
+        
+        // Check config property — only honor it if it's a genuinely custom path
+        // (not the legacy default that the shell script overrides anyway)
+        String configured = config.getProperty("local.socket.path", "").trim();
+        if (!configured.isEmpty() && !configured.equals(defaultPath)) {
+            // User explicitly set a custom socket path — respect it
+            return configured;
+        }
+        
+        // Mirror the shell script's pick_runtime_dir() logic:
+        // 1) $XDG_RUNTIME_DIR (set on most systemd-based Linux)
+        String xdgDir = System.getenv("XDG_RUNTIME_DIR");
+        if (xdgDir != null && !xdgDir.isEmpty()) {
+            File dir = new File(xdgDir);
+            if (dir.isDirectory() && dir.canWrite()) {
+                return new File(dir, sockName).getAbsolutePath();
+            }
+        }
+        // 2) /tmp
+        return defaultPath;
+    }
+
     private String getTrackingTransport() {
         // Optional override via config property.
-        // Default is TCP to match run_persistent_tracking.sh which defaults to TCP for Windows parity.
         String configured = config.getProperty("local.transport", "").trim().toLowerCase();
         if (!configured.isEmpty()) {
             return configured;
         }
-        // Default to TCP (matches shell script default)
-        return "tcp";
+        // Match setServerEnvironmentVariables: Unix socket on Linux/Mac, TCP on Windows.
+        // The shell script is started with RIPPLE_TRANSPORT=unix on non-Windows,
+        // so the server listens on a Unix socket — direct IPC must use the same transport.
+        try {
+            File scriptFile = getTrackingScript();
+            if (scriptFile != null && scriptFile.getName().toLowerCase().endsWith(".bat")) {
+                return "tcp";
+            }
+        } catch (Exception ignored) {
+            // Fall through to unix default
+        }
+        return isWindowsOS() ? "tcp" : "unix";
     }
 
     private JSONObject sendTrackingServerRequest(JSONObject request) throws IOException {
@@ -8569,7 +8744,7 @@ public class VideoAnnotationTool {
             }
         }
 
-        String socketPath = config.getProperty("local.socket.path", "/tmp/ripple-env.sock");
+        String socketPath = resolveRippleSocketPath();
         UnixDomainSocketAddress addr = UnixDomainSocketAddress.of(Paths.get(socketPath));
         try (SocketChannel channel = SocketChannel.open(StandardProtocolFamily.UNIX)) {
             channel.connect(addr);
@@ -8794,6 +8969,7 @@ public class VideoAnnotationTool {
         
         List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
         ProcessBuilder pb = new ProcessBuilder(command);
+        setServerEnvironmentVariables(pb);
         pb.redirectErrorStream(true);
         
         Process proc = pb.start();
@@ -8935,6 +9111,7 @@ public class VideoAnnotationTool {
 
             List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
             ProcessBuilder pb = new ProcessBuilder(command);
+            setServerEnvironmentVariables(pb);
             pb.redirectErrorStream(true);
 
             Process proc = pb.start();
@@ -9031,6 +9208,7 @@ public class VideoAnnotationTool {
 
             List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
             ProcessBuilder pb = new ProcessBuilder(command);
+            setServerEnvironmentVariables(pb);
             pb.redirectErrorStream(true);
 
             Process proc = pb.start();
@@ -9603,6 +9781,7 @@ public class VideoAnnotationTool {
                 
                 List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
                 ProcessBuilder pb = new ProcessBuilder(command);
+                setServerEnvironmentVariables(pb);
                 pb.redirectErrorStream(true);
                 Process process = pb.start();
                 
@@ -10064,6 +10243,7 @@ public class VideoAnnotationTool {
                 
                 List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
                 ProcessBuilder pb = new ProcessBuilder(command);
+                setServerEnvironmentVariables(pb);
                 pb.redirectErrorStream(true);
                 Process process = pb.start();
 
@@ -10364,6 +10544,7 @@ public class VideoAnnotationTool {
 
                 List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
                 ProcessBuilder pb = new ProcessBuilder(command);
+                setServerEnvironmentVariables(pb);
                 pb.redirectErrorStream(true);
                 Process process = pb.start();
 
@@ -10587,6 +10768,7 @@ public class VideoAnnotationTool {
             
             List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
             ProcessBuilder pb = new ProcessBuilder(command);
+            setServerEnvironmentVariables(pb);
             pb.redirectErrorStream(true);
             Process process = pb.start();
             
@@ -10731,6 +10913,7 @@ public class VideoAnnotationTool {
             
             List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
             ProcessBuilder pb = new ProcessBuilder(command);
+            setServerEnvironmentVariables(pb);
             pb.redirectErrorStream(true);
             Process process = pb.start();
             
@@ -11178,6 +11361,7 @@ public class VideoAnnotationTool {
                 
                 List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
                 ProcessBuilder pb = new ProcessBuilder(command);
+                setServerEnvironmentVariables(pb);
                 pb.redirectErrorStream(true);
                 Process process = pb.start();
                 
@@ -11464,7 +11648,7 @@ public class VideoAnnotationTool {
         
         // Check which flow files exist using pattern matching
         // CRITICAL: Filter by resolution to prevent using wrong-resolution flow data
-        String[] methods = {"raft", "locotrack", "trackpy", "dis"};
+        String[] methods = {"raft", "locotrack", "trackpy", "dis", "dis_fast"};
         java.util.List<String> availableMethods = new java.util.ArrayList<>();
         java.util.Map<String, java.util.List<File>> methodFiles = new java.util.HashMap<>();
         int totalIncompatible = 0;
@@ -11702,6 +11886,7 @@ public class VideoAnnotationTool {
             
             List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
             ProcessBuilder pb = new ProcessBuilder(command);
+            setServerEnvironmentVariables(pb);
             pb.redirectErrorStream(true);
             Process process = pb.start();
             
@@ -11890,7 +12075,7 @@ public class VideoAnnotationTool {
         flowContent.add(flowMethodLabel, fgbc);
         fgbc.gridx = 1; fgbc.weightx = 0.7;
         // Only show available methods based on execution mode
-        String[] advFlowMethods = isCpuOnly ? new String[]{"dis", "trackpy"} : new String[]{"raft", "dis", "locotrack", "trackpy"};
+        String[] advFlowMethods = isCpuOnly ? new String[]{"dis", "dis_fast", "trackpy"} : new String[]{"raft", "dis", "dis_fast", "locotrack", "trackpy"};
         JComboBox<String> flowMethodCombo = createConfigComboBox(advFlowMethods);
         flowMethodCombo.setSelectedItem(getConfiguredFlowMethod()); // Use normalized method name
         flowContent.add(flowMethodCombo, fgbc);
@@ -12017,13 +12202,20 @@ public class VideoAnnotationTool {
         
         // Search Radius
         bgbc.gridx = 0; bgbc.gridy = 0; bgbc.weightx = 0.5;
-        JLabel searchRadiusLabel = createConfigLabel("Search Radius:");
-        searchRadiusLabel.setToolTipText("<html>Radius around flow-predicted position to search for blobs.<br>" +
-            "Larger values are more tolerant of flow errors but slower.</html>");
+        JLabel searchRadiusLabel = createConfigLabel("Search Radius (px):");
+        searchRadiusLabel.setToolTipText("<html>Radius in pixels around the flow-predicted position to search for blobs.<br>" +
+            "Smaller values help separate nearby structures but require less frame-to-frame motion.<br>" +
+            "Larger values tolerate bigger displacements but may snap to the wrong neighbor.</html>");
         blobParamsPanel.add(searchRadiusLabel, bgbc);
         bgbc.gridx = 1; bgbc.weightx = 0.5;
+        int blobSearchRadiusDefault = TrackingParameters.validateBlobSearchRadiusPixels(
+            config.getProperty("dis.blob.search.radius", String.valueOf((int) TrackingParameters.DEFAULT_BLOB_SEARCH_RADIUS)),
+            (int) TrackingParameters.DEFAULT_BLOB_SEARCH_RADIUS);
         JSpinner disBlobSearchRadiusSpinner = new JSpinner(new SpinnerNumberModel(
-            Integer.parseInt(config.getProperty("dis.blob.search.radius", "15")), 5, 50, 1));
+            blobSearchRadiusDefault,
+            (int) TrackingParameters.MIN_BLOB_SEARCH_RADIUS,
+            (int) TrackingParameters.MAX_BLOB_SEARCH_RADIUS,
+            1));
         disBlobSearchRadiusSpinner.setFont(new Font("Segoe UI", Font.PLAIN, 12));
         ((JSpinner.DefaultEditor) disBlobSearchRadiusSpinner.getEditor()).getTextField().setBackground(PANEL_DARK);
         ((JSpinner.DefaultEditor) disBlobSearchRadiusSpinner.getEditor()).getTextField().setForeground(TEXT_PRIMARY);
@@ -12578,16 +12770,21 @@ public class VideoAnnotationTool {
         
         // Local Correction Window Size
         trgbc.gridx = 0; trgbc.gridy = trow; trgbc.weightx = 0.3;
-        JLabel windowLabel = createConfigLabel("Correction Window:");
+        JLabel windowLabel = createConfigLabel("Correction Window (frames):");
         windowLabel.setToolTipText("<html>Total number of frames affected by a local correction.<br>" +
-            "A window of 11 means ±5 frames around the correction point.<br>" +
-            "Must be an odd number (will be adjusted if even).</html>");
+            "Must be an odd number (for example 11 means ±5 frames around the correction).<br>" +
+            "Even values are rounded up to the next odd number.</html>");
         trackContent.add(windowLabel, trgbc);
         trgbc.gridx = 1; trgbc.weightx = 0.7;
         JPanel windowPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
         windowPanel.setBackground(PANEL_DARK);
+        int localWindowMax = TrackingParameters.getLocalWindowMaximum(getVideoFrameCount(selectedTrackId));
+        int localWindowDefault = TrackingParameters.normalizeLocalWindow(
+            config.getProperty("correction.local.window", String.valueOf(TrackingParameters.DEFAULT_LOCAL_WINDOW)),
+            localWindowMax,
+            TrackingParameters.DEFAULT_LOCAL_WINDOW);
         JSpinner localWindowSpinner = new JSpinner(new SpinnerNumberModel(
-            Integer.parseInt(config.getProperty("correction.local.window", "11")), 5, 51, 2));
+            localWindowDefault, TrackingParameters.MIN_LOCAL_WINDOW, localWindowMax, 2));
         localWindowSpinner.setFont(new Font("Segoe UI", Font.PLAIN, 12));
         ((JSpinner.DefaultEditor) localWindowSpinner.getEditor()).getTextField().setBackground(PANEL_DARK);
         ((JSpinner.DefaultEditor) localWindowSpinner.getEditor()).getTextField().setForeground(TEXT_PRIMARY);
@@ -12776,7 +12973,10 @@ public class VideoAnnotationTool {
             // DIS parameters
             config.setProperty("dis.downsample.factor", disDownsampleSpinner.getValue().toString());
             config.setProperty("dis.use.blob.detection", String.valueOf(disBlobDetectionCheckbox.isSelected()));
-            config.setProperty("dis.blob.search.radius", disBlobSearchRadiusSpinner.getValue().toString());
+            config.setProperty("dis.blob.search.radius", String.valueOf(
+                TrackingParameters.validateBlobSearchRadiusPixels(
+                    disBlobSearchRadiusSpinner.getValue().toString(),
+                    (int) TrackingParameters.DEFAULT_BLOB_SEARCH_RADIUS)));
             config.setProperty("dis.blob.radius", disBlobRadiusSpinner.getValue().toString());
             config.setProperty("dis.cache.video", String.valueOf(disCacheVideoCheckbox.isSelected()));
             // LocoTrack DoG parameters (only saved if components exist - GPU mode only)
@@ -12795,9 +12995,9 @@ public class VideoAnnotationTool {
             // Tracking settings
             config.setProperty("tracking.mode", newTrackingMode);
             config.setProperty("correction.local.mode", String.valueOf(localCorrectionCheckbox.isSelected()));
-            // Ensure window is odd
-            int windowVal = (Integer) localWindowSpinner.getValue();
-            if (windowVal % 2 == 0) windowVal++;
+            int windowVal = TrackingParameters.normalizeLocalWindow(
+                (Integer) localWindowSpinner.getValue(),
+                TrackingParameters.getLocalWindowMaximum(getVideoFrameCount(selectedTrackId)));
             config.setProperty("correction.local.window", String.valueOf(windowVal));
             
             // Fine-tuning settings (GPU mode only)
@@ -12966,10 +13166,10 @@ public class VideoAnnotationTool {
         String[] availableFlowMethods;
         String defaultFlowMethod;
         if (isCpuOnly) {
-            availableFlowMethods = new String[]{"DIS (Fast)", "Trackpy (Particles)"};
+            availableFlowMethods = new String[]{"DIS (Fast)", "DIS (Ultrafast)", "Trackpy (Particles)"};
             defaultFlowMethod = "DIS (Fast)";
         } else {
-            availableFlowMethods = new String[]{"RAFT (Original)", "DIS (Fast)", "LocoTrack (Points)", "Trackpy (Particles)"};
+            availableFlowMethods = new String[]{"RAFT (Original)", "DIS (Fast)", "DIS (Ultrafast)", "LocoTrack (Points)", "Trackpy (Particles)"};
             defaultFlowMethod = "RAFT (Original)";
         }
         cfgFlowMethodCombo = createModernComboBox(availableFlowMethods);
@@ -12983,6 +13183,7 @@ public class VideoAnnotationTool {
         cfgFlowMethodCombo.setSelectedItem(displayMethod);
         cfgFlowMethodCombo.setToolTipText("<html><b>RAFT:</b> Original deep learning method (GPU required)<br>" +
             "<b>DIS:</b> Fast CPU-based dense motion<br>" +
+            "<b>DIS (Ultrafast):</b> Fastest DIS preset at full resolution — best accuracy across varied data<br>" +
             "<b>LocoTrack:</b> AI point tracker with auto-detection (GPU required)<br>" +
             "<b>Trackpy:</b> Traditional particle tracking for blobs</html>");
         methodContent.add(cfgFlowMethodCombo, mgbc);
@@ -13373,9 +13574,16 @@ public class VideoAnnotationTool {
         refinementContent.add(windowLabel, rgbc);
         rgbc.gridx = 1; rgbc.weightx = 0.65;
         cfgLocalWindowSpinner = new JSpinner(new SpinnerNumberModel(
-            Integer.parseInt(config.getProperty("correction.local.window", "11")), 5, 51, 2));
+            TrackingParameters.normalizeLocalWindow(
+                config.getProperty("correction.local.window", String.valueOf(TrackingParameters.DEFAULT_LOCAL_WINDOW)),
+                TrackingParameters.getLocalWindowMaximum(getVideoFrameCount(selectedTrackId)),
+                TrackingParameters.DEFAULT_LOCAL_WINDOW),
+            TrackingParameters.MIN_LOCAL_WINDOW,
+            TrackingParameters.getLocalWindowMaximum(getVideoFrameCount(selectedTrackId)),
+            2));
         styleSpinner(cfgLocalWindowSpinner);
-        cfgLocalWindowSpinner.setToolTipText("Number of frames affected by a local correction");
+        cfgLocalWindowSpinner.setToolTipText("<html>Number of frames affected by a local correction (must be odd).<br>" +
+            "Even values are rounded up automatically.</html>");
         refinementContent.add(cfgLocalWindowSpinner, rgbc);
         rrow++;
         
@@ -13419,9 +13627,16 @@ public class VideoAnnotationTool {
         cfgBlobParamsPanel.add(createConfigLabel("Search Radius:"), bpgbc);
         bpgbc.gridx = 1; bpgbc.weightx = 0.5;
         cfgBlobSearchRadiusSpinner = new JSpinner(new SpinnerNumberModel(
-            Integer.parseInt(config.getProperty("dis.blob.search.radius", "15")), 5, 50, 1));
+            TrackingParameters.validateBlobSearchRadiusPixels(
+                config.getProperty("dis.blob.search.radius", String.valueOf((int) TrackingParameters.DEFAULT_BLOB_SEARCH_RADIUS)),
+                (int) TrackingParameters.DEFAULT_BLOB_SEARCH_RADIUS),
+            (int) TrackingParameters.MIN_BLOB_SEARCH_RADIUS,
+            (int) TrackingParameters.MAX_BLOB_SEARCH_RADIUS,
+            1));
         styleSpinner(cfgBlobSearchRadiusSpinner);
-        cfgBlobSearchRadiusSpinner.setToolTipText("How far to look for nearby particles");
+        cfgBlobSearchRadiusSpinner.setToolTipText("<html>Search radius in pixels around the predicted position.<br>" +
+            "Smaller values help separate nearby structures but require less frame-to-frame motion.<br>" +
+            "Larger values tolerate bigger displacements but may snap to the wrong neighbor.</html>");
         cfgBlobParamsPanel.add(cfgBlobSearchRadiusSpinner, bpgbc);
         
         bpgbc.gridx = 0; bpgbc.gridy = 1;
@@ -13509,6 +13724,7 @@ public class VideoAnnotationTool {
         String lower = method.toLowerCase();
         // Handle both internal names and legacy display names
         if (lower.equals("raft") || lower.startsWith("raft ")) return "RAFT (Original)";
+        if (lower.equals("dis_fast") || lower.startsWith("dis_fast ") || lower.equals("dis (ultrafast)")) return "DIS (Ultrafast)";
         if (lower.equals("dis") || lower.startsWith("dis ")) return "DIS (Fast)";
         if (lower.equals("locotrack") || lower.startsWith("locotrack ")) return "LocoTrack (Points)";
         if (lower.equals("trackpy") || lower.startsWith("trackpy ")) return "Trackpy (Particles)";
@@ -13523,6 +13739,7 @@ public class VideoAnnotationTool {
         if (display == null) return "raft";
         String lower = display.toLowerCase();
         if (lower.equals("raft") || lower.startsWith("raft ")) return "raft";
+        if (lower.equals("dis_fast") || lower.startsWith("dis_fast ") || lower.startsWith("dis (ultrafast)")) return "dis_fast";
         if (lower.equals("dis") || lower.startsWith("dis ")) return "dis";
         if (lower.equals("locotrack") || lower.startsWith("locotrack ")) return "locotrack";
         if (lower.equals("trackpy") || lower.startsWith("trackpy ")) return "trackpy";
@@ -13910,7 +14127,10 @@ public class VideoAnnotationTool {
         
         // Blob detection settings (now separate)
         config.setProperty("dis.use.blob.detection", String.valueOf(cfgBlobDetectionCheckbox.isSelected()));
-        config.setProperty("dis.blob.search.radius", cfgBlobSearchRadiusSpinner.getValue().toString());
+        config.setProperty("dis.blob.search.radius", String.valueOf(
+            TrackingParameters.validateBlobSearchRadiusPixels(
+                cfgBlobSearchRadiusSpinner.getValue().toString(),
+                (int) TrackingParameters.DEFAULT_BLOB_SEARCH_RADIUS)));
         config.setProperty("dis.blob.radius", cfgBlobRadiusSpinner.getValue().toString());
         
         // Correction method setting
@@ -13929,8 +14149,9 @@ public class VideoAnnotationTool {
         // Tracking settings
         config.setProperty("tracking.mode", newTrackingMode);
         config.setProperty("correction.local.mode", String.valueOf(cfgLocalCorrectionCheckbox.isSelected()));
-        int windowVal = (Integer) cfgLocalWindowSpinner.getValue();
-        if (windowVal % 2 == 0) windowVal++;
+        int windowVal = TrackingParameters.normalizeLocalWindow(
+            (Integer) cfgLocalWindowSpinner.getValue(),
+            TrackingParameters.getLocalWindowMaximum(getVideoFrameCount(selectedTrackId)));
         config.setProperty("correction.local.window", String.valueOf(windowVal));
         
         saveConfig();
@@ -13982,7 +14203,9 @@ public class VideoAnnotationTool {
         cfgAutoComputeCheck.setSelected(Boolean.parseBoolean(config.getProperty("auto.compute.optical.flow", "true")));
         
         cfgBlobDetectionCheckbox.setSelected(Boolean.parseBoolean(config.getProperty("dis.use.blob.detection", "false")));
-        cfgBlobSearchRadiusSpinner.setValue(Integer.parseInt(config.getProperty("dis.blob.search.radius", "15")));
+        cfgBlobSearchRadiusSpinner.setValue(TrackingParameters.validateBlobSearchRadiusPixels(
+            config.getProperty("dis.blob.search.radius", String.valueOf((int) TrackingParameters.DEFAULT_BLOB_SEARCH_RADIUS)),
+            (int) TrackingParameters.DEFAULT_BLOB_SEARCH_RADIUS));
         cfgBlobRadiusSpinner.setValue(Double.parseDouble(config.getProperty("dis.blob.radius", "5.0")));
         cfgBlobParamsPanel.setVisible(cfgBlobDetectionCheckbox.isSelected());
         
@@ -14002,7 +14225,19 @@ public class VideoAnnotationTool {
         
         cfgTrackingModeCombo.setSelectedItem(config.getProperty("tracking.mode", "single-seed"));
         cfgLocalCorrectionCheckbox.setSelected(Boolean.parseBoolean(config.getProperty("correction.local.mode", "false")));
-        cfgLocalWindowSpinner.setValue(Integer.parseInt(config.getProperty("correction.local.window", "11")));
+        int localWindowMax = TrackingParameters.getLocalWindowMaximum(getVideoFrameCount(selectedTrackId));
+        cfgLocalWindowSpinner.setModel(new SpinnerNumberModel(
+            TrackingParameters.normalizeLocalWindow(
+                config.getProperty("correction.local.window", String.valueOf(TrackingParameters.DEFAULT_LOCAL_WINDOW)),
+                localWindowMax,
+                TrackingParameters.DEFAULT_LOCAL_WINDOW),
+            TrackingParameters.MIN_LOCAL_WINDOW,
+            localWindowMax,
+            2));
+        cfgLocalWindowSpinner.setValue(TrackingParameters.normalizeLocalWindow(
+            config.getProperty("correction.local.window", String.valueOf(TrackingParameters.DEFAULT_LOCAL_WINDOW)),
+            localWindowMax,
+            TrackingParameters.DEFAULT_LOCAL_WINDOW));
         
         isUpdatingConfigPanel = false;
     }
@@ -14441,10 +14676,16 @@ public class VideoAnnotationTool {
                 infoRow.add(anchorBadge);
             }
             
-            // Occlusion badge
-            if (occludedFrames > 0) {
-                JLabel occlusionBadge = createInfoBadge("👁 " + occludedFrames, new Color(130, 90, 70));
-                infoRow.add(occlusionBadge);
+            // Occlusion badges (separate counts per type)
+            int oopFrames = calculateOccludedFramesByType(trackId, OCCLUSION_OUT_OF_PLANE);
+            int objFrames = calculateOccludedFramesByType(trackId, OCCLUSION_OBJECT);
+            if (oopFrames > 0) {
+                JLabel oopBadge = createInfoBadge("👁 " + oopFrames + " OoP", new Color(150, 60, 50));
+                infoRow.add(oopBadge);
+            }
+            if (objFrames > 0) {
+                JLabel objBadge = createInfoBadge("👁 " + objFrames + " Obj", new Color(160, 110, 40));
+                infoRow.add(objBadge);
             }
             
             // Smoothing badge
@@ -15998,6 +16239,7 @@ public class VideoAnnotationTool {
             
             List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
             ProcessBuilder pb = new ProcessBuilder(command);
+            setServerEnvironmentVariables(pb);
             pb.redirectErrorStream(true);
             
             long startTime = System.currentTimeMillis();
@@ -16086,6 +16328,7 @@ public class VideoAnnotationTool {
             List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
             
             ProcessBuilder pb = new ProcessBuilder(command);
+            setServerEnvironmentVariables(pb);
             pb.redirectErrorStream(true);
             
             Process proc = pb.start();
@@ -16146,6 +16389,7 @@ public class VideoAnnotationTool {
             List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
             
             ProcessBuilder pb = new ProcessBuilder(command);
+            setServerEnvironmentVariables(pb);
             pb.redirectErrorStream(true);
             
             Process proc = pb.start();
@@ -16998,7 +17242,13 @@ public class VideoAnnotationTool {
     private void setServerEnvironmentVariables(ProcessBuilder pb) {
         Map<String, String> env = pb.environment();
         env.put("CONDA_ENV", config.getProperty("local.conda.env", "ripple-env"));
-        env.put("SOCKET_PATH", config.getProperty("local.socket.path", "/tmp/ripple-env.sock"));
+        // Resolve socket path using the same logic as resolveRippleSocketPath()
+        // so that the shell script, Python server, and Java direct IPC all agree.
+        String socketPath = config.getProperty("local.socket.path", "").trim();
+        if (socketPath.isEmpty()) {
+            socketPath = resolveRippleSocketPath();
+        }
+        env.put("SOCKET_PATH", socketPath);
         env.put("SOCKET_HOST", config.getProperty("local.tcp.host", "127.0.0.1"));
         env.put("SOCKET_PORT", config.getProperty("local.tcp.port", "9876"));
         env.put("MODEL_SIZE", config.getProperty("raft.model.size", "large"));
@@ -17097,7 +17347,10 @@ public class VideoAnnotationTool {
      */
     private void cleanupSocketFile() {
         try {
-            String socketPath = config.getProperty("local.socket.path", "/tmp/ripple-env.sock");
+            String socketPath = config.getProperty("local.socket.path", "").trim();
+            if (socketPath.isEmpty()) {
+                socketPath = resolveRippleSocketPath();
+            }
             String os = System.getProperty("os.name").toLowerCase();
             ProcessBuilder pb;
             if (os.contains("win")) {
@@ -18826,6 +19079,8 @@ public class VideoAnnotationTool {
                         JSONObject segObj = new JSONObject();
                         segObj.put("start", segStart);
                         segObj.put("end", segEnd);
+                        int type = seg.length >= 3 ? seg[2] : OCCLUSION_OUT_OF_PLANE;
+                        segObj.put("type", type == OCCLUSION_OBJECT ? "object" : "out_of_plane");
                         segmentsArray.put(segObj);
                     }
                     if (segmentsArray.length() > 0) {
@@ -18949,7 +19204,7 @@ public class VideoAnnotationTool {
                 summary.append("trimmed=false; ");
             }
             
-            // Occlusion segments - export as compact array notation
+            // Occlusion segments - export as compact array notation with type
             List<int[]> occlusionSegments = trackOcclusionSegments.get(trackId);
             if (occlusionSegments != null && !occlusionSegments.isEmpty()) {
                 StringBuilder segBuilder = new StringBuilder("[");
@@ -18957,7 +19212,8 @@ public class VideoAnnotationTool {
                     int[] seg = occlusionSegments.get(i);
                     if (seg != null && seg.length >= 2) {
                         if (i > 0) segBuilder.append(",");
-                        segBuilder.append("[").append(seg[0]).append(",").append(seg[1]).append("]");
+                        int type = seg.length >= 3 ? seg[2] : OCCLUSION_OUT_OF_PLANE;
+                        segBuilder.append("[").append(seg[0]).append(",").append(seg[1]).append(",").append(type).append("]");
                     }
                 }
                 segBuilder.append("]");
@@ -19751,7 +20007,7 @@ public class VideoAnnotationTool {
     }
     
     /**
-     * Parse occlusion segments from array notation like [[1,5],[10,15]].
+     * Parse occlusion segments from array notation like [[1,5,0],[10,15,1]] or legacy [[1,5],[10,15]].
      */
     private List<int[]> parseOcclusionSegmentsArray(String arrayStr) {
         List<int[]> segments = new ArrayList<>();
@@ -19762,16 +20018,17 @@ public class VideoAnnotationTool {
         
         if (arrayStr.isEmpty()) return segments;
         
-        // Pattern to match [start,end] pairs
-        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("\\[(\\d+),(\\d+)\\]");
+        // Pattern to match [start,end] or [start,end,type] pairs
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("\\[(\\d+),(\\d+)(?:,(\\d+))?\\]");
         java.util.regex.Matcher matcher = pattern.matcher(arrayStr);
         
         while (matcher.find()) {
             try {
                 int start = Integer.parseInt(matcher.group(1));
                 int end = Integer.parseInt(matcher.group(2));
+                int type = matcher.group(3) != null ? Integer.parseInt(matcher.group(3)) : OCCLUSION_OUT_OF_PLANE;
                 if (start <= end) {  // Validate segment
-                    segments.add(new int[]{start, end});
+                    segments.add(new int[]{start, end, type});
                 }
             } catch (NumberFormatException ignored) {}
         }
@@ -19781,7 +20038,7 @@ public class VideoAnnotationTool {
     
     /**
      * Reconstruct occlusion segments from a list of individual occluded frame numbers.
-     * Consecutive frames are merged into segments.
+     * Consecutive frames are merged into segments. Legacy data defaults to out-of-plane type.
      */
     private List<int[]> reconstructOcclusionSegments(List<Integer> occludedFrames) {
         List<int[]> segments = new ArrayList<>();
@@ -19800,14 +20057,14 @@ public class VideoAnnotationTool {
                 segEnd = frame;
             } else {
                 // Gap found, save current segment and start new one
-                segments.add(new int[]{segStart, segEnd});
+                segments.add(new int[]{segStart, segEnd, OCCLUSION_OUT_OF_PLANE});
                 segStart = frame;
                 segEnd = frame;
             }
         }
         
         // Add final segment
-        segments.add(new int[]{segStart, segEnd});
+        segments.add(new int[]{segStart, segEnd, OCCLUSION_OUT_OF_PLANE});
         
         return segments;
     }
@@ -20121,11 +20378,14 @@ public class VideoAnnotationTool {
                                 JSONObject segObj = segmentsArray.getJSONObject(j);
                                 int segStart = segObj.optInt("start", 0);
                                 int segEnd = segObj.optInt("end", 0);
+                                // Read type with backward compatibility (default to out_of_plane)
+                                String typeStr = segObj.optString("type", "out_of_plane");
+                                int type = "object".equalsIgnoreCase(typeStr) ? OCCLUSION_OBJECT : OCCLUSION_OUT_OF_PLANE;
                                 
                                 // Validate segment
                                 if (segStart < 0) segStart = 0;
                                 if (segEnd >= segStart) {  // Valid segment
-                                    segments.add(new int[]{segStart, segEnd});
+                                    segments.add(new int[]{segStart, segEnd, type});
                                 } else {
                                     System.err.println("Warning: Invalid occlusion segment [" + segStart + "," + segEnd + "] in track " + trackId + ", skipping");
                                 }

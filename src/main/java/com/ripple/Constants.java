@@ -118,6 +118,7 @@ public class Constants {
     public static final String FLOW_METHOD_LOCOTRACK = "locotrack";
     public static final String FLOW_METHOD_TRACKPY = "trackpy";
     public static final String FLOW_METHOD_DIS = "dis";
+    public static final String FLOW_METHOD_DIS_FAST = "dis_fast";
     public static final String DEFAULT_FLOW_METHOD = FLOW_METHOD_RAFT;
     
     // Execution mode identifiers (set by launcher via environment variable)
@@ -129,7 +130,7 @@ public class Constants {
     public static final String[] GPU_ONLY_FLOW_METHODS = {FLOW_METHOD_RAFT, FLOW_METHOD_LOCOTRACK};
     
     // CPU-compatible features
-    public static final String[] CPU_FLOW_METHODS = {FLOW_METHOD_DIS, FLOW_METHOD_TRACKPY};
+    public static final String[] CPU_FLOW_METHODS = {FLOW_METHOD_DIS, FLOW_METHOD_DIS_FAST, FLOW_METHOD_TRACKPY};
     
     // Correction method identifiers
     public static final String CORRECTION_METHOD_FULL_BLEND = "full_blend";

@@ -1013,6 +1013,32 @@ def _clamp_xy(x, y, W, H):
     return int(np.clip(round(x), 0, W-1)), int(np.clip(round(y), 0, H-1))
 
 
+def _normalize_blob_search_radius(value, default=15):
+    """Validate blob search radius in pixels (minimum 1, no hidden 5px floor)."""
+    try:
+        radius = float(value)
+    except (TypeError, ValueError):
+        radius = float(default)
+    if not np.isfinite(radius) or radius <= 0:
+        radius = float(default)
+    return max(1, int(round(radius)))
+
+
+def _normalize_local_window(value, total_frames=0, default=11):
+    """Normalize local correction window to an odd frame count within safe bounds."""
+    try:
+        window = int(value)
+    except (TypeError, ValueError):
+        window = int(default)
+    max_window = 10001 if total_frames <= 0 else min(10001, total_frames)
+    if max_window % 2 == 0:
+        max_window = max(3, max_window - 1)
+    window = max(3, min(max_window, window))
+    if window % 2 == 0:
+        window = min(max_window, window + 1)
+    return window
+
+
 # =============================================================================
 # FLOW-BASED TRACK CORRECTION (SEGMENT BLENDING)
 # =============================================================================
@@ -2743,7 +2769,8 @@ class TrackingServer:
         # Expected format: videoname_method_optical_flow.npz
         video_name = basename
         for suffix in ['_raft_optical_flow.npz', '_locotrack_optical_flow.npz', 
-                       '_trackpy_optical_flow.npz', '_dis_optical_flow.npz',
+                       '_trackpy_optical_flow.npz', '_dis_fast_optical_flow.npz',
+                       '_dis_optical_flow.npz',
                        '_optical_flow.npz', '.npz']:
             if video_name.endswith(suffix):
                 video_name = video_name[:-len(suffix)]
@@ -2823,6 +2850,9 @@ class TrackingServer:
             # DIS: include downsample factor
             ds_factor = params.get('downsample_factor', 2)
             param_suffix = f"_ds{ds_factor}"
+        elif method == 'dis_fast':
+            # DIS Ultrafast: always full resolution, no extra params
+            param_suffix = ""
         else:
             param_suffix = ""
         
@@ -2982,6 +3012,10 @@ class TrackingServer:
                 # Trackpy: check radius/diameter, threshold, search_range, etc.
                 if self._trackpy_params_match_filename(fname, params):
                     matched.append(f)
+            
+            elif method == 'dis_fast':
+                # DIS Ultrafast: no extra parameters beyond resolution
+                matched.append(f)
         
         return matched
     
@@ -3319,7 +3353,7 @@ class TrackingServer:
             
             # For long-running operations, check if server is busy
             long_running_commands = {
-                "compute_flow", "compute_dis_flow", "compute_locotrack_flow", 
+                "compute_flow", "compute_dis_flow", "compute_dis_fast_flow", "compute_locotrack_flow", 
                 "compute_trackpy_flow", "propagate_track", "optimize_track",
                 "optimize_tracks", "visualize_flow", "preview_trackpy_trajectories",
                 # These can be slow (I/O heavy) and should support Cancel
@@ -3360,6 +3394,8 @@ class TrackingServer:
                     response = self._compute_flow(request)
                 elif command == "compute_dis_flow":
                     response = self._compute_dis_flow(request)
+                elif command == "compute_dis_fast_flow":
+                    response = self._compute_dis_fast_flow(request)
                 elif command == "compute_locotrack_flow":
                     response = self._compute_locotrack_flow(request)
                 elif command == "compute_trackpy_flow":
@@ -4730,6 +4766,8 @@ class TrackingServer:
                         def get_frame_gray(t):
                             """Get frame t as grayscale uint8 from zarr store."""
                             frame = np.array(tiff_zarr[t]).astype(np.float32)
+                            if frame.ndim == 3:
+                                frame = np.mean(frame, axis=-1).astype(np.float32)
                             if should_resize and (orig_H != target_H or orig_W != target_W):
                                 frame = cv2.resize(frame, (target_W, target_H))
                             return cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
@@ -4749,6 +4787,8 @@ class TrackingServer:
                     def get_frame_gray(t):
                         """Get frame t as grayscale uint8 from memory."""
                         frame = video_data[t].astype(np.float32)
+                        if frame.ndim == 3:
+                            frame = np.mean(frame, axis=-1).astype(np.float32)
                         if should_resize and (orig_H != target_H or orig_W != target_W):
                             frame = cv2.resize(frame, (target_W, target_H))
                         return cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
@@ -4757,6 +4797,8 @@ class TrackingServer:
                     """Get frame t as grayscale uint8 from pages."""
                     with tifffile.TiffFile(video_path_str) as tif:
                         frame = tif.pages[t].asarray().astype(np.float32)
+                    if frame.ndim == 3:
+                        frame = np.mean(frame, axis=-1).astype(np.float32)
                     if should_resize and (orig_H != target_H or orig_W != target_W):
                         frame = cv2.resize(frame, (target_W, target_H))
                     return cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
@@ -4841,11 +4883,26 @@ class TrackingServer:
         # Pre-load first frame
         prev_frame = get_frame_gray(0)
         
+        # Safety: validate first frame is single-channel uint8
+        if prev_frame is None or prev_frame.size == 0:
+            raise ValueError(f"First frame is empty (shape={getattr(prev_frame, 'shape', None)})")
+        if prev_frame.ndim != 2:
+            raise ValueError(f"get_frame_gray returned {prev_frame.ndim}D array (shape={prev_frame.shape}), expected 2D grayscale")
+        if prev_frame.dtype != np.uint8:
+            raise ValueError(f"get_frame_gray returned dtype={prev_frame.dtype}, expected uint8")
+        print(f"  Frame validation OK: shape={prev_frame.shape}, dtype={prev_frame.dtype}")
+        
         for t in range(T - 1):
             # Allow responsive cancellation during long per-frame loops
             self._check_cancelled("DIS flow computation")
             # Get current and next frame
             curr_frame = get_frame_gray(t + 1)
+            
+            # Safety: ensure frames are single-channel uint8 for DIS
+            if curr_frame is not None and curr_frame.ndim == 3:
+                curr_frame = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
+            if curr_frame is not None and curr_frame.dtype != np.uint8:
+                curr_frame = cv2.normalize(curr_frame, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
             
             # Downsample frames for DIS computation
             if DS > 1:
@@ -4954,6 +5011,348 @@ class TrackingServer:
             "input_resolution": f"{W}x{H}",
             "method": "dis",
             "downsample_factor": DS,
+            "memory_gb": f"{expected_mem_gb:.2f}",
+            "elapsed_time": f"{elapsed:.2f}s",
+        }
+        
+        return {
+            "status": "ok",
+            "message": "DIS optical flow computed",
+            "shape": list(flows_np.shape),
+            "flow_resolution": f"{flow_W}x{flow_H}",
+            "input_resolution": f"{W}x{H}",
+            "method": "dis",
+            "downsample_factor": DS,
+            "memory_gb": f"{expected_mem_gb:.2f}",
+            "elapsed_time": f"{elapsed:.2f}s",
+        }
+    
+    def _compute_dis_fast_flow(self, request):
+        """Compute optical flow using OpenCV DIS with ULTRAFAST preset at full resolution.
+        
+        This method was selected via benchmarking as the best-performing CPU optical flow
+        algorithm across diverse datasets (confined particles, deformable tissue, fast-moving
+        sperm). It consistently outperforms the default DIS MEDIUM with DS=2 baseline.
+        
+        Key differences from standard DIS:
+          - Uses PRESET_ULTRAFAST (fewer refinement iterations)
+          - Always computes at full resolution (no downsampling)
+          - Faster computation, better accuracy on fast-moving objects
+        
+        Request parameters:
+            video_path: Path to video file (TIFF or AVI)
+            output_path: Optional path to save flow
+            force_recompute: Force recomputation even if cached
+            target_width: Target width for resizing (optional, from Java UI compression)
+            target_height: Target height for resizing (optional, from Java UI compression)
+            save_to_disk: Whether to save computed flow to disk (default: True)
+            incremental_allocation: Use incremental allocation for low-memory systems.
+        """
+        self._check_cancelled("DIS Ultrafast flow computation")
+        
+        video_path = request["video_path"]
+        force_recompute = request.get("force_recompute", False)
+        output_path = request.get("output_path", None)
+        target_width = request.get("target_width", None)
+        target_height = request.get("target_height", None)
+        save_to_disk = request.get("save_to_disk", True)
+        
+        print(f"\n{'='*60}")
+        print(f"[DIS ULTRAFAST] Request parameters:")
+        print(f"  video_path: {video_path}")
+        print(f"  force_recompute: {force_recompute} (type: {type(force_recompute).__name__})")
+        print(f"  output_path: {output_path}")
+        print(f"  target_width: {target_width}, target_height: {target_height}")
+        print(f"{'='*60}\n")
+        
+        if isinstance(force_recompute, str):
+            force_recompute = force_recompute.lower() in ('true', '1', 'yes')
+        else:
+            force_recompute = bool(force_recompute)
+        
+        incremental_req = request.get("incremental_allocation", None)
+        use_incremental = should_use_incremental_allocation(incremental_req)
+        
+        output_path = self._normalize_flow_output_path(request, output_path)
+        self._clear_flow_cache_for_new_video(video_path)
+        
+        cache_key = f"{video_path}_dis_fast"
+        print(f"[DIS ULTRAFAST] Cache key: {cache_key}")
+        
+        # Check in-memory cache
+        cache_entry = self.flow_cache.get(cache_key)
+        if cache_entry and not force_recompute:
+            cached_method = cache_entry.get("metadata", {}).get("method", None)
+            if cached_method == "dis_fast":
+                print(f"Using cached DIS Ultrafast flow from memory for {video_path}")
+                flows = cache_entry["flows_np"]
+                response = {
+                    "status": "ok",
+                    "message": "DIS Ultrafast optical flow loaded from cache",
+                    "shape": list(flows.shape),
+                    "method": "dis_fast",
+                }
+                if video_path in self.video_metadata:
+                    metadata = self.video_metadata[video_path]
+                    response["metadata"] = {
+                        "original_shape": list(metadata['original_shape']) if metadata.get('original_shape') else None,
+                        "resized_shape": list(metadata['resized_shape']) if metadata.get('resized_shape') else None,
+                        "is_avi": metadata.get('is_avi', False),
+                        "method": "dis_fast",
+                    }
+                return response
+        
+        # Check disk cache
+        if output_path and not force_recompute:
+            disk_path = self._find_existing_flow_file(
+                output_path, 'dis_fast', target_width=target_width, target_height=target_height)
+            if disk_path and os.path.exists(disk_path):
+                print(f"Loading DIS Ultrafast flow from disk cache: {disk_path}")
+                try:
+                    data = np.load(disk_path, allow_pickle=False)
+                    flows = load_flows_memory_efficient(data['flows'])
+                    if flows.ndim == 4 and flows.shape[-1] == 2:
+                        disk_method = str(data.get('method', 'dis_fast')) if 'method' in data.files else 'dis_fast'
+                        if disk_method == 'dis_fast' and 'original_shape' in data:
+                            metadata = {
+                                'original_shape': tuple(int(x) for x in data['original_shape']),
+                                'resized_shape': tuple(int(x) for x in data['resized_shape']),
+                                'is_avi': bool(data['is_avi']) if 'is_avi' in data.files else False,
+                                'method': 'dis_fast',
+                                'flow_to_input_scale': 1,
+                            }
+                            self.flow_cache[cache_key] = {
+                                "flows_np": flows,
+                                "timestamp": _pc(),
+                                "metadata": metadata,
+                            }
+                            self.flow_cache[video_path] = self.flow_cache[cache_key]
+                            self.video_metadata[video_path] = metadata
+                            print(f"✓ DIS Ultrafast flow loaded from disk ({flows.shape})")
+                            return {
+                                "status": "ok",
+                                "message": "DIS Ultrafast optical flow loaded from cache",
+                                "shape": list(flows.shape),
+                                "method": "dis_fast",
+                            }
+                except Exception as e:
+                    print(f"Failed to load DIS Ultrafast flow from disk: {e}")
+        
+        # Compute DIS Ultrafast flow
+        print(f"Computing DIS Ultrafast optical flow for {video_path}")
+        if target_width and target_height:
+            print(f"Using target resolution: {target_width}x{target_height}")
+        start_time = _pc()
+        
+        video_path_str = str(video_path)
+        is_avi = video_path_str.lower().endswith('.avi')
+        
+        should_resize = (target_width is not None and target_width > 0 and 
+                         target_height is not None and target_height > 0)
+        
+        tiff_store = None
+        
+        if is_avi:
+            import mediapy as media
+            print(f"Loading AVI with mediapy: {video_path_str}")
+            video = media.read_video(video_path_str)
+            orig_shape = video.shape[:3]
+            T, H, W = orig_shape[0], orig_shape[1], orig_shape[2]
+            
+            if should_resize:
+                target_H, target_W = target_height, target_width
+            else:
+                target_H, target_W = H, W
+            
+            resized_shape = (T, target_H, target_W)
+            
+            def get_frame_gray(t):
+                frame = video[t]
+                if frame.ndim == 3:
+                    frame = np.mean(frame, axis=-1)
+                if should_resize and (H != target_H or W != target_W):
+                    frame = cv2.resize(frame.astype(np.float32), (target_W, target_H))
+                return cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        else:
+            print(f"Loading TIFF with memory-efficient access: {video_path_str}")
+            with tifffile.TiffFile(video_path_str) as tif:
+                num_pages = len(tif.pages)
+                series_frames = 1
+                if tif.series and len(tif.series) > 0:
+                    series = tif.series[0]
+                    shape = series.shape
+                    if len(shape) >= 3:
+                        series_frames = shape[0]
+                        H = shape[1]
+                        W = shape[2]
+                    else:
+                        H, W = shape[0], shape[1]
+                else:
+                    first_page = tif.pages[0].asarray()
+                    H, W = first_page.shape[:2]
+                
+                if series_frames > num_pages:
+                    T = series_frames
+                    use_pages = False
+                else:
+                    T = num_pages
+                    use_pages = True
+                
+                orig_shape = (T, H, W)
+            
+            if should_resize:
+                target_H, target_W = target_height, target_width
+            else:
+                target_H, target_W = H, W
+            
+            resized_shape = (T, target_H, target_W)
+            
+            if not use_pages:
+                try:
+                    tiff_store = tifffile.imread(video_path_str, aszarr=True)
+                    import zarr
+                    zarr_arr = zarr.open(tiff_store, mode='r')
+                    
+                    def get_frame_gray(t):
+                        frame = zarr_arr[t].astype(np.float32)
+                        if frame.ndim == 3:
+                            frame = np.mean(frame, axis=-1).astype(np.float32)
+                        if should_resize and (H != target_H or W != target_W):
+                            frame = cv2.resize(frame, (target_W, target_H))
+                        return cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                except Exception:
+                    use_pages = True
+            
+            if use_pages:
+                def get_frame_gray(t):
+                    with tifffile.TiffFile(video_path_str) as tif:
+                        frame = tif.pages[t].asarray().astype(np.float32)
+                    if frame.ndim == 3:
+                        frame = np.mean(frame, axis=-1).astype(np.float32)
+                    if should_resize and (H != target_H or W != target_W):
+                        frame = cv2.resize(frame, (target_W, target_H))
+                    return cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        
+        # Create DIS Ultrafast optical flow object
+        dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_ULTRAFAST)
+        
+        # Full resolution — no downsampling
+        flow_H = target_H
+        flow_W = target_W
+        
+        num_flow_frames = T - 1
+        expected_mem_gb = num_flow_frames * flow_H * flow_W * 2 * 4 / 1e9
+        
+        total_ram_gb = get_total_system_memory_gb()
+        print(f"\n{'='*60}")
+        print(f"DIS ULTRAFAST OPTICAL FLOW - MEMORY ESTIMATION")
+        print(f"  Video: {T} frames at {target_W}x{target_H}")
+        print(f"  Full resolution (no downsampling)")
+        print(f"  Memory required: {expected_mem_gb:.2f} GB")
+        print(f"  System RAM: {total_ram_gb:.1f} GB")
+        print(f"  Allocation mode: {'INCREMENTAL' if use_incremental else 'PRE-ALLOCATED'}")
+        print(f"{'='*60}\n")
+        
+        if HAS_PSUTIL and not use_incremental:
+            available_mem_gb = psutil.virtual_memory().available / 1e9
+            if expected_mem_gb > available_mem_gb * 0.8:
+                print(f"  ⚠️  Memory may be tight - switching to incremental allocation...")
+                use_incremental = True
+        
+        if use_incremental:
+            flow_maps = [None] * num_flow_frames
+        else:
+            try:
+                flows_np = np.zeros((num_flow_frames, flow_H, flow_W, 2), dtype=np.float32)
+            except MemoryError:
+                print("  MemoryError during pre-allocation, switching to incremental mode...")
+                use_incremental = True
+                flow_maps = [None] * num_flow_frames
+        
+        prev_frame = get_frame_gray(0)
+        
+        for t in range(num_flow_frames):
+            self._check_cancelled("DIS Ultrafast flow computation")
+            
+            curr_frame = get_frame_gray(t + 1)
+            flow = dis.calc(prev_frame, curr_frame, None)
+            
+            if use_incremental:
+                flow_maps[t] = flow.copy()
+            else:
+                flows_np[t] = flow
+            
+            prev_frame = curr_frame
+            
+            if (t + 1) % 50 == 0 or t == num_flow_frames - 1:
+                print(f"  DIS Ultrafast: {t + 1}/{num_flow_frames} frames processed")
+        
+        if use_incremental:
+            print(f"  Converting {num_flow_frames} flow maps to array...")
+            flows_np = np.stack(flow_maps, axis=0)
+            del flow_maps
+            import gc
+            gc.collect()
+        
+        print(f"  DIS Ultrafast flow array shape: {flows_np.shape}")
+        
+        if flows_np.ndim != 4:
+            raise RuntimeError(f"Invalid flow shape: {flows_np.shape}, expected 4D array (T-1, H, W, 2)")
+        
+        elapsed = _pc() - start_time
+        print(f"✓ DIS Ultrafast flow computed in {elapsed:.2f}s")
+        
+        metadata = {
+            'original_shape': orig_shape,
+            'resized_shape': resized_shape,
+            'flow_shape': (num_flow_frames, flow_H, flow_W, 2),
+            'is_avi': is_avi,
+            'method': 'dis_fast',
+            'flow_to_input_scale': 1,
+        }
+        self.video_metadata[video_path] = metadata
+        
+        if tiff_store is not None:
+            try:
+                tiff_store.close()
+            except:
+                pass
+        
+        flows_np = wrap_flows_memory_efficient(flows_np, "DIS Ultrafast")
+        
+        self.flow_cache[cache_key] = {
+            "flows_np": flows_np,
+            "timestamp": _pc(),
+            "metadata": metadata,
+        }
+        self.flow_cache[video_path] = self.flow_cache[cache_key]
+        
+        if output_path and save_to_disk:
+            actual_output_path = self._build_flow_filename(
+                output_path, 'dis_fast',
+                resized_shape=resized_shape,
+                original_shape=orig_shape,
+            )
+            flows_to_save = flows_np.get_raw() if hasattr(flows_np, 'get_raw') else flows_np
+            np.savez(
+                actual_output_path,
+                flows=flows_to_save,
+                original_shape=metadata['original_shape'],
+                resized_shape=metadata['resized_shape'],
+                flow_shape=metadata['flow_shape'],
+                is_avi=is_avi,
+                method='dis_fast',
+                flow_to_input_scale=1,
+            )
+            print(f"✓ DIS Ultrafast flow saved to {actual_output_path}")
+        
+        return {
+            "status": "ok",
+            "message": "DIS Ultrafast optical flow computed",
+            "shape": list(flows_np.shape),
+            "flow_resolution": f"{flow_W}x{flow_H}",
+            "input_resolution": f"{target_W}x{target_H}",
+            "method": "dis_fast",
             "memory_gb": f"{expected_mem_gb:.2f}",
             "elapsed_time": f"{elapsed:.2f}s",
         }
@@ -5439,7 +5838,7 @@ class TrackingServer:
         
         # Blob detection parameters (new feature)
         use_blob_detection = request.get("use_blob_detection", False)
-        blob_search_radius = request.get("blob_search_radius", 15)
+        blob_search_radius = _normalize_blob_search_radius(request.get("blob_search_radius", 15))
         blob_radius = request.get("blob_radius", 5.0)
         cache_video = request.get("cache_video", False)  # Whether to cache video in memory
         
@@ -5550,7 +5949,7 @@ class TrackingServer:
         corridor_width = self._normalize_corridor_width(request.get("corridor_width", None))
         
         # Blob detection parameters (only used for blob_assisted mode)
-        blob_search_radius = request.get("blob_search_radius", 15)
+        blob_search_radius = _normalize_blob_search_radius(request.get("blob_search_radius", 15))
         blob_radius = request.get("blob_radius", 5.0)
         cache_video = request.get("cache_video", False)  # Whether to cache video in memory
         
@@ -5752,7 +6151,7 @@ class TrackingServer:
         
         # Correction method: "full_blend" (default), "blob_assisted", or "corridor_dp"
         correction_method = request.get("correction_method", "full_blend")
-        blob_search_radius = request.get("blob_search_radius", 15)
+        blob_search_radius = _normalize_blob_search_radius(request.get("blob_search_radius", 15))
         blob_radius = request.get("blob_radius", 5.0)
         cache_video = request.get("cache_video", False)  # Whether to cache video in memory
         

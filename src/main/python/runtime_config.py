@@ -218,6 +218,16 @@ class RuntimeConfig:
         except (ImportError, AttributeError):
             return False
     
+    @property
+    def can_use_dis_fast_flow(self) -> bool:
+        """True if DIS Ultrafast optical flow is available (CPU, OpenCV)."""
+        try:
+            import cv2
+            dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_ULTRAFAST)
+            return True
+        except (ImportError, AttributeError):
+            return False
+    
     def get_available_features(self) -> Dict[str, bool]:
         """Get a dictionary of all available features."""
         return {
@@ -226,6 +236,7 @@ class RuntimeConfig:
             "trackmate_dog": self.can_use_trackmate_dog,
             "trackpy": self.can_use_trackpy,
             "dis_optical_flow": self.can_use_dis_flow,
+            "dis_fast_optical_flow": self.can_use_dis_fast_flow,
         }
     
     # =========================================================================

@@ -214,9 +214,26 @@ class PythonEnvironment:
         anaconda_bases = [
             Path.home() / "anaconda3" / "envs",
             Path.home() / "miniconda3" / "envs",
+            Path.home() / "miniforge3" / "envs",
+            Path.home() / "mambaforge" / "envs",
             Path("/opt/anaconda3/envs"),
             Path("/opt/miniconda3/envs"),
         ]
+        
+        # Add macOS Homebrew Caskroom paths (Apple Silicon + Intel)
+        for caskroom in [Path("/opt/homebrew/Caskroom"), Path("/usr/local/Caskroom")]:
+            for dist in ["miniconda", "miniforge", "mambaforge"]:
+                # Direct path: /opt/homebrew/Caskroom/miniconda/base/envs
+                direct = caskroom / dist / "base" / "envs"
+                if direct.is_dir():
+                    anaconda_bases.append(direct)
+                # Versioned path: /opt/homebrew/Caskroom/miniconda/24.1.2-0/base/envs
+                version_dir = caskroom / dist
+                if version_dir.is_dir():
+                    for child in version_dir.iterdir():
+                        versioned = child / "base" / "envs"
+                        if versioned.is_dir():
+                            anaconda_bases.append(versioned)
         
         for base in anaconda_bases:
             for env_name in known_envs:

@@ -34,7 +34,7 @@ By participating in this project, you agree to maintain a respectful and inclusi
 
 ### Prerequisites
 
-- **Java 11+** (OpenJDK 17+ recommended)
+- **JDK 17 or newer** (full JDK with `javac`, not a JRE only)
 - **Maven 3.8+**
 - **Conda** (Miniconda or Anaconda)
 - **Git**

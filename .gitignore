@@ -52,10 +52,24 @@ htmlcov/
 .hypothesis/
 
 # ==== Virtual environments ====
+# RIPPLE uses the conda env "ripple-env" (created by quickstart.sh), not a project venv.
 venv/
 ENV/
 env/
 .venv/
+.ripple-env.stamp
+
+# ==== Downloaded model weights (optional for GPU; see locotrack_pytorch/weights/README.md) ====
+locotrack_pytorch/weights/*
+!locotrack_pytorch/weights/README.md
+
+# ==== Local sample / working videos (not required for build) ====
+video/
+
+# ==== Local source archives ====
+ripple-source.zip
+*.tar.gz
+*.tgz
 
 # ==== IDE ====
 .idea/

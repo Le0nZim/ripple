@@ -109,38 +109,123 @@ transport_is_tcp() {
   [[ "${t_lower}" == "tcp" || "${t_lower}" == "inet" ]]
 }
 
+check_env_exists() {
+  # Check if the conda environment exists.
+  # Use --json for reliable parsing across conda versions,
+  # falling back to text grep if json parse fails.
+  local env_list
+  env_list="$(conda env list 2>/dev/null)" || true
+  if echo "${env_list}" | grep -qE "(^|[[:space:]])${CONDA_ENV}([[:space:]]|$)"; then
+    return 0
+  fi
+  # Fallback: check if the env directory exists under conda's envs dir
+  local conda_prefix
+  conda_prefix="$(conda info --base 2>/dev/null)" || true
+  if [[ -n "${conda_prefix}" && -d "${conda_prefix}/envs/${CONDA_ENV}" ]]; then
+    return 0
+  fi
+  return 1
+}
+
 activate_conda() {
   # Conda activation scripts can reference unset variables
   set +u
 
+  local conda_found=false
+  local conda_base=""
+
   if command -v conda >/dev/null 2>&1; then
     eval "$(conda shell.bash hook)"
-    conda activate "${CONDA_ENV}" >/dev/null 2>&1 || {
-      set -u
-      error "Failed to activate conda env: ${CONDA_ENV}"
-      exit 1
-    }
-    set -u
-    return
+    conda_found=true
+  else
+    # Search common conda installation paths (Linux + macOS Intel + Apple Silicon + Homebrew)
+    # Note: Homebrew Caskroom paths may include version numbers, so we use wildcards
+    local conda_paths=(
+      "$HOME/miniconda3"
+      "$HOME/mambaforge"
+      "$HOME/miniforge3"
+      "$HOME/anaconda3"
+      "$HOME/.conda"
+      "/opt/homebrew/Caskroom/miniconda/base"
+      "/opt/homebrew/Caskroom/miniforge/base"
+      "/opt/homebrew/Caskroom/mambaforge/base"
+      "/usr/local/Caskroom/miniconda/base"
+      "/usr/local/Caskroom/miniforge/base"
+      "/opt/miniconda3"
+      "/opt/anaconda3"
+    )
+
+    for d in "${conda_paths[@]}"; do
+      if [[ -f "$d/etc/profile.d/conda.sh" ]]; then
+        # shellcheck source=/dev/null
+        . "$d/etc/profile.d/conda.sh"
+        conda_found=true
+        conda_base="$d"
+        break
+      fi
+    done
+
+    # If still not found, try globbing Homebrew Caskroom paths (version-specific directories)
+    if [[ "$conda_found" != "true" ]]; then
+      for pattern in "/opt/homebrew/Caskroom/miniconda"/*/base \
+                     "/opt/homebrew/Caskroom/miniforge"/*/base \
+                     "/opt/homebrew/Caskroom/mambaforge"/*/base \
+                     "/usr/local/Caskroom/miniconda"/*/base \
+                     "/usr/local/Caskroom/miniforge"/*/base; do
+        # Use nullglob behavior manually
+        for d in $pattern; do
+          if [[ -f "$d/etc/profile.d/conda.sh" ]]; then
+            . "$d/etc/profile.d/conda.sh"
+            conda_found=true
+            conda_base="$d"
+            break 2
+          fi
+        done
+      done
+    fi
   fi
 
-  for d in "$HOME/miniconda3" "$HOME/mambaforge" "$HOME/anaconda3"; do
-    if [[ -f "$d/etc/profile.d/conda.sh" ]]; then
-      # shellcheck source=/dev/null
-      . "$d/etc/profile.d/conda.sh"
-      conda activate "${CONDA_ENV}" >/dev/null 2>&1 || {
-        set -u
-        error "Failed to activate conda env: ${CONDA_ENV}"
-        exit 1
-      }
-      set -u
-      return
-    fi
-  done
+  if [[ "$conda_found" != "true" ]]; then
+    set -u
+    error "conda not found. Install Miniconda/Anaconda or add 'conda' to PATH."
+    echo ""
+    echo "  Common installation paths checked:"
+    echo "    - \$HOME/miniconda3"
+    echo "    - \$HOME/miniforge3"
+    echo "    - \$HOME/anaconda3"
+    echo "    - /opt/homebrew/Caskroom/miniconda/*/base (Apple Silicon)"
+    echo "    - /usr/local/Caskroom/miniconda/*/base (Intel Mac)"
+    echo ""
+    echo "  If conda is installed elsewhere, add it to your PATH or set CONDA_EXE."
+    exit 1
+  fi
 
+  # Check if the environment exists before trying to activate
+  if ! check_env_exists; then
+    set -u
+    error "Conda environment '${CONDA_ENV}' does not exist."
+    echo ""
+    echo "  To create it, run the quickstart script from the project directory:"
+    echo ""
+    echo "    cd \"${PROJECT_DIR}\" && bash quickstart.sh"
+    echo ""
+    echo "  Or create it manually:"
+    echo ""
+    echo "    conda env create -f \"${PROJECT_DIR}/conda/environment-cpu.yml\" -n ${CONDA_ENV}"
+    echo ""
+    exit 1
+  fi
+
+  conda activate "${CONDA_ENV}" >/dev/null 2>&1 || {
+    set -u
+    error "Failed to activate conda env: ${CONDA_ENV}"
+    echo ""
+    echo "  The environment exists but activation failed."
+    echo "  Try running: conda activate ${CONDA_ENV}"
+    echo "  Or re-create the environment: conda env remove -n ${CONDA_ENV} && bash quickstart.sh"
+    exit 1
+  }
   set -u
-  error "conda not found. Install Miniconda/Anaconda or add 'conda' to PATH."
-  exit 1
 }
 
 python_exec() {
@@ -255,11 +340,13 @@ start_server() {
   fi
 
   # Start detached
+  # Note: ${gpu_args[@]+"${gpu_args[@]}"} is required for bash 3.2 (macOS default)
+  # where expanding an empty array with set -u triggers "unbound variable".
   nohup "${py}" "${SERVER_SCRIPT}" \
     "${args[@]}" \
     --model "${MODEL_SIZE}" \
     --device auto \
-    "${gpu_args[@]}" \
+    ${gpu_args[@]+"${gpu_args[@]}"} \
     >>"${LOG_FILE}" 2>&1 &
 
   echo "$!" >"${PID_FILE}" 2>/dev/null || true

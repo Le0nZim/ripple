@@ -248,6 +248,8 @@ def parse_args():
         method = command.get("method", "raft")
         if method == "dis":
             command["command"] = "compute_dis_flow"
+        elif method == "dis_fast":
+            command["command"] = "compute_dis_fast_flow"
         elif method == "locotrack":
             command["command"] = "compute_locotrack_flow"
         elif method == "trackpy":

@@ -58,12 +58,28 @@ echo [1/6] Checking system requirements...
 java -version >nul 2>&1
 if errorlevel 1 (
     echo   [ERROR] Java not found!
-    echo   Please install Java 11 or newer from https://adoptium.net/
+    echo   Please install JDK 17 or newer from https://adoptium.net/
     echo   Make sure Java is added to your PATH.
     pause
     exit /b 1
 )
-echo   [OK] Java installed
+
+javac -version >nul 2>&1
+if errorlevel 1 (
+    echo   [ERROR] javac not found!
+    echo   RIPPLE requires a full JDK 17 or newer, not a JRE-only installation.
+    pause
+    exit /b 1
+)
+
+echo   Java runtime:
+java -version 2>&1
+echo   Java compiler:
+javac -version 2>&1
+echo   Maven toolchain:
+mvn -version 2>&1 | findstr /I "Apache Maven Java version"
+if defined JAVA_HOME echo   JAVA_HOME=%JAVA_HOME%
+echo   [OK] Java toolchain detected (JDK 17+ required for build)
 
 REM Check Conda
 where conda >nul 2>&1

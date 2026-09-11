@@ -28,10 +28,37 @@ LocoTrack predictions on the same freely-moving dataset, illustrating typical fa
 
 > The Google Drive folder also contains companion `tracks.xlsx` files with the raw matched coordinates and per-dataset `README.txt` files describing the visual encoding and frame counts.
 
+## 📥 Fast download (avoid copying local bloat)
+
+The **git repository is only ~2–3 MB**. Most slow downloads come from copying the whole working folder, which accumulates local-only data:
+
+| Path | Typical size | Needed for build? |
+|------|--------------|-------------------|
+| `.venv/` | ~460 MB | **No** — use `bash quickstart.sh` (creates conda `ripple-env`) |
+| `locotrack_pytorch/weights/*.ckpt` | ~76 MB | **No** for CPU; optional for GPU ([download links](locotrack_pytorch/weights/README.md)) |
+| `target/` | ~5 MB | **No** — rebuilt by Maven |
+
+**Recommended:**
+
+```bash
+git clone https://github.com/Le0nZim/ripple.git
+cd ripple
+bash quickstart.sh
+```
+
+**Minimal zip (tracked source only, no venv/weights/build):**
+
+```bash
+bash scripts/make_source_archive.sh
+unzip ripple-source.zip -d ripple && cd ripple && bash quickstart.sh
+```
+
+Do **not** zip or sync the entire working tree if it contains `.venv/` — that alone adds hundreds of MB and is recreated by the installer.
+
 ## 🚀 Quick Start
 
 ### Prerequisites
-- **Java 11+** (OpenJDK 17+ recommended)
+- **JDK 17 or newer** (full JDK with `javac`, not a JRE only)
 - **Conda** (Miniconda or Anaconda)
 - **Maven 3.8+** (needed to build the Java app)
 
