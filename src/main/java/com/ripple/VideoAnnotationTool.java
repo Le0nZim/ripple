@@ -425,6 +425,7 @@ public class VideoAnnotationTool {
     private JButton importButton = null;            // Import button (disable in preview)
     private JButton exportButton = null;            // Export button (disable in preview)
     private JButton helpButton = null;              // Help button (disable in preview)
+    private JButton updateButton = null;            // Check GitHub for software updates
     private JButton flowVizToggle = null;           // Flow Viz button (disable in preview)
     private JButton fineTuneButton = null;          // Fine-Tune LocoTrack button (GPU only, disable in preview)
     private boolean hideTracksInPreview = false;    // Flag to hide tracks during preview
@@ -3752,6 +3753,7 @@ public class VideoAnnotationTool {
         if (importButton != null) importButton.setEnabled(false);
         if (exportButton != null) exportButton.setEnabled(false);
         if (helpButton != null) helpButton.setEnabled(false);
+        if (updateButton != null) updateButton.setEnabled(false);
         if (flowVizToggle != null) flowVizToggle.setEnabled(false);
         if (satCheckbox != null) satCheckbox.setEnabled(false);
         if (satAdjustButton != null) satAdjustButton.setEnabled(false);
@@ -3818,6 +3820,7 @@ public class VideoAnnotationTool {
         if (importButton != null) importButton.setEnabled(true);
         if (exportButton != null) exportButton.setEnabled(true);
         if (helpButton != null) helpButton.setEnabled(true);
+        if (updateButton != null) updateButton.setEnabled(true);
         // flowVizToggle state depends on whether flow is computed
         if (flowVizToggle != null) flowVizToggle.setEnabled(opticalFlowComputed);
         // SAT controls depend on satEnabled state
@@ -3880,6 +3883,7 @@ public class VideoAnnotationTool {
         if (importButton != null) importButton.setEnabled(false);
         if (exportButton != null) exportButton.setEnabled(false);
         if (helpButton != null) helpButton.setEnabled(false);
+        if (updateButton != null) updateButton.setEnabled(false);
         if (flowVizToggle != null) flowVizToggle.setEnabled(false);
         if (satCheckbox != null) satCheckbox.setEnabled(false);
         if (satAdjustButton != null) satAdjustButton.setEnabled(false);
@@ -3939,6 +3943,7 @@ public class VideoAnnotationTool {
         if (importButton != null) importButton.setEnabled(true);
         if (exportButton != null) exportButton.setEnabled(true);
         if (helpButton != null) helpButton.setEnabled(true);
+        if (updateButton != null) updateButton.setEnabled(true);
         if (flowVizToggle != null) flowVizToggle.setEnabled(opticalFlowComputed);
         if (satCheckbox != null) satCheckbox.setEnabled(true);
         if (satAdjustButton != null) satAdjustButton.setEnabled(satEnabled);
@@ -6002,6 +6007,7 @@ public class VideoAnnotationTool {
         exportButton = createToolbarButton("Save", "export", "Save annotations to JSON");
         helpButton = createToolbarButton("?", null, "Help & keyboard shortcuts");
         helpButton.setFont(new Font("Segoe UI", Font.BOLD, 14));
+        updateButton = createToolbarButton("Update", "update", "Check GitHub for software updates");
         
         // Frame navigation controls - compact text field
         gotoFrameField = createCompactTextField("1", 3);
@@ -6088,7 +6094,9 @@ public class VideoAnnotationTool {
         // Spacer to push help to the right
         controlPanel.add(Box.createHorizontalGlue());
         
-        // Help button (right-aligned)
+        // Update + Help (right-aligned)
+        controlPanel.add(updateButton);
+        controlPanel.add(Box.createHorizontalStrut(4));
         controlPanel.add(helpButton);
         controlPanel.add(Box.createHorizontalStrut(4));
         
@@ -6124,6 +6132,7 @@ public class VideoAnnotationTool {
         importButton.addActionListener(e -> importAnnotations());
         exportButton.addActionListener(e -> exportAnnotations());
         helpButton.addActionListener(e -> showInstructions());
+        updateButton.addActionListener(e -> startSoftwareUpdate());
         
         flowVizToggle.addActionListener(e -> toggleFlowVisualization(flowVizToggle));
         
@@ -6343,6 +6352,28 @@ public class VideoAnnotationTool {
         
         imageOffsetX = (viewSize.width - imageWidth) / 2.0;
         imageOffsetY = (viewSize.height - imageHeight) / 2.0;
+    }
+
+    private void startSoftwareUpdate() {
+        if (updateButton != null) {
+            updateButton.setEnabled(false);
+        }
+        setStatus("Checking for updates...");
+        SoftwareUpdater.checkForUpdates(frame, () -> {
+            for (String trackId : trackAnnotations.keySet()) {
+                pauseTrackTimer(trackId);
+            }
+            cleanupTempVideoFile();
+            promptServerShutdownOnExit();
+            if (frame != null) {
+                frame.dispose();
+            }
+        }, () -> {
+            if (updateButton != null) {
+                updateButton.setEnabled(true);
+            }
+            setStatus("Ready");
+        });
     }
 
     private void showInstructions() {
@@ -21995,6 +22026,14 @@ public class VideoAnnotationTool {
                 g2d.drawLine(8, 8, 10, 10);
                 break;
                 
+            case "update":
+                // Circular refresh arrows
+                g2d.setStroke(new BasicStroke(1.5f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                g2d.drawArc(3, 3, 8, 8, 40, 200);
+                g2d.drawLine(11, 3, 13, 5);
+                g2d.drawLine(11, 3, 9, 5);
+                break;
+
             case "help":
                 // Question mark
                 g2d.setStroke(new BasicStroke(1.5f));

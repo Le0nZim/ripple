@@ -8,6 +8,10 @@ import java.awt.Color;
  */
 public class Constants {
     
+    // Official GitHub source used by the in-app Update button
+    public static final String GITHUB_REPO_URL = "https://github.com/Le0nZim/ripple.git";
+    public static final String GITHUB_DEFAULT_BRANCH = "main";
+    
     // Configuration parameters and default values
     public static final String CONFIG_FILE = "config.properties";
     public static final String DEFAULT_BASH_SCRIPT_PATH = "scripts/run_persistent_tracking.sh";

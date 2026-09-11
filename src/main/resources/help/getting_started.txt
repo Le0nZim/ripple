@@ -1,1 +1,16 @@
-Coming soon...
+GETTING STARTED
+
+1. Open a video with the Open button (TIFF or AVI).
+2. Create a track with + New Track, then click on a frame to place a point.
+3. Compute optical flow when prompted, then track and correct as needed.
+4. Save annotations with Save.
+
+UPDATING RIPPLE
+
+Use the Update button (bottom-right, next to Help) to check GitHub for
+software changes. If an update is available, RIPPLE will close, pull the
+latest code from https://github.com/Le0nZim/ripple, rebuild, and reopen.
+
+This requires a git clone of the repository (not a zip download). Local
+source edits block the update so they are not overwritten. User videos
+and annotation files are left alone.

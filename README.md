@@ -105,6 +105,12 @@ That's it! The script will:
 4. Build the Java application
 5. Create launchers / shortcuts and start RIPPLE
 
+## 🔄 Updating RIPPLE
+
+If you installed from a `git clone`, use the **Update** button (bottom-right, next to Help) to check [github.com/Le0nZim/ripple](https://github.com/Le0nZim/ripple) for new commits. If an update is available, RIPPLE closes, fast-forwards the repo, rebuilds, and reopens.
+
+Local source edits cancel the update so they are not overwritten. Zip downloads and packaged AppImage/`.deb` installs cannot update in place — clone the repository and run `quickstart` instead.
+
 ## 🔨 Build & Run (Maven)
 
 If you prefer to build/run manually (instead of using `quickstart.sh` / `quickstart.bat`), Maven produces a single shaded JAR at `target/ripple.jar`.
