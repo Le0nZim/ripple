@@ -1,1 +1,38 @@
-Coming soon...
+SHORTCUTS
+
+FILE
+Ctrl+O     Open a video
+Ctrl+S     Save annotations
+Ctrl+I     Import annotations
+
+EDIT
+Ctrl+Z              Undo
+Ctrl+Shift+Z / Y    Redo
+Ctrl+A              Select all tracks (not while typing in a field)
+Delete / Backspace  Remove the selected track’s point on this frame
+Shift+Delete        Delete the selected track (asks first)
+
+PLAYBACK AND FRAMES
+Space            Play / pause
+Left / Right     ±1 frame
+Alt+Left/Right   ±10 frames (same as Alt+mouse wheel)
+Home / End       First / last frame of the current clip
+[ / ]            Previous / next anchor on the selected track
+N / P            Next / previous review issue (gap, occlusion, seed-only)
+
+MOUSE
+Wheel            ±1 frame
+Alt+wheel        ±10 frames
+Ctrl+wheel       Zoom the image (or the timeline when over the slider)
+Right-drag       Pan
+Shift+click      Switch the active track
+Ctrl+click       Toggle track multi-select
+Esc              Cancel trim, exit smoothing comparison, or close Help
+
+REVIEW
+N and P walk problems on the selected track, or every track if none is
+selected. The status bar shows which issue you are on, for example
+“Review: Track3 gap at frame 142 (2 of 8)”.
+
+Shortcuts do not fire while a text field, spinner, or combo box has
+focus, so Space will not play the video while you edit FPS.

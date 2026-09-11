@@ -23,3 +23,14 @@ PREVIEW VS WORK
 Selecting a clip chip is preview only: cheap, no flow load. The banner
 has Switch to this clip (commit: save previous, load this clip’s flow)
 and Back / Entire video.
+
+REVIEW, FOLLOW, ONION-SKIN
+
+N / P jump to the next or previous review issue (interior gap,
+occlusion start, or an unoptimized seed-only track). [ / ] jump
+anchors on the selected track.
+
+View → Follow selected track during playback keeps the active particle
+centered while you play. View → Onion-skin previous frame blends the
+previous frame under the current one so jitter and drift are easier
+to see.

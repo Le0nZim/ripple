@@ -1,1 +1,21 @@
-Coming soon...
+GPU FEATURES
+
+NVIDIA CUDA unlocks RAFT optical flow, LocoTrack point tracking, and
+the Train button for fine-tuning. macOS and machines without CUDA run
+in CPU mode.
+
+GPU MODE
+- RAFT: dense optical flow (best quality, more RAM)
+- LocoTrack: learned point tracking
+- DIS / DIS-fast: lighter optical flow
+- TrackPy: CPU-friendly particle tracking
+- Train: fine-tune LocoTrack on completed tracks (disabled while clip
+  batching is active)
+
+CPU MODE
+- TrackPy and DIS / DIS-fast only
+- RAFT, LocoTrack, and Train stay hidden
+
+Check the header of Help — it shows GPU Mode or CPU Mode. The launcher
+sets RIPPLE_MODE from nvidia-smi. If a GPU is installed but RIPPLE
+started in CPU mode, confirm drivers and re-run quickstart.

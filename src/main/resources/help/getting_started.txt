@@ -6,7 +6,14 @@ GETTING STARTED
    offers to split it into clips. Small videos skip this and go on.
 4. Create a track with + New Track, then click on a frame to place a point.
 5. Compute optical flow when prompted, then track and correct as needed.
-6. Save annotations with Export.
+   Trackpy preview can Accept as Tracks instead of clicking every seed.
+6. Save annotations with File → Save (Ctrl+S). RIPPLE also autosaves.
+
+REVIEW WHILE YOU WORK
+
+N / P jump to the next gap, occlusion, or seed-only track. Space plays
+the video. View → Follow selected track keeps the particle centered;
+View → Onion-skin blends the previous frame so jitter is easier to see.
 
 LONG VIDEOS (CLIP BATCHING)
 

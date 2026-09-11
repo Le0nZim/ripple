@@ -418,12 +418,26 @@ public class VideoAnnotationTool {
     private String workingVideoPath = null;         // Path used for backend operations (may be compressed temp file)
     private String tempCompressedVideoPath = null;  // Path to temporary compressed video file (to clean up on exit)
     
-    // Remember last directory for each file operation type (persists across operations within session)
+    // Remember last directory for each file operation type (persists across sessions)
     private File lastOpenedVideoDirectory = null;   // Open Video file explorer
     private File lastExportVideoDirectory = null;   // Export Video with tracks
     private File lastExportAnnotationsDirectory = null;  // Export annotations
     private File lastImportAnnotationsDirectory = null;  // Import annotations
     private File lastSaveWeightsDirectory = null;   // Save fine-tuned weights
+    private final List<String> recentVideoPaths = new ArrayList<>();
+    private boolean annotationsDirty = false;
+    private boolean followTrackDuringPlayback = true;
+    private boolean onionSkinEnabled = false;
+    private BufferedImage onionSkinImage = null;
+    private int onionSkinSourceSlice = -1;
+    private Timer autosaveTimer;
+    private JMenu recentMenu;
+    private JMenuItem undoMenuItem;
+    private JMenuItem redoMenuItem;
+    private JCheckBoxMenuItem followTrackMenuItem;
+    private JCheckBoxMenuItem onionSkinMenuItem;
+    private static final int MAX_UNDO_LEVELS = 50;
+    private static final int AUTOSAVE_INTERVAL_MS = 2 * 60 * 1000;
     
     private ImagePlus flowVisualization = null;
     private boolean showingFlowViz = false;
@@ -992,7 +1006,12 @@ public class VideoAnnotationTool {
                                            trackVisibleSegments,
                                            trackSmoothing, trackOriginalAnnotations,
                                            trackCounter, colorIndex, correctionMode, description));
+        while (undoStack.size() > MAX_UNDO_LEVELS) {
+            undoStack.remove(0);
+        }
         redoStack.clear();
+        markAnnotationsDirty();
+        updateUndoRedoMenuItems();
     }
     
     /**
@@ -1071,6 +1090,8 @@ public class VideoAnnotationTool {
         
         // Show what was undone
         setStatus("Undo: " + state.operationDescription);
+        markAnnotationsDirty();
+        updateUndoRedoMenuItems();
         
         loadSliceImage();
         refreshAnnotationList();
@@ -1144,10 +1165,349 @@ public class VideoAnnotationTool {
         
         // Show what was redone
         setStatus("Redo: " + state.operationDescription);
+        markAnnotationsDirty();
+        updateUndoRedoMenuItems();
         
         loadSliceImage();
         refreshAnnotationList();
         frameSlider.repaint(); // Update slider to show anchor points
+    }
+
+    private void markAnnotationsDirty() {
+        if (!annotationsDirty) {
+            annotationsDirty = true;
+            updateWindowTitle();
+        }
+    }
+
+    private void markAnnotationsClean() {
+        annotationsDirty = false;
+        updateWindowTitle();
+        deleteAutosaveFile();
+    }
+
+    private void updateWindowTitle() {
+        if (frame == null) {
+            return;
+        }
+        String title = "RIPPLE \u2014 Video Annotation Tool";
+        if (currentVideoPath != null) {
+            title = "RIPPLE \u2014 " + new File(currentVideoPath).getName();
+        }
+        if (annotationsDirty) {
+            title += " *";
+        }
+        frame.setTitle(title);
+    }
+
+    private void updateUndoRedoMenuItems() {
+        if (undoMenuItem != null) {
+            if (undoStack.isEmpty()) {
+                undoMenuItem.setText("  Undo");
+                undoMenuItem.setEnabled(false);
+            } else {
+                undoMenuItem.setText("  Undo: " + undoStack.peek().operationDescription);
+                undoMenuItem.setEnabled(true);
+            }
+        }
+        if (redoMenuItem != null) {
+            if (redoStack.isEmpty()) {
+                redoMenuItem.setText("  Redo");
+                redoMenuItem.setEnabled(false);
+            } else {
+                redoMenuItem.setText("  Redo: " + redoStack.peek().operationDescription);
+                redoMenuItem.setEnabled(true);
+            }
+        }
+    }
+
+    private boolean isEditingTextComponent() {
+        Component focus = KeyboardFocusManager.getCurrentKeyboardFocusManager().getFocusOwner();
+        while (focus != null) {
+            if (focus instanceof JTextField || focus instanceof JTextArea || focus instanceof JTextPane
+                || focus instanceof JComboBox || focus instanceof JSpinner) {
+                return true;
+            }
+            focus = focus.getParent();
+        }
+        return false;
+    }
+
+    private JMenu createStyledMenu(String label) {
+        JMenu menu = new JMenu(label);
+        menu.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        menu.setForeground(TEXT_PRIMARY);
+        menu.setOpaque(false);
+        return menu;
+    }
+
+    private JMenuItem createStyledMenuItem(String label) {
+        JMenuItem item = new JMenuItem(label);
+        item.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        item.setBackground(PANEL_DARK);
+        item.setForeground(TEXT_PRIMARY);
+        item.setBorder(BorderFactory.createEmptyBorder(8, 12, 8, 12));
+        return item;
+    }
+
+    private void persistChooserDirectories() {
+        UserSessionPreferences.writeDirectories(config,
+            lastOpenedVideoDirectory, lastExportAnnotationsDirectory, lastImportAnnotationsDirectory);
+        config.setProperty(UserSessionPreferences.KEY_RECENT, UserSessionPreferences.encodeRecent(recentVideoPaths));
+        config.setProperty(UserSessionPreferences.KEY_FOLLOW_TRACK, String.valueOf(followTrackDuringPlayback));
+        config.setProperty(UserSessionPreferences.KEY_ONION_SKIN, String.valueOf(onionSkinEnabled));
+        saveConfig();
+    }
+
+    private void loadUiPreferences() {
+        recentVideoPaths.clear();
+        recentVideoPaths.addAll(UserSessionPreferences.parseRecent(
+            config.getProperty(UserSessionPreferences.KEY_RECENT, "")));
+        lastOpenedVideoDirectory = UserSessionPreferences.directoryOrNull(
+            config.getProperty(UserSessionPreferences.KEY_LAST_DIR_VIDEO, ""));
+        lastExportAnnotationsDirectory = UserSessionPreferences.directoryOrNull(
+            config.getProperty(UserSessionPreferences.KEY_LAST_DIR_EXPORT, ""));
+        lastImportAnnotationsDirectory = UserSessionPreferences.directoryOrNull(
+            config.getProperty(UserSessionPreferences.KEY_LAST_DIR_IMPORT, ""));
+        followTrackDuringPlayback = UserSessionPreferences.getBoolean(
+            config, UserSessionPreferences.KEY_FOLLOW_TRACK, true);
+        onionSkinEnabled = UserSessionPreferences.getBoolean(
+            config, UserSessionPreferences.KEY_ONION_SKIN, false);
+    }
+
+    private void rememberRecentVideo(String path) {
+        if (path == null || path.trim().isEmpty()) {
+            return;
+        }
+        List<String> updated = UserSessionPreferences.addRecent(recentVideoPaths, path);
+        recentVideoPaths.clear();
+        recentVideoPaths.addAll(updated);
+        persistChooserDirectories();
+        refreshRecentMenu();
+    }
+
+    private void refreshRecentMenu() {
+        if (recentMenu == null) {
+            return;
+        }
+        recentMenu.removeAll();
+        int added = 0;
+        for (String path : recentVideoPaths) {
+            File file = new File(path);
+            if (!file.isFile()) {
+                continue;
+            }
+            JMenuItem item = createStyledMenuItem("  " + file.getName() + "  ");
+            item.setToolTipText(path);
+            item.addActionListener(e -> openTiff(pageLabel, file));
+            recentMenu.add(item);
+            added++;
+        }
+        recentMenu.setEnabled(added > 0);
+        if (added == 0) {
+            JMenuItem empty = createStyledMenuItem("  No recent videos  ");
+            empty.setEnabled(false);
+            recentMenu.add(empty);
+        }
+    }
+
+    /**
+     * @return true if the caller may discard or replace the current session
+     */
+    private boolean confirmDiscardOrSave(String action) {
+        if (!annotationsDirty || trackAnnotations.isEmpty()) {
+            return true;
+        }
+        int choice = JOptionPane.showOptionDialog(
+            frame,
+            "Save annotations before " + action + "?\n\nUnsaved changes will be lost.",
+            "Unsaved annotations",
+            JOptionPane.YES_NO_CANCEL_OPTION,
+            JOptionPane.WARNING_MESSAGE,
+            null,
+            new String[]{"Save", "Don't Save", "Cancel"},
+            "Save");
+        if (choice == 0) {
+            exportAnnotations();
+            return !annotationsDirty;
+        }
+        return choice == 1;
+    }
+
+    private File autosaveFile() {
+        if (currentVideoPath == null) {
+            return null;
+        }
+        return UserSessionPreferences.autosaveFile(new File(currentVideoPath));
+    }
+
+    private void deleteAutosaveFile() {
+        File file = autosaveFile();
+        if (file != null && file.exists()) {
+            file.delete();
+        }
+    }
+
+    private void startAutosaveTimer() {
+        if (autosaveTimer != null) {
+            autosaveTimer.stop();
+        }
+        autosaveTimer = new Timer(AUTOSAVE_INTERVAL_MS, e -> silentAutosave());
+        autosaveTimer.setRepeats(true);
+        autosaveTimer.start();
+    }
+
+    private void silentAutosave() {
+        if (!annotationsDirty || imp == null || trackAnnotations.isEmpty()) {
+            return;
+        }
+        File file = autosaveFile();
+        if (file == null) {
+            return;
+        }
+        try {
+            if (batchCoordinator.isEnabled()) {
+                saveWorkingClipSilent();
+            }
+            exportToJson(file, ExportContent.RICH);
+            java.time.LocalTime now = java.time.LocalTime.now();
+            setStatus(String.format("Autosaved %02d:%02d", now.getHour(), now.getMinute()));
+        } catch (Exception ex) {
+            System.err.println("Autosave failed: " + ex.getMessage());
+        }
+    }
+
+    private void offerAutosaveRestore() {
+        File file = autosaveFile();
+        if (file == null || !file.exists() || file.length() == 0) {
+            return;
+        }
+        int choice = JOptionPane.showConfirmDialog(
+            frame,
+            "Found an autosave for this video:\n" + file.getName() + "\n\nRestore it?",
+            "Restore autosave",
+            JOptionPane.YES_NO_OPTION,
+            JOptionPane.QUESTION_MESSAGE);
+        if (choice != JOptionPane.YES_OPTION) {
+            return;
+        }
+        try {
+            String content = new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
+            importFromJson(content, false, 0);
+            ensureFirstTrackSelected();
+            loadSliceImage();
+            refreshAnnotationList();
+            annotationsDirty = false;
+            updateWindowTitle();
+            setStatus("Restored autosave");
+        } catch (Exception ex) {
+            JOptionPane.showMessageDialog(frame,
+                "Could not restore autosave:\n" + ex.getMessage(),
+                "Autosave",
+                JOptionPane.ERROR_MESSAGE);
+        }
+    }
+
+    private void togglePlayback() {
+        if (playButton == null || trimModeActive || previewModeActive || imp == null) {
+            return;
+        }
+        for (ActionListener listener : playButton.getActionListeners()) {
+            listener.actionPerformed(new ActionEvent(playButton, ActionEvent.ACTION_PERFORMED, "shortcut"));
+        }
+    }
+
+    private void jumpToAnchor(boolean next) {
+        if (selectedTrackId == null) {
+            setStatus("Select a track to jump anchors");
+            return;
+        }
+        List<Anchor> anchors = trackAnchors.get(selectedTrackId);
+        if (anchors == null || anchors.isEmpty()) {
+            setStatus("No anchors on " + selectedTrackId);
+            return;
+        }
+        List<Anchor> sorted = new ArrayList<>(anchors);
+        sorted.sort(Comparator.comparingInt(a -> a.frame));
+        int current = currentSlice - 1;
+        Integer target = null;
+        if (next) {
+            for (Anchor anchor : sorted) {
+                if (anchor.frame > current) {
+                    target = anchor.frame;
+                    break;
+                }
+            }
+            if (target == null) {
+                target = sorted.get(0).frame;
+            }
+        } else {
+            for (int i = sorted.size() - 1; i >= 0; i--) {
+                if (sorted.get(i).frame < current) {
+                    target = sorted.get(i).frame;
+                    break;
+                }
+            }
+            if (target == null) {
+                target = sorted.get(sorted.size() - 1).frame;
+            }
+        }
+        goToFrame(target + 1);
+        if (followTrackDuringPlayback) {
+            focusOnTrack(selectedTrackId);
+        }
+        refreshAnnotationList();
+        setStatus((next ? "Next" : "Previous") + " anchor on " + selectedTrackId + " (frame " + (target + 1) + ")");
+    }
+
+    private void jumpToReviewIssue(boolean next) {
+        List<ReviewNavigator.Issue> issues = ReviewNavigator.findIssues(
+            trackAnnotations, trackOcclusionSegments, trackOptimized, selectedTrackId);
+        if (issues.isEmpty()) {
+            setStatus("No review issues" + (selectedTrackId != null ? " on " + selectedTrackId : ""));
+            return;
+        }
+        ReviewNavigator.Issue issue = next
+            ? ReviewNavigator.next(issues, currentSlice - 1)
+            : ReviewNavigator.previous(issues, currentSlice - 1);
+        if (issue == null) {
+            return;
+        }
+        selectedTrackId = issue.trackId;
+        goToFrame(issue.frame + 1);
+        if (followTrackDuringPlayback) {
+            focusOnTrack(issue.trackId);
+        }
+        refreshAnnotationList();
+        int index = ReviewNavigator.indexOf(issues, issue);
+        setStatus("Review: " + issue.statusLabel() + " (" + (index + 1) + " of " + issues.size() + ")");
+    }
+
+    private void refreshOnionSkin() {
+        if (!onionSkinEnabled || imp == null || currentSlice <= navigationMinSlice()) {
+            onionSkinImage = null;
+            onionSkinSourceSlice = -1;
+            return;
+        }
+        int prev = currentSlice - 1;
+        if (onionSkinSourceSlice == prev && onionSkinImage != null) {
+            return;
+        }
+        try {
+            ImagePlus sourceImage = showingFlowViz && flowVisualization != null ? flowVisualization : imp;
+            int saved = sourceImage.getCurrentSlice();
+            sourceImage.setSlice(prev);
+            ImageProcessor ip = sourceImage.getProcessor().duplicate();
+            if (!showingFlowViz && viewMin != null && viewMax != null) {
+                ip.setMinAndMax(viewMin, viewMax);
+            }
+            onionSkinImage = ip.getBufferedImage();
+            onionSkinSourceSlice = prev;
+            sourceImage.setSlice(saved);
+        } catch (Exception ex) {
+            onionSkinImage = null;
+            onionSkinSourceSlice = -1;
+        }
     }
 
     private Color getTrackColor(String trackId) {
@@ -4054,6 +4414,17 @@ public class VideoAnnotationTool {
         previewLabel.setForeground(new Color(180, 210, 255));
         previewModeToolbar.add(previewLabel);
         
+        JButton acceptTracksButton = new JButton("Accept as Tracks");
+        acceptTracksButton.setFont(new Font("Segoe UI", Font.BOLD, 13));
+        acceptTracksButton.setBackground(ACCENT_GREEN);
+        acceptTracksButton.setForeground(Color.WHITE);
+        acceptTracksButton.setFocusPainted(false);
+        acceptTracksButton.setBorder(BorderFactory.createEmptyBorder(10, 20, 10, 20));
+        acceptTracksButton.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        acceptTracksButton.setToolTipText("Turn these Trackpy trajectories into RIPPLE tracks");
+        acceptTracksButton.addActionListener(e -> acceptPreviewTrajectoriesAsTracks());
+        previewModeToolbar.add(acceptTracksButton);
+
         JButton editConfigButton = new JButton("◀ Return to Configuration");
         editConfigButton.setFont(new Font("Segoe UI", Font.BOLD, 13));
         editConfigButton.setBackground(ACCENT_BLUE);
@@ -4114,6 +4485,101 @@ public class VideoAnnotationTool {
         } else {
             savedConfigDialog = null;
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void acceptPreviewTrajectoriesAsTracks() {
+        if (previewTrajectories == null || previewTrajectories.isEmpty()) {
+            setStatus("No Trackpy trajectories to accept");
+            return;
+        }
+        int count = previewTrajectories.size();
+        if (count > 40) {
+            int confirm = JOptionPane.showConfirmDialog(
+                frame,
+                "This will create " + count + " tracks. Continue?",
+                "Accept trajectories",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.WARNING_MESSAGE);
+            if (confirm != JOptionPane.YES_OPTION) {
+                return;
+            }
+        }
+        if (!trackAnnotations.isEmpty()) {
+            int confirm = JOptionPane.showOptionDialog(
+                frame,
+                "Add " + count + " trajectories as new tracks alongside the "
+                    + trackAnnotations.size() + " existing track(s)?",
+                "Existing tracks",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.QUESTION_MESSAGE,
+                null,
+                new String[]{"Add", "Cancel"},
+                "Add");
+            if (confirm != 0) {
+                return;
+            }
+        }
+        if (!allowBatchAnnotation("accept trajectories as tracks")) {
+            return;
+        }
+        saveState("Accept Trackpy trajectories");
+        int created = 0;
+        for (Map<String, Object> traj : previewTrajectories) {
+            Map<Integer, double[]> positions = (Map<Integer, double[]>) traj.get("positions");
+            if (positions == null || positions.isEmpty()) {
+                continue;
+            }
+            List<Integer> frames = new ArrayList<>(positions.keySet());
+            Collections.sort(frames);
+            int nextNum = findNextAvailableTrackNumber();
+            String trackId = "Track" + nextNum;
+            Map<Integer, Point> points = new HashMap<>();
+            for (Integer frame : frames) {
+                double[] pos = positions.get(frame);
+                if (frame == null || pos == null || pos.length < 2) {
+                    continue;
+                }
+                points.put(frame, new Point((int) Math.round(pos[0]), (int) Math.round(pos[1])));
+            }
+            if (points.isEmpty()) {
+                continue;
+            }
+            List<Anchor> anchors = new ArrayList<>();
+            Integer first = frames.get(0);
+            Integer last = frames.get(frames.size() - 1);
+            Point firstPoint = points.get(first);
+            Point lastPoint = points.get(last);
+            if (firstPoint != null) {
+                anchors.add(new Anchor(first, firstPoint.x, firstPoint.y));
+            }
+            if (last != null && !last.equals(first) && lastPoint != null) {
+                anchors.add(new Anchor(last, lastPoint.x, lastPoint.y));
+            }
+            trackAnnotations.put(trackId, points);
+            trackColors.put(trackId, generateRandomColor());
+            trackAnchors.put(trackId, anchors);
+            trackOptimized.put(trackId, false);
+            trackSelected.put(trackId, false);
+            trackTotalTime.put(trackId, 0L);
+            trackStartTime.put(trackId, 0L);
+            trackCompleted.put(trackId, false);
+            trackSmoothing.put(trackId, false);
+            if (nextNum >= trackCounter) {
+                trackCounter = nextNum + 1;
+            }
+            selectedTrackId = trackId;
+            created++;
+        }
+        if (batchCoordinator.getManifest() != null) {
+            batchCoordinator.getManifest().trackCounter = Math.max(
+                batchCoordinator.getManifest().trackCounter, trackCounter);
+        }
+        exitTrajectoryPreviewMode(false);
+        refreshAnnotationList();
+        imageLabel.repaint();
+        frameSlider.repaint();
+        setStatus("Accepted " + created + " Trackpy trajectories as tracks");
     }
     
     private boolean isMultiSeedMode() {
@@ -4486,6 +4952,7 @@ public class VideoAnnotationTool {
 
     private void initUI() {
         loadConfig();
+        loadUiPreferences();
         
         // Set theme Look and Feel
         try {
@@ -4576,11 +5043,45 @@ public class VideoAnnotationTool {
         brandLabel.setForeground(ACCENT_BLUE);
         menuBar.add(brandLabel);
         menuBar.add(Box.createHorizontalStrut(10));
+
+        JMenu fileMenu = createStyledMenu("  File  ");
+        JMenuItem openMenuItem = createStyledMenuItem("  Open...          Ctrl+O  ");
+        openMenuItem.addActionListener(e -> openTiff(pageLabel));
+        fileMenu.add(openMenuItem);
+        recentMenu = createStyledMenu("  Recent  ");
+        fileMenu.add(recentMenu);
+        refreshRecentMenu();
+        fileMenu.addSeparator();
+        JMenuItem saveMenuItem = createStyledMenuItem("  Save annotations...          Ctrl+S  ");
+        saveMenuItem.addActionListener(e -> exportAnnotations());
+        fileMenu.add(saveMenuItem);
+        JMenuItem importMenuItem = createStyledMenuItem("  Import annotations...          Ctrl+I  ");
+        importMenuItem.addActionListener(e -> importAnnotations());
+        fileMenu.add(importMenuItem);
+        JMenuItem exportVideoMenuItem = createStyledMenuItem("  Export video...  ");
+        exportVideoMenuItem.addActionListener(e -> showExportVideoDialog());
+        fileMenu.add(exportVideoMenuItem);
+        fileMenu.addSeparator();
+        JMenuItem quitMenuItem = createStyledMenuItem("  Quit  ");
+        quitMenuItem.addActionListener(e -> frame.dispatchEvent(new WindowEvent(frame, WindowEvent.WINDOW_CLOSING)));
+        fileMenu.add(quitMenuItem);
+        menuBar.add(fileMenu);
+
+        JMenu editMenu = createStyledMenu("  Edit  ");
+        undoMenuItem = createStyledMenuItem("  Undo");
+        undoMenuItem.addActionListener(e -> undo());
+        editMenu.add(undoMenuItem);
+        redoMenuItem = createStyledMenuItem("  Redo");
+        redoMenuItem.addActionListener(e -> redo());
+        editMenu.add(redoMenuItem);
+        editMenu.addSeparator();
+        JMenuItem selectAllMenuItem = createStyledMenuItem("  Select all tracks          Ctrl+A  ");
+        selectAllMenuItem.addActionListener(e -> selectAllTracks());
+        editMenu.add(selectAllMenuItem);
+        updateUndoRedoMenuItems();
+        menuBar.add(editMenu);
         
-        JMenu optionsMenu = new JMenu("  View  ");
-        optionsMenu.setFont(new Font("Segoe UI", Font.PLAIN, 13));
-        optionsMenu.setForeground(TEXT_PRIMARY);
-        optionsMenu.setOpaque(false);
+        JMenu optionsMenu = createStyledMenu("  View  ");
         
         // Toggle configuration panel
         JMenuItem toggleConfigPanelItem = new JMenuItem("  ☰ Toggle Config Panel  ");
@@ -4590,6 +5091,34 @@ public class VideoAnnotationTool {
         toggleConfigPanelItem.setBorder(BorderFactory.createEmptyBorder(8, 12, 8, 12));
         toggleConfigPanelItem.addActionListener(e -> toggleConfigPanel());
         optionsMenu.add(toggleConfigPanelItem);
+
+        followTrackMenuItem = new JCheckBoxMenuItem("  Follow selected track during playback  ");
+        followTrackMenuItem.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        followTrackMenuItem.setBackground(PANEL_DARK);
+        followTrackMenuItem.setForeground(TEXT_PRIMARY);
+        followTrackMenuItem.setSelected(followTrackDuringPlayback);
+        followTrackMenuItem.addActionListener(e -> {
+            followTrackDuringPlayback = followTrackMenuItem.isSelected();
+            persistChooserDirectories();
+        });
+        optionsMenu.add(followTrackMenuItem);
+
+        onionSkinMenuItem = new JCheckBoxMenuItem("  Onion-skin previous frame  ");
+        onionSkinMenuItem.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        onionSkinMenuItem.setBackground(PANEL_DARK);
+        onionSkinMenuItem.setForeground(TEXT_PRIMARY);
+        onionSkinMenuItem.setSelected(onionSkinEnabled);
+        onionSkinMenuItem.addActionListener(e -> {
+            onionSkinEnabled = onionSkinMenuItem.isSelected();
+            onionSkinImage = null;
+            onionSkinSourceSlice = -1;
+            refreshOnionSkin();
+            if (imageLabel != null) {
+                imageLabel.repaint();
+            }
+            persistChooserDirectories();
+        });
+        optionsMenu.add(onionSkinMenuItem);
         
         optionsMenu.addSeparator();
         
@@ -4708,8 +5237,17 @@ public class VideoAnnotationTool {
                 
                 // Draw the image scaled to the destination rectangle
                 // drawImage will clip automatically to the panel bounds
-                g2d.drawImage(currentImage, dstX, dstY, dstX + dstW, dstY + dstH, 
-                              0, 0, imgW, imgH, null);
+                if (onionSkinEnabled && onionSkinImage != null) {
+                    g2d.drawImage(onionSkinImage, dstX, dstY, dstX + dstW, dstY + dstH,
+                                  0, 0, onionSkinImage.getWidth(), onionSkinImage.getHeight(), null);
+                    g2d.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, 0.65f));
+                    g2d.drawImage(currentImage, dstX, dstY, dstX + dstW, dstY + dstH,
+                                  0, 0, imgW, imgH, null);
+                    g2d.setComposite(AlphaComposite.SrcOver);
+                } else {
+                    g2d.drawImage(currentImage, dstX, dstY, dstX + dstW, dstY + dstH,
+                                  0, 0, imgW, imgH, null);
+                }
                 
                 // Draw segmentation mask overlay if SAT is enabled and Mask checkbox is ON
                 if (satEnabled && segmentationMask != null && showMask) {
@@ -6113,10 +6651,76 @@ public class VideoAnnotationTool {
                 redo();
                 return true;
             }
+
+            if (e.isControlDown() && e.getKeyCode() == KeyEvent.VK_O) {
+                openTiff(pageLabel);
+                return true;
+            }
+            if (e.isControlDown() && e.getKeyCode() == KeyEvent.VK_S) {
+                exportAnnotations();
+                return true;
+            }
+            if (e.isControlDown() && e.getKeyCode() == KeyEvent.VK_I) {
+                importAnnotations();
+                return true;
+            }
             
-            // Ctrl+A: Select all tracks
+            // Ctrl+A: Select all tracks (do not steal from text fields)
             if (e.isControlDown() && e.getKeyCode() == KeyEvent.VK_A) {
+                if (isEditingTextComponent()) {
+                    return false;
+                }
                 selectAllTracks();
+                return true;
+            }
+
+            if (isEditingTextComponent()) {
+                return false;
+            }
+
+            if (e.getKeyCode() == KeyEvent.VK_SPACE) {
+                togglePlayback();
+                return true;
+            }
+            if (e.getKeyCode() == KeyEvent.VK_LEFT) {
+                changeSlice(e.isAltDown() ? -FRAME_JUMP_AMOUNT : -1, pageLabel);
+                return true;
+            }
+            if (e.getKeyCode() == KeyEvent.VK_RIGHT) {
+                changeSlice(e.isAltDown() ? FRAME_JUMP_AMOUNT : 1, pageLabel);
+                return true;
+            }
+            if (e.getKeyCode() == KeyEvent.VK_HOME) {
+                goToFrame(navigationMinSlice());
+                return true;
+            }
+            if (e.getKeyCode() == KeyEvent.VK_END) {
+                goToFrame(navigationMaxSlice());
+                return true;
+            }
+            if ((e.getKeyCode() == KeyEvent.VK_DELETE || e.getKeyCode() == KeyEvent.VK_BACK_SPACE)
+                && e.isShiftDown()) {
+                deleteSelectedTrack();
+                return true;
+            }
+            if (e.getKeyCode() == KeyEvent.VK_DELETE || e.getKeyCode() == KeyEvent.VK_BACK_SPACE) {
+                deleteSelectedPoint();
+                return true;
+            }
+            if (e.getKeyCode() == KeyEvent.VK_OPEN_BRACKET) {
+                jumpToAnchor(false);
+                return true;
+            }
+            if (e.getKeyCode() == KeyEvent.VK_CLOSE_BRACKET) {
+                jumpToAnchor(true);
+                return true;
+            }
+            if (e.getKeyCode() == KeyEvent.VK_N) {
+                jumpToReviewIssue(true);
+                return true;
+            }
+            if (e.getKeyCode() == KeyEvent.VK_P) {
+                jumpToReviewIssue(false);
                 return true;
             }
             
@@ -6395,6 +6999,9 @@ public class VideoAnnotationTool {
                             slice++;
                             currentSlice = clampNavigationSlice(slice);
                             loadSliceImage();
+                            if (followTrackDuringPlayback && selectedTrackId != null) {
+                                focusOnTrack(selectedTrackId);
+                            }
                             refreshAnnotationList();
                             updateFrameStatus();
                             frameSlider.setValue(currentSlice); // Update slider during playback
@@ -6417,16 +7024,8 @@ public class VideoAnnotationTool {
         frame.addWindowListener(new WindowAdapter() {
             @Override
             public void windowClosing(WindowEvent e) {
-                // Show confirmation dialog before exiting
-                int confirm = JOptionPane.showConfirmDialog(frame,
-                    "Are you sure you want to exit RIPPLE?\n\n" +
-                    "Any unsaved annotations will be lost.",
-                    "Confirm Exit",
-                    JOptionPane.YES_NO_OPTION,
-                    JOptionPane.QUESTION_MESSAGE);
-                
-                if (confirm != JOptionPane.YES_OPTION) {
-                    return;  // User cancelled, don't exit
+                if (!confirmDiscardOrSave("exiting RIPPLE")) {
+                    return;
                 }
                 
                 // Pause all active track timers before exit
@@ -6468,6 +7067,9 @@ public class VideoAnnotationTool {
         });
         
         // Check server status on startup and prompt for restart if needed
+        startAutosaveTimer();
+        updateWindowTitle();
+
         SwingUtilities.invokeLater(() -> {
             checkServerOnStartup();
         });
@@ -6515,6 +7117,9 @@ public class VideoAnnotationTool {
     }
 
     private void startSoftwareUpdate() {
+        if (!confirmDiscardOrSave("updating RIPPLE")) {
+            return;
+        }
         if (updateButton != null) {
             updateButton.setEnabled(false);
         }
@@ -14570,7 +15175,7 @@ public class VideoAnnotationTool {
     // KEEP ALL REMAINING METHODS FROM ORIGINAL (deleteSelectedPoint, deleteSelectedTrack, refreshAnnotationList, etc.)
     private void deleteSelectedPoint() {
         if (selectedTrackId == null) {
-            JOptionPane.showMessageDialog(frame, "No track selected.", "Info", JOptionPane.INFORMATION_MESSAGE);
+            setStatus("No track selected");
             return;
         }
         
@@ -14578,14 +15183,20 @@ public class VideoAnnotationTool {
         // Convert currentSlice (1-indexed UI) to 0-indexed frame
         int frameIndex = currentSlice - 1;
         if (frameMap == null || !frameMap.containsKey(frameIndex)) {
-            JOptionPane.showMessageDialog(frame, "No point on current frame for selected track.", "Info", JOptionPane.INFORMATION_MESSAGE);
+            setStatus("No point on this frame for " + selectedTrackId);
             return;
         }
         
         saveState("Delete point from " + selectedTrackId);
         frameMap.remove(frameIndex);
+        List<Anchor> anchors = trackAnchors.get(selectedTrackId);
+        if (anchors != null) {
+            anchors.removeIf(anchor -> anchor != null && anchor.frame == frameIndex);
+        }
         imageLabel.repaint();
         refreshAnnotationList();
+        frameSlider.repaint();
+        setStatus("Deleted point on " + selectedTrackId + " at frame " + currentSlice);
     }
 
     private void deleteSelectedTrack() {
@@ -15930,6 +16541,7 @@ public class VideoAnnotationTool {
             g.drawImage(img, 0, 0, null);
             g.dispose();
         }
+        refreshOnionSkin();
         
         imageLabel.repaint();
     }
@@ -15987,6 +16599,7 @@ public class VideoAnnotationTool {
         }
         
         currentImage = ip.getBufferedImage();
+        refreshOnionSkin();
         
         // Regenerate segmentation mask for current frame if SAT is enabled
         if (satEnabled) {
@@ -17092,30 +17705,43 @@ public class VideoAnnotationTool {
     }
 
     private void openTiff(JLabel pageLabel) {
+        openTiff(pageLabel, null);
+    }
+
+    private void openTiff(JLabel pageLabel, File preselected) {
         // Outer loop: allows returning to file explorer from compression dialog
         fileExplorerLoop:
         while (true) {
-            JFileChooser chooser = createStyledFileChooser();
-            
-            // Use last opened directory if available (overrides default repo directory)
-            if (lastOpenedVideoDirectory != null && lastOpenedVideoDirectory.exists()) {
-                chooser.setCurrentDirectory(lastOpenedVideoDirectory);
+            File selectedFile = preselected;
+            preselected = null;
+            if (selectedFile == null) {
+                JFileChooser chooser = createStyledFileChooser();
+                
+                // Use last opened directory if available (overrides default repo directory)
+                if (lastOpenedVideoDirectory != null && lastOpenedVideoDirectory.exists()) {
+                    chooser.setCurrentDirectory(lastOpenedVideoDirectory);
+                }
+                // Otherwise keep the repo directory set by createStyledFileChooser()
+                chooser.setFileFilter(new FileNameExtensionFilter("Video Files (TIFF, AVI)", "tif", "tiff", "avi"));
+                
+                if (chooser.showOpenDialog(frame) != JFileChooser.APPROVE_OPTION) {
+                    // User cancelled file selection
+                    return;
+                }
+                selectedFile = chooser.getSelectedFile();
             }
-            // Otherwise keep the repo directory set by createStyledFileChooser()
-            chooser.setFileFilter(new FileNameExtensionFilter("Video Files (TIFF, AVI)", "tif", "tiff", "avi"));
-            
-            if (chooser.showOpenDialog(frame) != JFileChooser.APPROVE_OPTION) {
-                // User cancelled file selection
+
+            if (!confirmDiscardOrSave("opening a new video")) {
                 return;
             }
             
-            File selectedFile = chooser.getSelectedFile();
             String path = selectedFile.getAbsolutePath();
             
             // Remember this directory for next time (even before we confirm loading)
             File parentDir = selectedFile.getParentFile();
             if (parentDir != null && parentDir.exists()) {
                 lastOpenedVideoDirectory = parentDir;
+                persistChooserDirectories();
             }
             
             // Get dimensions WITHOUT loading the full image into memory
@@ -17273,6 +17899,7 @@ public class VideoAnnotationTool {
             colorIndex = 0;
             undoStack.clear();
             redoStack.clear();
+            updateUndoRedoMenuItems();
             zoomFactor = 1.0;
             opticalFlowComputed = false;
             
@@ -17363,6 +17990,11 @@ public class VideoAnnotationTool {
                 fitImageToPanel(scrollPane);
             });
             
+            rememberRecentVideo(path);
+            annotationsDirty = false;
+            updateWindowTitle();
+            offerAutosaveRestore();
+
             boolean startedBatches = maybeOfferOrResumeBatches();
             if (!startedBatches) {
                 checkAndPromptOpticalFlow();
@@ -18509,6 +19141,7 @@ public class VideoAnnotationTool {
         // Remember this directory for next export video operation
         if (outputFile.getParentFile() != null && outputFile.getParentFile().exists()) {
             lastExportVideoDirectory = outputFile.getParentFile();
+            persistChooserDirectories();
         }
         if (!outputFile.getName().toLowerCase().endsWith(".mp4")) {
             outputFile = new File(outputFile.getAbsolutePath() + ".mp4");
@@ -19135,6 +19768,7 @@ public class VideoAnnotationTool {
         // Remember this directory for next export annotations operation
         if (outputFile.getParentFile() != null && outputFile.getParentFile().exists()) {
             lastExportAnnotationsDirectory = outputFile.getParentFile();
+            persistChooserDirectories();
         }
         // Ensure correct extension
         if (!outputFile.getName().toLowerCase().endsWith(extension)) {
@@ -19163,6 +19797,9 @@ public class VideoAnnotationTool {
         
         JOptionPane.showMessageDialog(frame, 
             "Exported " + contentDesc + " to:\n" + outputFile.getAbsolutePath());
+        if (content == ExportContent.RICH) {
+            markAnnotationsClean();
+        }
         
         // Return the parent directory so subsequent exports can start there
         return outputFile.getParentFile();
@@ -19743,6 +20380,7 @@ public class VideoAnnotationTool {
             // Remember this directory for next import annotations operation
             if (selectedFile.getParentFile() != null && selectedFile.getParentFile().exists()) {
                 lastImportAnnotationsDirectory = selectedFile.getParentFile();
+                persistChooserDirectories();
             }
             String filename = selectedFile.getName().toLowerCase();
             if (selectedFile.getName().endsWith(Constants.BATCH_MANIFEST_SUFFIX)) {
@@ -19877,6 +20515,7 @@ public class VideoAnnotationTool {
                     splitImportedTracksIntoClips();
                 }
                 JOptionPane.showMessageDialog(frame, "Annotations imported successfully.");
+                markAnnotationsDirty();
                 return; // Success, exit the loop
                 
             } catch (Exception ex) {
@@ -23372,6 +24011,7 @@ public class VideoAnnotationTool {
         opticalFlowComputed = false;
         undoStack.clear();
         redoStack.clear();
+        updateUndoRedoMenuItems();
         try {
             batchCoordinator.saveManifest();
         } catch (Exception ex) {
@@ -23665,6 +24305,7 @@ public class VideoAnnotationTool {
                         saveWorkingClipSilent();
                         undoStack.clear();
                         redoStack.clear();
+                        updateUndoRedoMenuItems();
                         setStatus("Working on clip " + (clipIndex + 1));
                     }
                 } catch (Exception ex) {
@@ -23720,6 +24361,8 @@ public class VideoAnnotationTool {
                 batchCoordinator.getManifest().markSaved(batchCoordinator.workingClipIndex(), snap.hasAnnotations());
                 batchCoordinator.saveManifest();
             }
+            annotationsDirty = false;
+            updateWindowTitle();
             return true;
         } catch (Exception ex) {
             System.err.println("Failed to save working clip: " + ex.getMessage());
@@ -23748,6 +24391,13 @@ public class VideoAnnotationTool {
         snap.colors.putAll(trackColors);
         snap.anchors.putAll(copyAnchorMap(trackAnchors));
         snap.optimized.putAll(trackOptimized);
+        snap.occlusions.putAll(copyOcclusionMap(trackOcclusionSegments));
+        snap.trimRange.putAll(copyTrimRangeMap(trackTrimRange));
+        snap.untrimmedAnnotations.putAll(copyTrackMap(trackUntrimmedAnnotations));
+        snap.untrimmedAnchors.putAll(copyAnchorMap(trackUntrimmedAnchors));
+        snap.completed.putAll(trackCompleted);
+        snap.timeMs.putAll(trackTotalTime);
+        snap.smoothing.putAll(trackSmoothing);
         return snap;
     }
 
@@ -23756,6 +24406,13 @@ public class VideoAnnotationTool {
         trackColors.clear();
         trackAnchors.clear();
         trackOptimized.clear();
+        trackOcclusionSegments.clear();
+        trackTrimRange.clear();
+        trackUntrimmedAnnotations.clear();
+        trackUntrimmedAnchors.clear();
+        trackCompleted.clear();
+        trackTotalTime.clear();
+        trackSmoothing.clear();
         if (snap == null) {
             return;
         }
@@ -23763,9 +24420,20 @@ public class VideoAnnotationTool {
         trackColors.putAll(snap.colors);
         trackAnchors.putAll(copyAnchorMap(snap.anchors));
         trackOptimized.putAll(snap.optimized);
+        trackOcclusionSegments.putAll(copyOcclusionMap(snap.occlusions));
+        trackTrimRange.putAll(copyTrimRangeMap(snap.trimRange));
+        trackUntrimmedAnnotations.putAll(copyTrackMap(snap.untrimmedAnnotations));
+        trackUntrimmedAnchors.putAll(copyAnchorMap(snap.untrimmedAnchors));
+        trackCompleted.putAll(snap.completed);
+        trackTotalTime.putAll(snap.timeMs);
+        trackSmoothing.putAll(snap.smoothing);
         for (String trackId : trackAnnotations.keySet()) {
             trackAnchors.computeIfAbsent(trackId, k -> new ArrayList<>());
             trackOptimized.putIfAbsent(trackId, false);
+            trackCompleted.putIfAbsent(trackId, false);
+            trackTotalTime.putIfAbsent(trackId, 0L);
+            trackSmoothing.putIfAbsent(trackId, false);
+            trackSelected.putIfAbsent(trackId, false);
             if (!trackColors.containsKey(trackId)) {
                 trackColors.put(trackId, generateRandomColor());
             }
@@ -24057,6 +24725,7 @@ public class VideoAnnotationTool {
                         saveWorkingClipSilent();
                         undoStack.clear();
                         redoStack.clear();
+                        updateUndoRedoMenuItems();
                     });
                 }
                 return null;
@@ -24426,5 +25095,38 @@ public class VideoAnnotationTool {
             }
         }
         return clipped;
+    }
+
+    private Map<String, List<int[]>> copyOcclusionMap(Map<String, List<int[]>> source) {
+        Map<String, List<int[]>> copy = new LinkedHashMap<>();
+        if (source == null) {
+            return copy;
+        }
+        for (Map.Entry<String, List<int[]>> entry : source.entrySet()) {
+            List<int[]> segments = new ArrayList<>();
+            if (entry.getValue() != null) {
+                for (int[] segment : entry.getValue()) {
+                    if (segment != null) {
+                        segments.add(java.util.Arrays.copyOf(segment, Math.max(segment.length, 3)));
+                    }
+                }
+            }
+            copy.put(entry.getKey(), segments);
+        }
+        return copy;
+    }
+
+    private Map<String, int[]> copyTrimRangeMap(Map<String, int[]> source) {
+        Map<String, int[]> copy = new LinkedHashMap<>();
+        if (source == null) {
+            return copy;
+        }
+        for (Map.Entry<String, int[]> entry : source.entrySet()) {
+            int[] range = entry.getValue();
+            if (range != null && range.length >= 2) {
+                copy.put(entry.getKey(), new int[]{range[0], range[1]});
+            }
+        }
+        return copy;
     }
 }

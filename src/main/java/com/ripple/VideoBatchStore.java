@@ -23,6 +23,13 @@ public final class VideoBatchStore {
         public final Map<String, List<Anchor>> anchors = new LinkedHashMap<>();
         public final Map<String, Color> colors = new LinkedHashMap<>();
         public final Map<String, Boolean> optimized = new LinkedHashMap<>();
+        public final Map<String, List<int[]>> occlusions = new LinkedHashMap<>();
+        public final Map<String, int[]> trimRange = new LinkedHashMap<>();
+        public final Map<String, Map<Integer, Point>> untrimmedAnnotations = new LinkedHashMap<>();
+        public final Map<String, List<Anchor>> untrimmedAnchors = new LinkedHashMap<>();
+        public final Map<String, Boolean> completed = new LinkedHashMap<>();
+        public final Map<String, Long> timeMs = new LinkedHashMap<>();
+        public final Map<String, Boolean> smoothing = new LinkedHashMap<>();
         public int batchIndex = -1;
         public int startFrame = -1;
         public int endFrame = -1;
@@ -88,6 +95,33 @@ public final class VideoBatchStore {
                     color.optInt("a", 200)));
             }
             snapshot.optimized.put(trackId, track.optBoolean("optimized", false));
+            snapshot.completed.put(trackId, track.optBoolean("completed", false));
+            if (track.has("time_ms")) {
+                snapshot.timeMs.put(trackId, track.optLong("time_ms", 0L));
+            }
+            snapshot.smoothing.put(trackId, track.optBoolean("smoothing", false));
+
+            List<int[]> occlusions = readOcclusions(track.optJSONArray("occlusion_segments"));
+            if (!occlusions.isEmpty()) {
+                snapshot.occlusions.put(trackId, occlusions);
+            }
+
+            JSONObject trimInfo = track.optJSONObject("trim_info");
+            if (trimInfo != null && trimInfo.optBoolean("trimmed", false)) {
+                int start = trimInfo.optInt("trim_start_frame", -1);
+                int end = trimInfo.optInt("trim_end_frame", -1);
+                if (start >= 0 && end >= start) {
+                    snapshot.trimRange.put(trackId, new int[]{start, end});
+                }
+                Map<Integer, Point> untrimmed = readPoints(trimInfo.optJSONArray("original_annotations"));
+                if (!untrimmed.isEmpty()) {
+                    snapshot.untrimmedAnnotations.put(trackId, untrimmed);
+                }
+                List<Anchor> untrimmedAnchors = readAnchors(trimInfo.optJSONArray("original_anchors"));
+                if (!untrimmedAnchors.isEmpty()) {
+                    snapshot.untrimmedAnchors.put(trackId, untrimmedAnchors);
+                }
+            }
         }
         return snapshot;
     }
@@ -137,6 +171,49 @@ public final class VideoBatchStore {
                 track.put("color", colorObj);
             }
             track.put("optimized", snapshot.optimized.getOrDefault(entry.getKey(), false));
+            track.put("completed", snapshot.completed.getOrDefault(entry.getKey(), false));
+            if (snapshot.timeMs.containsKey(entry.getKey())) {
+                track.put("time_ms", snapshot.timeMs.get(entry.getKey()));
+            }
+            track.put("smoothing", snapshot.smoothing.getOrDefault(entry.getKey(), false));
+
+            List<int[]> occlusions = snapshot.occlusions.get(entry.getKey());
+            if (occlusions != null && !occlusions.isEmpty()) {
+                JSONArray segments = new JSONArray();
+                for (int[] seg : occlusions) {
+                    if (seg == null || seg.length < 2 || seg[1] < seg[0]) {
+                        continue;
+                    }
+                    JSONObject segObj = new JSONObject();
+                    segObj.put("start", seg[0]);
+                    segObj.put("end", seg[1]);
+                    int type = seg.length >= 3 ? seg[2] : 0;
+                    segObj.put("type", occlusionTypeToJson(type));
+                    segments.put(segObj);
+                }
+                if (segments.length() > 0) {
+                    track.put("occlusion_segments", segments);
+                }
+            }
+
+            int[] trim = snapshot.trimRange.get(entry.getKey());
+            JSONObject trimObj = new JSONObject();
+            if (trim != null && trim.length >= 2) {
+                trimObj.put("trimmed", true);
+                trimObj.put("trim_start_frame", trim[0]);
+                trimObj.put("trim_end_frame", trim[1]);
+                Map<Integer, Point> untrimmed = snapshot.untrimmedAnnotations.get(entry.getKey());
+                if (untrimmed != null && !untrimmed.isEmpty()) {
+                    trimObj.put("original_annotations", writePoints(untrimmed));
+                }
+                List<Anchor> untrimmedAnchors = snapshot.untrimmedAnchors.get(entry.getKey());
+                if (untrimmedAnchors != null && !untrimmedAnchors.isEmpty()) {
+                    trimObj.put("original_anchors", writeAnchors(untrimmedAnchors));
+                }
+            } else {
+                trimObj.put("trimmed", false);
+            }
+            track.put("trim_info", trimObj);
             tracks.put(track);
         }
         root.put("tracks", tracks);
@@ -181,6 +258,26 @@ public final class VideoBatchStore {
             points.put(obj.getInt("frame"), new Point(obj.getInt("x"), obj.getInt("y")));
         }
         return points;
+    }
+
+    static String occlusionTypeToJson(int type) {
+        if (type == 1) {
+            return "object";
+        }
+        if (type == 2) {
+            return "low_quality";
+        }
+        return "out_of_plane";
+    }
+
+    static int occlusionTypeFromJson(String typeStr) {
+        if (typeStr != null && "object".equalsIgnoreCase(typeStr)) {
+            return 1;
+        }
+        if (typeStr != null && "low_quality".equalsIgnoreCase(typeStr)) {
+            return 2;
+        }
+        return 0;
     }
 
     private static JSONArray writePoints(Map<Integer, Point> points) {
@@ -229,5 +326,26 @@ public final class VideoBatchStore {
             array.put(obj);
         }
         return array;
+    }
+
+    private static List<int[]> readOcclusions(JSONArray array) {
+        List<int[]> segments = new ArrayList<>();
+        if (array == null) {
+            return segments;
+        }
+        for (int i = 0; i < array.length(); i++) {
+            JSONObject obj = array.optJSONObject(i);
+            if (obj == null) {
+                continue;
+            }
+            int start = obj.optInt("start", -1);
+            int end = obj.optInt("end", -1);
+            if (start < 0 || end < start) {
+                continue;
+            }
+            int type = occlusionTypeFromJson(obj.optString("type", "out_of_plane"));
+            segments.add(new int[]{start, end, type});
+        }
+        return segments;
     }
 }

@@ -1,1 +1,30 @@
-Coming soon...
+DETECTION
+
+RIPPLE can preview particle detections before you create tracks.
+
+DOG (DIFFERENCE OF GAUSSIAN)
+
+DoG finds bright spots on the current frame only. The preview locks
+frame navigation so you can check radius and threshold. Spots are not
+tracks — they have no identity across time. Return to Configuration to
+tune parameters and preview again.
+
+TRACKPY TRAJECTORIES
+
+Trackpy links spots across frames. Preview Trajectories overlays those
+paths and lets you scrub the video. When the overlay looks right, click
+Accept as Tracks to turn each trajectory into a RIPPLE track:
+
+- First and last frames become anchors
+- All other frames become annotation points
+- Optical flow is not required (these are already trajectories)
+- Existing tracks are kept; new Track IDs are added alongside them
+
+If more than 40 trajectories are found, RIPPLE asks before creating
+that many tracks.
+
+PARAMETERS
+
+Diameter and minmass control which spots are kept. Search range and
+memory control linking. Require persistent drops short flickers. If
+preview is empty, raise minmass or diameter, or widen search range.
