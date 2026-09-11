@@ -29,7 +29,13 @@ parse_java_major() {
 
 find_jdk_home() {
     local candidate
+    local tools_root="${RIPPLE_TOOLS_DIR:-}"
+    if [[ -z "$tools_root" && -n "${RIPPLE_PROJECT_DIR:-}" ]]; then
+        tools_root="${RIPPLE_PROJECT_DIR}/tools"
+    fi
     for candidate in \
+        "${tools_root:+$tools_root/jdk}" \
+        "${tools_root:+$tools_root/jdk/Contents/Home}" \
         "${JAVA_HOME:-}" \
         "$(dirname "$(dirname "$(command -v javac 2>/dev/null || true)")")" \
         "$(dirname "$(dirname "$(command -v java 2>/dev/null || true)")")" \

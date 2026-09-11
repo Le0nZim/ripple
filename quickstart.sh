@@ -2,26 +2,74 @@
 # =============================================================================
 # RIPPLE Quick Start Script
 # =============================================================================
-# One-command setup and launch for biology labs.
+# One-command setup and launch for biology labs (macOS + Linux).
 #
 # This script:
-#   1. Checks system requirements (Java, Conda, Maven) and auto-installs on macOS
+#   1. Checks system requirements and downloads a portable JDK, Maven,
+#      and Miniconda when they are missing (no admin/sudo)
 #   2. Detects NVIDIA GPU availability
-#   3. Asks user to choose CPU or GPU version
-#   4. Creates/activates ripple-env conda environment
-#   5. Installs all dependencies
+#   3. Asks the user to choose CPU or GPU mode
+#   4. Creates/activates the ripple-env conda environment
+#   5. Installs Python dependencies
 #   6. Builds and launches RIPPLE
 # =============================================================================
 
 set -e
 
-# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 BOLD='\033[1m'
 NC='\033[0m'
+
+print_help() {
+    cat <<'EOF'
+Usage: bash quickstart.sh [options]
+
+One-command RIPPLE setup for macOS and Linux. Missing JDK 17+, Maven, and
+Miniconda are downloaded into tools/ or ~/miniconda3 after confirmation.
+
+  --yes, -y       Install missing tools without prompting
+  --cpu           Force CPU mode
+  --gpu           Prefer GPU mode when an NVIDIA GPU is available
+  --check         Doctor mode: report tools, do not install or launch
+  --no-launch     Set up but do not start RIPPLE
+  --help, -h      Show this help
+
+Environment:
+  RIPPLE_ASSUME_YES=1     Same as --yes
+  RIPPLE_NO_LAUNCH=1      Same as --no-launch
+  RIPPLE_TOOLS_DIR=...    Override portable JDK/Maven location
+  RIPPLE_FORCE_REBUILD=1  Force mvn clean package
+EOF
+}
+
+ASSUME_YES="${RIPPLE_ASSUME_YES:-0}"
+FORCE_CPU=0
+FORCE_GPU=0
+CHECK_ONLY=0
+NO_LAUNCH="${RIPPLE_NO_LAUNCH:-0}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --yes|-y) ASSUME_YES=1 ;;
+        --cpu) FORCE_CPU=1 ;;
+        --gpu) FORCE_GPU=1 ;;
+        --check) CHECK_ONLY=1 ;;
+        --no-launch) NO_LAUNCH=1 ;;
+        --help|-h)
+            print_help
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            print_help
+            exit 1
+            ;;
+    esac
+    shift
+done
 
 echo -e "${BOLD}${BLUE}"
 echo "╔══════════════════════════════════════════════════════════╗"
@@ -30,26 +78,36 @@ echo "║        Video Annotation Tool for Biology                 ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 
-# Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+export RIPPLE_PROJECT_DIR="$SCRIPT_DIR"
 
-# Configuration
 CONDA_ENV_NAME="ripple-env"
 RIPPLE_REQUIRED_JAVA_MAJOR=17
+APPLE_SILICON=false
 
-# Shared validation helpers
 # shellcheck source=scripts/lib/java_env_check.sh
 source "${SCRIPT_DIR}/scripts/lib/java_env_check.sh"
 # shellcheck source=scripts/lib/conda_env_check.sh
 source "${SCRIPT_DIR}/scripts/lib/conda_env_check.sh"
+# shellcheck source=scripts/lib/bootstrap_tools.sh
+source "${SCRIPT_DIR}/scripts/lib/bootstrap_tools.sh"
+
+print_manual_tool_help() {
+    echo ""
+    echo -e "  ${YELLOW}Portable install skipped.${NC} You can also install tools yourself:"
+    echo "    JDK 17+ (full JDK with javac): https://adoptium.net/"
+    echo "    Maven 3.8+: https://maven.apache.org/download.cgi"
+    echo "    Miniconda: https://docs.conda.io/en/latest/miniconda.html"
+    echo ""
+    echo "  Then re-run: bash quickstart.sh"
+}
 
 # =============================================================================
 # STEP 1: Check System Requirements
 # =============================================================================
 echo -e "${BLUE}[1/6] Checking system requirements...${NC}"
 
-# Check OS
 OS=$(uname -s)
 ARCH=$(uname -m)
 if [[ "$OS" == "Linux" ]]; then
@@ -59,147 +117,104 @@ elif [[ "$OS" == "Darwin" ]]; then
     if [[ "$ARCH" == "arm64" ]]; then
         echo -e "  ${GREEN}✓${NC} Apple Silicon detected"
         APPLE_SILICON=true
-    else
-        APPLE_SILICON=false
     fi
-    # Check for Gatekeeper quarantine flag and warn user
     if xattr -l "$SCRIPT_DIR/quickstart.sh" 2>/dev/null | grep -q "com.apple.quarantine"; then
         echo -e "  ${YELLOW}!${NC} Gatekeeper quarantine detected"
         echo -e "    Run this command to fix: ${BOLD}xattr -cr \"$SCRIPT_DIR\"${NC}"
         echo ""
-        read -p "  Would you like to clear quarantine now? [Y/n]: " CLEAR_QUARANTINE
-        if [[ ! "$CLEAR_QUARANTINE" =~ ^[Nn]$ ]]; then
+        if [[ "$ASSUME_YES" == "1" ]]; then
             xattr -cr "$SCRIPT_DIR"
             echo -e "  ${GREEN}✓${NC} Quarantine flags cleared"
+        else
+            read -r -p "  Would you like to clear quarantine now? [Y/n]: " CLEAR_QUARANTINE
+            if [[ ! "$CLEAR_QUARANTINE" =~ ^[Nn]$ ]]; then
+                xattr -cr "$SCRIPT_DIR"
+                echo -e "  ${GREEN}✓${NC} Quarantine flags cleared"
+            fi
         fi
     fi
+elif [[ "$OS" == MINGW* || "$OS" == MSYS* || "$OS" == CYGWIN* ]]; then
+    echo -e "  ${RED}✗${NC} Please run quickstart.bat on Windows (double-click or from cmd)."
+    exit 1
 else
     echo -e "  ${YELLOW}!${NC} Unknown OS: $OS"
 fi
 
-# Check Java / Maven toolchain (JDK 17+ required; Maven must use the same JDK)
-if ! command -v java &> /dev/null && [[ "$OS" == "Darwin" ]]; then
-    JAVA_HOME_CANDIDATE=$(/usr/libexec/java_home -v "${RIPPLE_REQUIRED_JAVA_MAJOR}" 2>/dev/null || /usr/libexec/java_home 2>/dev/null || true)
-    if [[ -n "$JAVA_HOME_CANDIDATE" ]]; then
-        export JAVA_HOME="$JAVA_HOME_CANDIDATE"
-        export PATH="$JAVA_HOME/bin:$PATH"
-        echo -e "  ${YELLOW}!${NC} Java found via java_home; using it for this session"
+ripple_scan_tools
+echo ""
+echo -e "  ${BOLD}Preflight${NC}"
+if [[ "$NEED_JDK" == "0" ]]; then
+    echo -e "    ${GREEN}✓${NC} JDK 17+: $JDK_LOCATION"
+else
+    echo -e "    ${YELLOW}!${NC} JDK 17+ not found (will download Eclipse Temurin into tools/jdk)"
+fi
+if [[ "$NEED_MAVEN" == "0" ]]; then
+    echo -e "    ${GREEN}✓${NC} Maven: $MAVEN_LOCATION"
+else
+    echo -e "    ${YELLOW}!${NC} Maven 3.8+ not found (will download Apache Maven into tools/maven)"
+fi
+if [[ "$NEED_CONDA" == "0" ]]; then
+    echo -e "    ${GREEN}✓${NC} Conda: $CONDA_LOCATION"
+else
+    echo -e "    ${YELLOW}!${NC} Conda not found (will install Miniconda to ${RIPPLE_MINICONDA_HOME})"
+fi
+
+if [[ "$CHECK_ONLY" == "1" ]]; then
+    echo ""
+    if [[ "$NEED_JDK" == "0" && "$NEED_MAVEN" == "0" && "$NEED_CONDA" == "0" ]]; then
+        ripple_apply_toolchain
+        validate_java_toolchain 1
+        echo -e "  ${GREEN}✓${NC} Doctor check passed"
+        exit 0
     fi
+    echo -e "  ${YELLOW}!${NC} Doctor check found missing tools. Re-run without --check to install."
+    exit 1
+fi
+
+if [[ "$NEED_JDK" == "1" || "$NEED_MAVEN" == "1" || "$NEED_CONDA" == "1" ]]; then
+    echo ""
+    if [[ "$ASSUME_YES" != "1" ]]; then
+        read -r -p "  Install missing tools now? [Y/n]: " INSTALL_MISSING
+        if [[ "$INSTALL_MISSING" =~ ^[Nn]$ ]]; then
+            print_manual_tool_help
+            exit 1
+        fi
+    else
+        echo "  Installing missing tools (--yes)..."
+    fi
+    if ! ripple_install_missing_tools; then
+        echo -e "  ${RED}✗${NC} Portable tool install failed."
+        echo "    Check your network, firewall, or proxy, then re-run:"
+        echo "      bash quickstart.sh --yes"
+        exit 1
+    fi
+else
+    ripple_apply_toolchain
+    ripple_init_conda_shell || true
 fi
 
 echo "  Checking Java toolchain (JDK ${RIPPLE_REQUIRED_JAVA_MAJOR}+ required)..."
 if ! validate_java_toolchain 1; then
-    if [[ "$OS" == "Darwin" ]]; then
-        echo -e "  ${RED}✗${NC} Compatible JDK ${RIPPLE_REQUIRED_JAVA_MAJOR}+ not found"
-        echo "    Install a JDK ${RIPPLE_REQUIRED_JAVA_MAJOR}+ and ensure java, javac, and Maven agree."
-        echo "    After install: /usr/libexec/java_home -V"
-        echo "    export JAVA_HOME=\"\$(/usr/libexec/java_home -v ${RIPPLE_REQUIRED_JAVA_MAJOR})\""
-        echo "    export PATH=\"\$JAVA_HOME/bin:\$PATH\""
-    else
-        echo -e "  ${RED}✗${NC} Compatible JDK ${RIPPLE_REQUIRED_JAVA_MAJOR}+ not found"
-        echo "    Ubuntu/WSL fix:"
-        echo "      sudo apt update"
-        echo "      sudo apt install -y openjdk-17-jdk maven"
-        echo "      sudo update-alternatives --config java"
-        echo "      sudo update-alternatives --config javac"
-        echo "      export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64"
-        echo "      export PATH=\"\$JAVA_HOME/bin:\$PATH\""
-    fi
+    echo -e "  ${RED}✗${NC} Compatible JDK ${RIPPLE_REQUIRED_JAVA_MAJOR}+ not found after setup"
+    echo "    Re-run: bash quickstart.sh --yes"
+    echo "    Or install a full JDK ${RIPPLE_REQUIRED_JAVA_MAJOR}+ from https://adoptium.net/"
     exit 1
 fi
 echo -e "  ${GREEN}✓${NC} JDK ${RIPPLE_REQUIRED_JAVA_MAJOR}+ toolchain validated"
 
-# Check Conda (handle Homebrew, Miniforge, Miniconda, Anaconda)
-find_conda_exe() {
-    # Direct paths first
-    local CONDA_PATHS=(
-        "$HOME/miniconda3/bin/conda"
-        "$HOME/anaconda3/bin/conda"
-        "$HOME/miniforge3/bin/conda"
-        "$HOME/mambaforge/bin/conda"
-        "/opt/homebrew/Caskroom/miniconda/base/bin/conda"
-        "/opt/homebrew/Caskroom/miniforge/base/bin/conda"
-        "/opt/homebrew/Caskroom/mambaforge/base/bin/conda"
-        "/usr/local/Caskroom/miniconda/base/bin/conda"
-        "/usr/local/Caskroom/miniforge/base/bin/conda"
-    )
-    for cpath in "${CONDA_PATHS[@]}"; do
-        if [[ -x "$cpath" ]]; then
-            echo "$cpath"
-            return 0
-        fi
-    done
-    
-    # Try Homebrew Caskroom with version directories (e.g., /opt/homebrew/Caskroom/miniconda/24.1.2-0/base)
-    for pattern in "/opt/homebrew/Caskroom/miniconda"/*/base/bin/conda \
-                   "/opt/homebrew/Caskroom/miniforge"/*/base/bin/conda \
-                   "/opt/homebrew/Caskroom/mambaforge"/*/base/bin/conda \
-                   "/usr/local/Caskroom/miniconda"/*/base/bin/conda \
-                   "/usr/local/Caskroom/miniforge"/*/base/bin/conda; do
-        for cpath in $pattern; do
-            if [[ -x "$cpath" ]]; then
-                echo "$cpath"
-                return 0
-            fi
-        done
-    done
-    return 1
-}
-
-if ! command -v conda &> /dev/null; then
-    CONDA_EXE=$(find_conda_exe)
-    if [[ -n "$CONDA_EXE" ]]; then
-        eval "$($CONDA_EXE shell.bash hook)"
-    fi
-fi
-
-if ! command -v conda &> /dev/null && [[ "$OS" == "Darwin" ]]; then
-    echo -e "  ${YELLOW}!${NC} Conda not found - installing Miniconda"
-    mkdir -p ~/miniconda3
-    if [[ "$ARCH" == "arm64" ]]; then
-        MINICONDA_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-arm64.sh"
-    else
-        MINICONDA_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-x86_64.sh"
-    fi
-    curl "$MINICONDA_URL" -o ~/miniconda3/miniconda.sh
-    bash ~/miniconda3/miniconda.sh -b -u -p ~/miniconda3
-    rm ~/miniconda3/miniconda.sh
-    source ~/miniconda3/bin/activate
-    conda init --all
-fi
-
-if ! command -v conda &> /dev/null; then
-    echo -e "  ${RED}✗${NC} Conda not found"
-    echo "    Please install Miniconda or Anaconda:"
-    echo "    https://docs.conda.io/en/latest/miniconda.html"
-    exit 1
-fi
-echo -e "  ${GREEN}✓${NC} Conda found"
-
-# Check Maven
-if ! command -v mvn &> /dev/null; then
-    if [[ "$OS" == "Darwin" ]]; then
-        if ! command -v brew &> /dev/null; then
-            echo -e "  ${YELLOW}!${NC} Homebrew not found - installing"
-            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-            if [[ -x /opt/homebrew/bin/brew ]]; then
-                eval "$(/opt/homebrew/bin/brew shellenv)"
-            elif [[ -x /usr/local/bin/brew ]]; then
-                eval "$(/usr/local/bin/brew shellenv)"
-            fi
-        fi
-        echo -e "  ${YELLOW}!${NC} Maven not found - installing via Homebrew"
-        brew install maven
-    else
-        echo -e "  ${RED}✗${NC} Maven not found"
-        echo "    Please install Maven 3.8+ from https://maven.apache.org/download.cgi"
-        echo "    Ubuntu/Debian: sudo apt install maven"
+if ! command -v conda >/dev/null 2>&1; then
+    if ! ripple_init_conda_shell; then
+        echo -e "  ${RED}✗${NC} Conda not found after setup"
+        echo "    Re-run: bash quickstart.sh --yes"
+        echo "    Or install Miniconda: https://docs.conda.io/en/latest/miniconda.html"
         exit 1
     fi
 fi
+echo -e "  ${GREEN}✓${NC} Conda found"
 
-if ! command -v mvn &> /dev/null; then
-    echo -e "  ${RED}✗${NC} Maven not found"
+if ! command -v mvn >/dev/null 2>&1; then
+    echo -e "  ${RED}✗${NC} Maven not found after setup"
+    echo "    Re-run: bash quickstart.sh --yes"
     exit 1
 fi
 echo -e "  ${GREEN}✓${NC} Maven found"
@@ -210,23 +225,21 @@ echo -e "  ${GREEN}✓${NC} Maven found"
 echo -e "\n${BLUE}[2/6] Detecting GPU...${NC}"
 
 GPU_AVAILABLE=false
-
-# Only check for NVIDIA GPU on Linux
 if [[ "$OS" == "Linux" ]]; then
-    if command -v nvidia-smi &> /dev/null; then
-        if nvidia-smi &> /dev/null; then
-            GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
-            GPU_MEM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader | head -1)
-            echo -e "  ${GREEN}✓${NC} NVIDIA GPU detected: $GPU_NAME ($GPU_MEM)"
-            GPU_AVAILABLE=true
-        else
-            echo -e "  ${YELLOW}!${NC} nvidia-smi found but GPU not accessible"
-        fi
+    if command -v nvidia-smi &> /dev/null && nvidia-smi &> /dev/null; then
+        GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
+        GPU_MEM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader | head -1)
+        echo -e "  ${GREEN}✓${NC} NVIDIA GPU detected: $GPU_NAME ($GPU_MEM)"
+        GPU_AVAILABLE=true
+    elif command -v nvidia-smi &> /dev/null; then
+        echo -e "  ${YELLOW}!${NC} nvidia-smi found but GPU not accessible"
     else
         echo -e "  ${YELLOW}!${NC} No NVIDIA GPU detected"
     fi
-else
+elif [[ "$OS" == "Darwin" ]]; then
     echo -e "  ${YELLOW}!${NC} macOS detected - GPU mode not available"
+else
+    echo -e "  ${YELLOW}!${NC} No NVIDIA GPU detected"
 fi
 
 # =============================================================================
@@ -234,7 +247,18 @@ fi
 # =============================================================================
 echo -e "\n${BLUE}[3/6] Installation mode selection...${NC}"
 
-if [[ "$GPU_AVAILABLE" == "true" ]]; then
+if [[ "$FORCE_CPU" == "1" ]]; then
+    GPU_MODE="cpu"
+    echo -e "  ${GREEN}✓${NC} CPU mode selected (--cpu)"
+elif [[ "$FORCE_GPU" == "1" ]]; then
+    if [[ "$GPU_AVAILABLE" == "true" ]]; then
+        GPU_MODE="gpu"
+        echo -e "  ${GREEN}✓${NC} GPU mode selected (--gpu)"
+    else
+        GPU_MODE="cpu"
+        echo -e "  ${YELLOW}!${NC} --gpu requested but no NVIDIA GPU found; using CPU mode"
+    fi
+elif [[ "$GPU_AVAILABLE" == "true" ]]; then
     echo ""
     echo -e "  ${BOLD}Please select installation mode:${NC}"
     echo ""
@@ -246,9 +270,8 @@ if [[ "$GPU_AVAILABLE" == "true" ]]; then
     echo "        - Limited functionality: TrackPy, DIS optical flow"
     echo "        - Works on any system"
     echo ""
-    
     while true; do
-        read -p "  Enter your choice [1/2]: " choice
+        read -r -p "  Enter your choice [1/2]: " choice
         case $choice in
             1)
                 GPU_MODE="gpu"
@@ -277,53 +300,47 @@ fi
 # =============================================================================
 echo -e "\n${BLUE}[4/6] Setting up conda environment...${NC}"
 
-# Accept conda Terms of Service for default channels (match Windows quickstart.bat)
+if ! ripple_init_conda_shell; then
+    echo -e "  ${RED}✗${NC} Could not initialize conda for this shell"
+    exit 1
+fi
+
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main >/dev/null 2>&1 || true
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r >/dev/null 2>&1 || true
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/msys2 >/dev/null 2>&1 || true
 
-# Find conda base and source it (handle various conda installations)
 CONDA_BASE=$(conda info --base 2>/dev/null)
 if [[ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]]; then
+    # shellcheck disable=SC1091
     source "$CONDA_BASE/etc/profile.d/conda.sh"
 elif [[ -f "$CONDA_BASE/etc/profile.d/mamba.sh" ]]; then
-    # Miniforge/Mambaforge use mamba.sh
+    # shellcheck disable=SC1091
     source "$CONDA_BASE/etc/profile.d/mamba.sh"
-else
-    # Fallback: try to initialize via conda command
-    eval "$(conda shell.bash hook)"
 fi
 
-# Check if environment already exists
 if conda env list | grep -q "^${CONDA_ENV_NAME} "; then
     echo -e "  ${GREEN}✓${NC} Environment '${CONDA_ENV_NAME}' already exists"
     conda activate "${CONDA_ENV_NAME}"
 else
     echo "  Creating new environment '${CONDA_ENV_NAME}'..."
-    
-    # Select appropriate environment file
     if [[ "$GPU_MODE" == "gpu" ]]; then
         ENV_FILE="conda/environment.yml"
     else
         ENV_FILE="conda/environment-cpu.yml"
     fi
-    
-    # Warn about Apple Silicon compatibility
-    if [[ "$OS" == "Darwin" ]] && [[ "$APPLE_SILICON" == "true" ]]; then
+
+    if [[ "$OS" == "Darwin" && "$APPLE_SILICON" == "true" ]]; then
         echo -e "  ${YELLOW}Note:${NC} Apple Silicon detected. Some packages may be installed"
         echo -e "        via Rosetta 2 emulation if ARM64 wheels are unavailable."
     fi
-    
+
     if [[ -f "$ENV_FILE" ]]; then
-        # Create environment from file, but override the name
-        # Note: conda env create doesn't support -y, it auto-confirms by default
         conda env create -f "$ENV_FILE" -n "${CONDA_ENV_NAME}"
     else
-        # Fallback: create minimal environment and install via pip
         echo "  Environment file not found, creating minimal environment..."
         conda create -n "${CONDA_ENV_NAME}" python=3.11 pip -y
     fi
-    
+
     conda activate "${CONDA_ENV_NAME}"
     echo -e "  ${GREEN}✓${NC} Environment created and activated"
 fi
@@ -333,7 +350,6 @@ fi
 # =============================================================================
 echo -e "\n${BLUE}[5/6] Installing dependencies...${NC}"
 
-# Validate or repair dependencies for the selected install mode
 set +e
 validate_conda_environment "$GPU_MODE" "$CONDA_ENV_NAME" "$SCRIPT_DIR"
 ENV_STATUS=$?
@@ -354,9 +370,6 @@ fi
 # =============================================================================
 echo -e "\n${BLUE}[6/6] Building and launching RIPPLE...${NC}"
 
-# Build Java application
-# Previous behavior only checked for existence of target/ripple.jar, which can be stale
-# if sources changed after the last build. We now compare timestamps.
 FORCE_REBUILD="${RIPPLE_FORCE_REBUILD:-0}"
 
 get_latest_source_mtime() {
@@ -426,7 +439,6 @@ else
     echo -e "  ${GREEN}✓${NC} JAR already up to date"
 fi
 
-# Launch
 echo ""
 echo -e "${BOLD}${GREEN}════════════════════════════════════════════════════════════${NC}"
 echo -e "${BOLD}${GREEN}  RIPPLE Setup Complete!${NC}"
@@ -438,7 +450,8 @@ echo ""
 # =============================================================================
 echo -e "${BLUE}Creating launch shortcuts...${NC}"
 
-# Create the launcher shell script with improved conda detection
+LAUNCHER_JAVA_HOME="${RIPPLE_RESOLVED_JAVA_HOME:-${JAVA_HOME:-}}"
+
 cat > "${SCRIPT_DIR}/RIPPLE.sh" << 'LAUNCHER_EOF'
 #!/usr/bin/env bash
 # RIPPLE Launcher - Auto-generated by quickstart
@@ -446,9 +459,19 @@ cat > "${SCRIPT_DIR}/RIPPLE.sh" << 'LAUNCHER_EOF'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Initialize conda (handle Homebrew, Miniforge, and other installations)
+if [[ -x "${SCRIPT_DIR}/tools/jdk/bin/java" ]]; then
+    export JAVA_HOME="${SCRIPT_DIR}/tools/jdk"
+    export PATH="${JAVA_HOME}/bin:${PATH}"
+elif [[ -n "${RIPPLE_LAUNCHER_JAVA_HOME}" && -x "${RIPPLE_LAUNCHER_JAVA_HOME}/bin/java" ]]; then
+    export JAVA_HOME="${RIPPLE_LAUNCHER_JAVA_HOME}"
+    export PATH="${JAVA_HOME}/bin:${PATH}"
+fi
+
+if [[ -x "${SCRIPT_DIR}/tools/maven/bin/mvn" ]]; then
+    export PATH="${SCRIPT_DIR}/tools/maven/bin:${PATH}"
+fi
+
 find_conda() {
-    # Direct paths first
     local CONDA_PATHS=(
         "$HOME/miniconda3/bin/conda"
         "$HOME/anaconda3/bin/conda"
@@ -460,14 +483,13 @@ find_conda() {
         "/usr/local/Caskroom/miniconda/base/bin/conda"
         "/usr/local/Caskroom/miniforge/base/bin/conda"
     )
+    local cpath pattern
     for cpath in "${CONDA_PATHS[@]}"; do
         if [[ -x "$cpath" ]]; then
             echo "$cpath"
             return 0
         fi
     done
-    
-    # Try Homebrew Caskroom with version directories
     for pattern in "/opt/homebrew/Caskroom/miniconda"/*/base/bin/conda \
                    "/opt/homebrew/Caskroom/miniforge"/*/base/bin/conda \
                    "/opt/homebrew/Caskroom/mambaforge"/*/base/bin/conda \
@@ -493,8 +515,10 @@ fi
 if command -v conda &> /dev/null; then
     CONDA_BASE=$(conda info --base 2>/dev/null)
     if [[ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]]; then
+        # shellcheck disable=SC1091
         source "$CONDA_BASE/etc/profile.d/conda.sh"
     elif [[ -f "$CONDA_BASE/etc/profile.d/mamba.sh" ]]; then
+        # shellcheck disable=SC1091
         source "$CONDA_BASE/etc/profile.d/mamba.sh"
     else
         eval "$(conda shell.bash hook)"
@@ -506,20 +530,29 @@ else
 fi
 LAUNCHER_EOF
 
-# Add environment and mode dynamically
-echo "conda activate ${CONDA_ENV_NAME}" >> "${SCRIPT_DIR}/RIPPLE.sh"
-echo "export RIPPLE_MODE=${GPU_MODE}" >> "${SCRIPT_DIR}/RIPPLE.sh"
-echo 'java -jar target/ripple.jar "$@"' >> "${SCRIPT_DIR}/RIPPLE.sh"
+if [[ -n "$LAUNCHER_JAVA_HOME" ]]; then
+    # Insert the captured system JAVA_HOME fallback after the shebang block.
+    tmp_launcher="${SCRIPT_DIR}/RIPPLE.sh.tmp"
+    awk -v home="$LAUNCHER_JAVA_HOME" '
+        NR==6 { print "RIPPLE_LAUNCHER_JAVA_HOME=\"" home "\"" }
+        { print }
+    ' "${SCRIPT_DIR}/RIPPLE.sh" > "$tmp_launcher"
+    mv "$tmp_launcher" "${SCRIPT_DIR}/RIPPLE.sh"
+fi
+
+{
+    echo "conda activate ${CONDA_ENV_NAME}"
+    echo "export RIPPLE_MODE=${GPU_MODE}"
+    echo 'java -jar target/ripple.jar "$@"'
+} >> "${SCRIPT_DIR}/RIPPLE.sh"
 
 chmod +x "${SCRIPT_DIR}/RIPPLE.sh"
 echo -e "  ${GREEN}✓${NC} Created RIPPLE.sh"
 
-# Create desktop shortcut based on OS
 if [[ "$OS" == "Linux" ]]; then
-    # Create .desktop file for Linux
     DESKTOP_FILE="${HOME}/Desktop/RIPPLE.desktop"
     APPLICATIONS_FILE="${HOME}/.local/share/applications/ripple.desktop"
-    
+
     cat > "${SCRIPT_DIR}/RIPPLE.desktop" << EOF
 [Desktop Entry]
 Version=1.0
@@ -533,22 +566,18 @@ Categories=Science;Education;
 StartupNotify=true
 EOF
 
-    # Copy to Desktop if it exists
     if [[ -d "${HOME}/Desktop" ]]; then
         cp "${SCRIPT_DIR}/RIPPLE.desktop" "${DESKTOP_FILE}"
         chmod +x "${DESKTOP_FILE}"
-        # Make it trusted (GNOME)
         gio set "${DESKTOP_FILE}" metadata::trusted true 2>/dev/null || true
         echo -e "  ${GREEN}✓${NC} Created desktop shortcut"
     fi
-    
-    # Copy to applications menu
+
     mkdir -p "${HOME}/.local/share/applications"
     cp "${SCRIPT_DIR}/RIPPLE.desktop" "${APPLICATIONS_FILE}"
     echo -e "  ${GREEN}✓${NC} Added to applications menu"
 
 elif [[ "$OS" == "Darwin" ]]; then
-    # Create macOS .command file (double-clickable)
     cat > "${SCRIPT_DIR}/RIPPLE.command" << MACOS_EOF
 #!/usr/bin/env bash
 cd "\$(dirname "\$0")"
@@ -556,8 +585,7 @@ cd "\$(dirname "\$0")"
 MACOS_EOF
     chmod +x "${SCRIPT_DIR}/RIPPLE.command"
     echo -e "  ${GREEN}✓${NC} Created RIPPLE.command (double-click to launch)"
-    
-    # Create alias on Desktop
+
     if [[ -d "${HOME}/Desktop" ]]; then
         ln -sf "${SCRIPT_DIR}/RIPPLE.command" "${HOME}/Desktop/RIPPLE.command" 2>/dev/null || true
         echo -e "  ${GREEN}✓${NC} Created desktop alias"
@@ -576,11 +604,15 @@ echo ""
 GPU_MODE_UPPER=$(echo "$GPU_MODE" | tr '[:lower:]' '[:upper:]')
 echo -e "  Mode: ${BOLD}${GPU_MODE_UPPER}${NC}"
 echo ""
-echo -e "${BOLD}${GREEN}Launching RIPPLE now...${NC}"
-echo ""
 
-# Set execution mode and launch
 export RIPPLE_MODE="${GPU_MODE}"
 
-# Run the Java application directly
+if [[ "$NO_LAUNCH" == "1" ]]; then
+    echo -e "${BOLD}Setup finished without launching (--no-launch).${NC}"
+    echo ""
+    exit 0
+fi
+
+echo -e "${BOLD}${GREEN}Launching RIPPLE now...${NC}"
+echo ""
 java -jar target/ripple.jar

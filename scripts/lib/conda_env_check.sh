@@ -1,6 +1,25 @@
 #!/usr/bin/env bash
 # Validates conda environment completeness for the selected RIPPLE install mode.
 
+ripple_file_sha256() {
+    local path="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$path" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$path" | awk '{print $1}'
+    else
+        python - <<PY
+import hashlib
+p = r'''$path'''
+h = hashlib.sha256()
+with open(p, "rb") as f:
+    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+        h.update(chunk)
+print(h.hexdigest())
+PY
+    fi
+}
+
 validate_conda_environment() {
     local gpu_mode="$1"
     local env_name="$2"
@@ -18,7 +37,7 @@ validate_conda_environment() {
     fi
 
     if [[ -f "$req_file" ]]; then
-        req_hash=$(sha256sum "$req_file" | awk '{print $1}')
+        req_hash=$(ripple_file_sha256 "$req_file")
     fi
     if [[ -f "$stamp_file" ]]; then
         stamp_hash=$(awk -F= '/requirements_hash=/{print $2}' "$stamp_file" | tail -n1)
@@ -74,7 +93,7 @@ write_conda_env_stamp() {
     fi
     if [[ -f "$req_file" ]]; then
         {
-            echo "requirements_hash=$(sha256sum "$req_file" | awk '{print $1}')"
+            echo "requirements_hash=$(ripple_file_sha256 "$req_file")"
             echo "gpu_mode=${gpu_mode}"
             date -u +generated_utc=%Y-%m-%dT%H:%M:%SZ
         } > "$stamp_file"

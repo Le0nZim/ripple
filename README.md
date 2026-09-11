@@ -35,6 +35,7 @@ The **git repository is only ~2–3 MB**. Most slow downloads come from copying 
 | Path | Typical size | Needed for build? |
 |------|--------------|-------------------|
 | `.venv/` | ~460 MB | **No** — use `bash quickstart.sh` (creates conda `ripple-env`) |
+| `tools/` | ~200 MB | **No** — portable JDK/Maven downloaded by quickstart if needed |
 | `locotrack_pytorch/weights/*.ckpt` | ~76 MB | **No** for CPU; optional for GPU ([download links](locotrack_pytorch/weights/README.md)) |
 | `target/` | ~5 MB | **No** — rebuilt by Maven |
 
@@ -57,27 +58,52 @@ Do **not** zip or sync the entire working tree if it contains `.venv/` — that 
 
 ## 🚀 Quick Start
 
-### Prerequisites
-- **JDK 17 or newer** (full JDK with `javac`, not a JRE only)
-- **Conda** (Miniconda or Anaconda)
-- **Maven 3.8+** (needed to build the Java app)
+You do **not** need to install Java, Maven, or Conda first. On the first run, quickstart looks for them on your PATH, then downloads a portable JDK and Maven into `tools/` and Miniconda into your home folder if they are missing (one `Y/n` prompt, no admin/sudo).
 
-### One-Command Installation
+### macOS
 
 ```bash
+git clone https://github.com/Le0nZim/ripple.git
+cd ripple
 bash quickstart.sh
 ```
 
-That's it! The script will:
-1. Create a new conda environment `ripple-env` (or use existing one)
-2. Install all Python dependencies (GPU or CPU automatically detected)
-3. Build the Java application
-4. Launch RIPPLE
+If macOS Gatekeeper quarantines the folder, the script offers to clear it (`xattr -cr`). After setup, double-click `RIPPLE.command` or run `./RIPPLE.sh`.
+
+### Linux (including WSL)
+
+```bash
+git clone https://github.com/Le0nZim/ripple.git
+cd ripple
+bash quickstart.sh
+```
+
+GPU mode is offered only when `nvidia-smi` works. After setup, use `./RIPPLE.sh` or the desktop / applications-menu shortcut.
 
 ### Windows
-```cmd
-quickstart.bat
+
+1. Download or clone the repository.
+2. Double-click `quickstart.bat` (or run it from Command Prompt).
+3. If SmartScreen appears, choose **More info → Run anyway**.
+
+After setup, double-click `RIPPLE.bat` or the Desktop shortcut.
+
+### Optional flags
+
+```bash
+bash quickstart.sh --help
+bash quickstart.sh --yes --cpu --no-launch   # non-interactive setup
+bash quickstart.sh --check                   # doctor: report tools only
 ```
+
+Windows accepts the same flags: `quickstart.bat --yes`, `--cpu`, `--gpu`, `--check`, `--no-launch`.
+
+That's it! The script will:
+1. Detect or download JDK 17+, Maven 3.8+, and Miniconda
+2. Create a conda environment `ripple-env` (or reuse it)
+3. Install Python dependencies (GPU or CPU)
+4. Build the Java application
+5. Create launchers / shortcuts and start RIPPLE
 
 ## 🔨 Build & Run (Maven)
 
@@ -164,15 +190,15 @@ RIPPLE/
 │   ├── environment.yml          # GPU environment (CUDA)
 │   └── environment-cpu.yml      # CPU-only environment
 │
-└── scripts/                     # Build and utility scripts
+└── scripts/                     # Build, doctor tests, and portable-tool bootstrap
 ```
 
 ## 📋 Requirements
 
 ### System Requirements
-- **Java**: 11+ (17+ recommended)
-- **Conda**: Miniconda or Anaconda
-- **Maven**: 3.8+ (for building from source)
+- **Java**: JDK 17+ (full JDK with `javac`, not a JRE). Quickstart can download a portable Temurin JDK into `tools/jdk`.
+- **Conda**: Miniconda or Anaconda. Quickstart can install Miniconda to `~/miniconda3` (or `%USERPROFILE%\miniconda3`).
+- **Maven**: 3.8+ (for building from source). Quickstart can download a portable copy into `tools/maven`.
 
 ### GPU Support
 
@@ -202,35 +228,34 @@ RIPPLE/
 
 ## 🔧 Troubleshooting
 
-### Java not found
-Install OpenJDK 25:
+### Java, Maven, or Conda not found
+Re-run the installer and accept the portable download:
+
 ```bash
-# Ubuntu/Debian
-sudo apt install openjdk-25-jdk
+# macOS / Linux
+bash quickstart.sh --yes
 
-# macOS
-brew install openjdk@25
-
-# Windows: Download from https://www.oracle.com/java/technologies/downloads/#jdk25-windows
+# Windows
+quickstart.bat --yes
 ```
 
-### Conda not found
-Install Miniconda:
-```bash
-# Linux
-wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
-bash Miniconda3-latest-Linux-x86_64.sh
+If the download fails, check your network, firewall, or proxy, then try again. You can also install the tools yourself (JDK 17+ from [Adoptium](https://adoptium.net/), Maven 3.8+ from [maven.apache.org](https://maven.apache.org/download.cgi), Miniconda from the [Miniconda docs](https://docs.conda.io/en/latest/miniconda.html)) and re-run quickstart.
 
-# macOS
-wget https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-x86_64.sh
-bash Miniconda3-latest-MacOSX-x86_64.sh
+Doctor mode (no install, no launch):
+
+```bash
+bash quickstart.sh --check
+quickstart.bat --check
 ```
 
 ### GPU not detected
-Ensure NVIDIA drivers and CUDA toolkit are installed:
+Ensure NVIDIA drivers are installed and `nvidia-smi` works:
+
 ```bash
 nvidia-smi  # Should show GPU info
 ```
+
+On macOS, RIPPLE always uses CPU mode (TrackPy and DIS). RAFT and LocoTrack need an NVIDIA GPU.
 
 ## 📄 License
 

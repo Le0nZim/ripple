@@ -8,6 +8,10 @@ dist/
 # ==== Auto-generated scripts ====
 RIPPLE.bat
 RIPPLE.sh
+RIPPLE.command
+
+# ==== Portable JDK/Maven downloaded by quickstart ====
+tools/
 
 # ==== Java ====
 *.class
