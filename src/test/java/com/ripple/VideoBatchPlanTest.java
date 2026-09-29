@@ -64,6 +64,21 @@ class VideoBatchPlanTest {
     }
 
     @Test
+    void clipSliderRoundTripsSmallCountsOnLongVideos() {
+        int maxClips = 2769;
+        int span = VideoBatchPlan.CLIP_SLIDER_SPAN;
+        for (int count : new int[]{1, 2, 4, 8, 76, maxClips}) {
+            int pos = VideoBatchPlan.sliderPositionForClipCount(count, maxClips, span);
+            assertEquals(count, VideoBatchPlan.clipCountForSliderPosition(pos, maxClips, span),
+                "count " + count + " at slider " + pos);
+        }
+        assertTrue(VideoBatchPlan.sliderPositionForClipCount(2, maxClips, span)
+            < VideoBatchPlan.sliderPositionForClipCount(4, maxClips, span));
+        assertEquals(4, VideoBatchPlan.clipCountForSliderPosition(
+            VideoBatchPlan.sliderPositionForClipCount(4, 276, span), 276, span));
+    }
+
+    @Test
     void clampClipCountHonorsBounds() {
         assertEquals(1, VideoBatchPlan.clampClipCount(0, 100));
         assertEquals(99, VideoBatchPlan.clampClipCount(500, 100));

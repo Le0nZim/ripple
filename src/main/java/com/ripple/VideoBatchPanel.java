@@ -10,7 +10,9 @@ import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.JSlider;
+import javax.swing.JSpinner;
 import javax.swing.JTable;
+import javax.swing.SpinnerNumberModel;
 import javax.swing.SwingConstants;
 import javax.swing.table.DefaultTableModel;
 import java.awt.BorderLayout;
@@ -22,6 +24,7 @@ import java.awt.Font;
 import java.awt.Frame;
 import java.awt.event.ActionListener;
 import java.util.List;
+import javax.swing.JFormattedTextField;
 
 /**
  * Split dialog, clip strip, and preview banner for clip batching.
@@ -96,11 +99,21 @@ public final class VideoBatchPanel {
         overBudget.setVisible(suggested > 1);
         top.add(overBudget);
 
-        JLabel countLabel = new JLabel("Clips: " + suggested);
+        final int maxClips = Math.max(1, totalFrames - 1);
+        final int sliderSpan = VideoBatchPlan.CLIP_SLIDER_SPAN;
+        JLabel countLabel = new JLabel("Number of clips:");
         countLabel.setFont(new Font("Segoe UI", Font.BOLD, 13));
-        JSlider slider = new JSlider(1, Math.max(1, totalFrames - 1), suggested);
-        slider.setMajorTickSpacing(Math.max(1, (totalFrames - 1) / 10));
-        slider.setPaintTicks(true);
+        JSpinner clipSpinner = new JSpinner(new SpinnerNumberModel(suggested, 1, maxClips, 1));
+        JFormattedTextField spinnerField = ((JSpinner.DefaultEditor) clipSpinner.getEditor()).getTextField();
+        spinnerField.setColumns(5);
+        spinnerField.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        JSlider slider = new JSlider(0, sliderSpan,
+            VideoBatchPlan.sliderPositionForClipCount(suggested, maxClips, sliderSpan));
+        slider.setEnabled(maxClips > 1);
+        slider.setToolTipText("Stretched so small clip counts (2, 4, 8) are easy to select");
+        JLabel hint = new JLabel("Type a number, or drag the slider.");
+        hint.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        hint.setForeground(new Color(90, 90, 90));
 
         String[] columns = {"Clip", "Frames", "Length"};
         DefaultTableModel model = new DefaultTableModel(columns, 0) {
@@ -113,22 +126,55 @@ public final class VideoBatchPanel {
         table.setRowHeight(22);
         refreshRangeTable(model, totalFrames, suggested);
 
+        final boolean[] syncing = {false};
+        java.util.function.IntConsumer applyCount = count -> {
+            int clamped = VideoBatchPlan.clampClipCount(count, totalFrames);
+            chosen[0] = clamped;
+            refreshRangeTable(model, totalFrames, clamped);
+            overBudget.setVisible(clamped == 1 && suggested > 1);
+        };
+        clipSpinner.addChangeListener(e -> {
+            if (syncing[0]) {
+                return;
+            }
+            int count = ((Number) clipSpinner.getValue()).intValue();
+            syncing[0] = true;
+            slider.setValue(VideoBatchPlan.sliderPositionForClipCount(count, maxClips, sliderSpan));
+            applyCount.accept(count);
+            syncing[0] = false;
+        });
         slider.addChangeListener(e -> {
-            chosen[0] = slider.getValue();
-            countLabel.setText("Clips: " + chosen[0]);
-            refreshRangeTable(model, totalFrames, chosen[0]);
-            overBudget.setVisible(chosen[0] == 1 && suggested > 1);
+            if (syncing[0]) {
+                return;
+            }
+            int count = VideoBatchPlan.clipCountForSliderPosition(slider.getValue(), maxClips, sliderSpan);
+            syncing[0] = true;
+            clipSpinner.setValue(count);
+            applyCount.accept(count);
+            if (!slider.getValueIsAdjusting()) {
+                slider.setValue(VideoBatchPlan.sliderPositionForClipCount(count, maxClips, sliderSpan));
+            }
+            syncing[0] = false;
         });
 
-        JPanel middle = new JPanel(new BorderLayout(8, 8));
+        JPanel middle = new JPanel();
+        middle.setLayout(new BoxLayout(middle, BoxLayout.Y_AXIS));
         middle.setBorder(BorderFactory.createEmptyBorder(0, 18, 0, 18));
-        JPanel sliderRow = new JPanel(new BorderLayout(8, 0));
-        sliderRow.add(countLabel, BorderLayout.WEST);
-        sliderRow.add(slider, BorderLayout.CENTER);
-        middle.add(sliderRow, BorderLayout.NORTH);
+        JPanel countRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        countRow.add(countLabel);
+        countRow.add(clipSpinner);
+        countRow.setAlignmentX(0f);
+        hint.setAlignmentX(0f);
+        slider.setAlignmentX(0f);
+        middle.add(countRow);
+        middle.add(hint);
+        middle.add(Box.createVerticalStrut(6));
+        middle.add(slider);
+        middle.add(Box.createVerticalStrut(8));
         JScrollPane tableScroll = new JScrollPane(table);
-        tableScroll.setPreferredSize(new Dimension(420, 160));
-        middle.add(tableScroll, BorderLayout.CENTER);
+        tableScroll.setPreferredSize(new Dimension(460, 160));
+        tableScroll.setAlignmentX(0f);
+        middle.add(tableScroll);
 
         JPanel buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 10));
         JButton keep = new JButton("Keep as one clip");
@@ -140,7 +186,13 @@ public final class VideoBatchPanel {
             dialog.dispose();
         });
         split.addActionListener(e -> {
-            result[0] = SplitResult.split(Math.max(1, chosen[0]));
+            try {
+                clipSpinner.commitEdit();
+            } catch (java.text.ParseException ignored) {
+                // Keep the last valid spinner value.
+            }
+            int count = ((Number) clipSpinner.getValue()).intValue();
+            result[0] = SplitResult.split(VideoBatchPlan.clampClipCount(count, totalFrames));
             dialog.dispose();
         });
         cancel.addActionListener(e -> dialog.dispose());

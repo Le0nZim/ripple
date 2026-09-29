@@ -111,6 +111,66 @@ public final class VideoBatchPlan {
         return Math.max(1, Math.min(maxClips, requested));
     }
 
+    /** Positions on the split-dialog slider. Low clip counts get more of the track. */
+    public static final int CLIP_SLIDER_SPAN = 1000;
+
+    /**
+     * Map a slider position to a clip count on a log scale so 2 and 4 stay
+     * easy to hit when the maximum is hundreds of clips.
+     */
+    public static int clipCountForSliderPosition(int position, int maxClips, int sliderSpan) {
+        if (maxClips <= 1 || sliderSpan <= 0) {
+            return 1;
+        }
+        int pos = Math.max(0, Math.min(sliderSpan, position));
+        if (pos == 0) {
+            return 1;
+        }
+        if (pos == sliderSpan) {
+            return maxClips;
+        }
+        double t = pos / (double) sliderSpan;
+        int rounded = (int) Math.round(Math.exp(Math.log(maxClips) * t));
+        return Math.max(1, Math.min(maxClips, rounded));
+    }
+
+    /**
+     * Slider position whose log-scale value is {@code clipCount}, or the closest count
+     * the slider can represent. Uses the middle of that count's plateau so a one-pixel
+     * nudge does not fall off onto a neighbor.
+     */
+    public static int sliderPositionForClipCount(int clipCount, int maxClips, int sliderSpan) {
+        int target = Math.max(1, Math.min(Math.max(1, maxClips), clipCount));
+        if (maxClips <= 1 || sliderSpan <= 0 || target <= 1) {
+            return 0;
+        }
+        if (target >= maxClips) {
+            return sliderSpan;
+        }
+        int first = -1;
+        int last = -1;
+        int closestPos = 0;
+        int closestDist = Integer.MAX_VALUE;
+        for (int pos = 0; pos <= sliderSpan; pos++) {
+            int clips = clipCountForSliderPosition(pos, maxClips, sliderSpan);
+            int dist = Math.abs(clips - target);
+            if (dist < closestDist) {
+                closestDist = dist;
+                closestPos = pos;
+            }
+            if (clips == target) {
+                if (first < 0) {
+                    first = pos;
+                }
+                last = pos;
+            }
+        }
+        if (first < 0) {
+            return closestPos;
+        }
+        return (first + last) / 2;
+    }
+
     /**
      * Split {@code totalFrames} into {@code clipCount} overlapping clips.
      * Remainder flow-pairs are spread onto the later clips.

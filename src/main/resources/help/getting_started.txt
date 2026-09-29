@@ -21,6 +21,8 @@ Optical flow for a long video is a large (T-1) × H × W × 2 array in RAM.
 Right after the compression prompt, RIPPLE estimates that size from the
 working resolution and the current flow method, compares it to free RAM,
 and suggests a clip count when the full video would be too large.
+Type the number of clips (for example 2 or 4), or drag the slider.
+The slider is stretched so small counts are easy to land on.
 
 - Preview a clip to watch that range and see first/last-frame dots only.
 - Switch loads that clip’s optical flow and unloads the previous clip.
