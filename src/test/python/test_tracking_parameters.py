@@ -1,17 +1,11 @@
 """Unit tests for tracking parameter validation helpers."""
 
-import math
+from pathlib import Path
+import sys
 import unittest
 
-
-def normalize_blob_search_radius(value, default=15):
-    try:
-        radius = float(value)
-    except (TypeError, ValueError):
-        radius = float(default)
-    if not math.isfinite(radius) or radius <= 0:
-        radius = float(default)
-    return max(1, int(round(radius)))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "main" / "python"))
+from tracking_server import _normalize_blob_search_radius as normalize_blob_search_radius
 
 
 class TrackingParameterValidationTest(unittest.TestCase):

@@ -321,53 +321,31 @@ def parse_args():
         candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
         command["flow_path"] = candidates[0]
     
-    # Post-processing: if 'anchors' is a file path, read and parse the JSON file
-    # The server expects anchors to be actual JSON data, not a file path
+    # Resolve payload files locally and fail before contacting the server if the
+    # file is missing or malformed. Sending a path string conceals the real error.
     if "anchors" in command:
-        anchors_value = command["anchors"]
-        if isinstance(anchors_value, str) and os.path.isfile(anchors_value):
-            try:
-                with open(anchors_value, 'r', encoding='utf-8') as f:
-                    anchors_data = json.load(f)
-                command["anchors"] = anchors_data
-                print(f"[DEBUG] Loaded anchors from file: {anchors_value}", file=sys.stderr)
-                print(f"[DEBUG] Anchors count: {len(anchors_data) if isinstance(anchors_data, list) else 'N/A'}", file=sys.stderr)
-            except Exception as e:
-                print(f"[ERROR] Failed to read anchors file: {e}", file=sys.stderr)
+        anchors_path = command["anchors"]
+        with open(anchors_path, "r", encoding="utf-8") as handle:
+            anchors = json.load(handle)
+        if not isinstance(anchors, list) or not anchors:
+            raise ValueError("anchors file must contain a non-empty array")
+        command["anchors"] = anchors
 
-    # Post-processing: optimize_tracks can accept a bundle file created by the Java UI.
-    # On Linux, run_persistent_tracking.sh expands this bundle into a JSON request with a
-    # top-level 'tracks' field. On Windows, run_persistent_tracking.bat forwards args
-    # directly to this script, so we must expand the bundle here.
     if "anchors_bundle" in command:
-        bundle_path = command.get("anchors_bundle")
-        if isinstance(bundle_path, str) and os.path.isfile(bundle_path):
-            try:
-                with open(bundle_path, 'r', encoding='utf-8') as f:
-                    bundle_data = json.load(f)
+        bundle_path = command.pop("anchors_bundle")
+        with open(bundle_path, "r", encoding="utf-8") as handle:
+            bundle = json.load(handle)
+        tracks = bundle.get("tracks") if isinstance(bundle, dict) else bundle
+        if not isinstance(tracks, list) or not tracks:
+            raise ValueError("anchors bundle must contain a non-empty 'tracks' array")
+        command["tracks"] = tracks
 
-                if isinstance(bundle_data, dict) and "tracks" in bundle_data:
-                    command["tracks"] = bundle_data.get("tracks") or []
-                elif isinstance(bundle_data, list):
-                    # Allow bundle file to be a raw list of tracks specs
-                    command["tracks"] = bundle_data
-                else:
-                    raise ValueError("anchors bundle JSON must be an object with a 'tracks' array or a raw tracks array")
-
-                # Do not send the file path to the server; send the expanded tracks list.
-                del command["anchors_bundle"]
-                print(f"[DEBUG] Loaded anchors bundle from file: {bundle_path}", file=sys.stderr)
-                print(f"[DEBUG] Bundle tracks: {len(command.get('tracks', []))}", file=sys.stderr)
-            except Exception as e:
-                print(f"[ERROR] Failed to read anchors bundle file: {e}", file=sys.stderr)
-    
     return command, conn
 
 
 def main():
-    command, conn = parse_args()
-    
     try:
+        command, conn = parse_args()
         response = send_command(
             command,
             use_tcp=conn.get("use_tcp"),

@@ -267,4 +267,16 @@ public final class VideoBatchCoordinator {
             manifest.save(file);
         }
     }
+
+    /** Preview and entire-video modes still retain the working clip in memory. */
+    public void saveWorkingSnapshot(VideoBatchStore.ClipSnapshot snapshot, String sourceFilename,
+                                    int totalFrames) throws Exception {
+        VideoBatchPlan.ClipRange range = workingRange();
+        if (range == null) {
+            return;
+        }
+        VideoBatchStore.save(annotationFile(range.index), snapshot, sourceFilename, range, totalFrames);
+        manifest.markSaved(range.index, snapshot.hasAnnotations());
+        saveManifest();
+    }
 }

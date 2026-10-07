@@ -7,6 +7,7 @@ Frame indices are 0-based and inclusive. A clip [start, end] has
 from __future__ import annotations
 
 import os
+import math
 
 
 def resolve_frame_range(request, total_frames=None):
@@ -97,6 +98,41 @@ def to_global_frame(local_frame, frame_start):
     if frame_start is None:
         return int(local_frame)
     return int(local_frame) + int(frame_start)
+
+
+def validated_local_frame(frame, frame_start, frame_count, label="Track"):
+    """Validate a global frame before indexing a clip-sized array."""
+    start = 0 if frame_start is None else int(frame_start)
+    end = start + frame_count - 1
+    try:
+        value = int(frame)
+        if isinstance(frame, bool) or float(frame) != value:
+            raise ValueError()
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{label}: invalid frame {frame!r}") from exc
+    if not start <= value <= end:
+        raise ValueError(f"{label}: frame {value} is outside the loaded frames [{start}, {end}]")
+    return value - start
+
+
+def validated_local_anchors(anchors, frame_start, frame_count, label="Track"):
+    if not isinstance(anchors, list) or not anchors:
+        raise ValueError(f"{label}: provide at least one anchor")
+    result = {}
+    for anchor in anchors:
+        if not isinstance(anchor, dict) or not all(k in anchor for k in ("frame", "x", "y")):
+            raise ValueError(f"{label}: each anchor needs frame, x and y")
+        local = validated_local_frame(anchor["frame"], frame_start, frame_count, label)
+        try:
+            x, y = float(anchor["x"]), float(anchor["y"])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{label}: anchor coordinates must be finite numbers") from exc
+        if not math.isfinite(x) or not math.isfinite(y):
+            raise ValueError(f"{label}: anchor coordinates must be finite numbers")
+        if local in result and result[local] != (local, x, y):
+            raise ValueError(f"{label}: conflicting anchors at frame {anchor['frame']}")
+        result[local] = (local, x, y)
+    return sorted(result.values())
 
 
 def remap_anchors(anchors, frame_start):

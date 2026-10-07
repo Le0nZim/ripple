@@ -1367,7 +1367,9 @@ public class VideoAnnotationTool {
         }
         try {
             if (batchCoordinator.isEnabled()) {
-                saveWorkingClipSilent();
+                if (!saveWorkingClipSilent()) {
+                    throw new IOException("Could not save the current clip");
+                }
             }
             exportToJson(file, ExportContent.RICH);
             java.time.LocalTime now = java.time.LocalTime.now();
@@ -8998,6 +9000,9 @@ public class VideoAnnotationTool {
     
     // NEW METHOD: Batch optimize all selected tracks (multi-seed mode)
     private void runBatchTrackOptimization() {
+        if (!allowBatchAnnotation("optimize tracks")) {
+            return;
+        }
         if (currentVideoPath == null || imp == null) {
             JOptionPane.showMessageDialog(frame,
                 "No video loaded.",
@@ -9233,9 +9238,9 @@ public class VideoAnnotationTool {
                         return;
                     }
                     elapsedTimer.stop();
-                    setStatus("Batch optimization failed: " + ex.getMessage());
+                    setStatus("Batch optimization failed: " + BatchTracking.errorMessage(ex));
                     JOptionPane.showMessageDialog(frame,
-                        "Failed to optimize tracks:\n" + ex.getMessage(),
+                        "Failed to optimize tracks:\n" + BatchTracking.errorMessage(ex),
                         "Error",
                         JOptionPane.ERROR_MESSAGE);
                     ex.printStackTrace();
@@ -9561,7 +9566,10 @@ public class VideoAnnotationTool {
         UnixDomainSocketAddress addr = UnixDomainSocketAddress.of(Paths.get(socketPath));
         try (SocketChannel channel = SocketChannel.open(StandardProtocolFamily.UNIX)) {
             channel.connect(addr);
-            channel.write(ByteBuffer.wrap(payload));
+            ByteBuffer buffer = ByteBuffer.wrap(payload);
+            while (buffer.hasRemaining()) {
+                channel.write(buffer);
+            }
             channel.shutdownOutput();
             String resp = readJsonLineFromChannel(channel);
             return new JSONObject(resp);
@@ -9959,132 +9967,71 @@ public class VideoAnnotationTool {
             return Collections.emptyMap();
         }
 
+        VideoBatchPlan.ClipRange range = batchCoordinator.isWork() ? batchCoordinator.workingRange() : null;
+        JSONObject request = BatchTracking.request(
+            workingVideoPath, currentVideoBaseName(), range, trackIds, anchorsList, config);
+
+        // Use the same socket transport as single-track optimization. Batch responses
+        // already contain the tracks, so no annotation file needs to be overwritten.
+        if (canUseDirectTrackingIpc()) {
+            JSONObject response = sendTrackingServerRequest(request);
+            ensureOkResponse(response);
+            return BatchTracking.parseResults(response, trackIds, range);
+        }
+
         File scriptFile = getTrackingScript();
         if (!scriptFile.exists()) {
             throw new FileNotFoundException("Tracking script not found: " + scriptFile.getAbsolutePath());
         }
-
-        String outputDir = getOutputDirectory();
-
-        // Bundle anchors into a single JSON payload
-        File tempBundleFile = File.createTempFile("anchors_bundle_", ".json");
-        JSONObject bundleObj = new JSONObject();
-        JSONArray tracksArray = new JSONArray();
-
-        for (int i = 0; i < trackIds.size(); i++) {
-            String trackId = trackIds.get(i);
-            List<Anchor> anchors = anchorsList.get(i);
-            JSONObject trackObj = new JSONObject();
-            trackObj.put("track_id", trackId);
-
-            JSONArray anchorsArray = new JSONArray();
-            for (Anchor anchor : anchors) {
-                JSONObject anchorObj = new JSONObject();
-                anchorObj.put("frame", anchor.frame);
-                anchorObj.put("x", anchor.x);
-                anchorObj.put("y", anchor.y);
-                anchorsArray.put(anchorObj);
-            }
-            trackObj.put("anchors", anchorsArray);
-            tracksArray.put(trackObj);
-        }
-
-        bundleObj.put("tracks", tracksArray);
-
-        try (FileWriter writer = new FileWriter(tempBundleFile)) {
-            writer.write(bundleObj.toString());
-        }
-
+        File bundleFile = File.createTempFile("anchors_bundle_", ".json");
+        File outputFile = null;
         try {
-            // Get correction method settings
-            String correctionMethod = config.getProperty("correction.method", "full_blend");
-            String blobSearchRadius = config.getProperty("dis.blob.search.radius", "15");
-            String blobRadius = config.getProperty("dis.blob.radius", "5.0");
-            String corridorWidth = config.getProperty("corridor.width", "adaptive");
-            int linearInterpThreshold = Integer.parseInt(config.getProperty("correction.linear.interp.threshold", "0"));
-            
+            outputFile = File.createTempFile("ripple_batch_tracks_", ".json");
+            Files.writeString(bundleFile.toPath(),
+                new JSONObject().put("tracks", request.getJSONArray("tracks")).toString(), StandardCharsets.UTF_8);
             List<String> args = new ArrayList<>();
             args.add("optimize_tracks");
             args.add("--tiff");
             args.add(workingVideoPath);
             appendBatchFrameArgs(args);
             args.add("--output-dir");
-            args.add(outputDir);
+            args.add(outputFile.getAbsolutePath());
+            args.add("--video-name");
+            args.add(currentVideoBaseName());
             args.add("--anchors-bundle");
-            args.add(tempBundleFile.getAbsolutePath());
-            args.add("--correction-method");
-            args.add(correctionMethod);
-            args.add("--blob-search-radius");
-            args.add(blobSearchRadius);
-            args.add("--blob-radius");
-            args.add(blobRadius);
-            args.add("--corridor-width");
-            args.add(corridorWidth);
-            args.add("--linear-interp-threshold");
-            args.add(String.valueOf(linearInterpThreshold));
+            args.add(bundleFile.getAbsolutePath());
+            for (String key : List.of("correction_method", "blob_search_radius", "blob_radius",
+                                      "corridor_width", "linear_interp_threshold")) {
+                args.add("--" + key.replace('_', '-'));
+                args.add(String.valueOf(request.get(key)));
+            }
 
-            List<String> command = buildWSLCommand(scriptFile.getAbsolutePath(), args);
-            ProcessBuilder pb = new ProcessBuilder(command);
+            ProcessBuilder pb = new ProcessBuilder(buildWSLCommand(scriptFile.getAbsolutePath(), args));
             setServerEnvironmentVariables(pb);
             pb.redirectErrorStream(true);
-
             Process proc = pb.start();
-            BufferedReader reader = new BufferedReader(new InputStreamReader(proc.getInputStream()));
-            String line;
             StringBuilder output = new StringBuilder();
-            while ((line = reader.readLine()) != null) {
-                output.append(line).append("\n");
-                System.out.println("[BATCH_OPTIMIZE] " + line);
-            }
-
-            int exitCode = proc.waitFor();
-            if (exitCode != 0) {
-                throw new Exception("Batch track optimization failed: " + output);
-            }
-
-            String videoBaseName = new File(currentVideoPath).getName().replaceFirst("\\.[^.]+$", "");
-            File outputFile = new File(outputDir, videoBaseName + "_annotations.json");
-            if (!outputFile.exists()) {
-                throw new FileNotFoundException("Output file not found: " + outputFile.getAbsolutePath());
-            }
-
-            StringBuilder jsonContent = new StringBuilder();
-            try (BufferedReader br = new BufferedReader(new FileReader(outputFile))) {
-                while ((line = br.readLine()) != null) {
-                    jsonContent.append(line);
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    output.append(line).append("\n");
+                    System.out.println("[BATCH_OPTIMIZE] " + line);
+                }
+                if (proc.waitFor() != 0) {
+                    throw new IOException("Batch track optimization failed:\n" + output);
+                }
+            } finally {
+                if (proc.isAlive()) {
+                    proc.destroyForcibly();
                 }
             }
-
-            Map<String, Map<Integer, Point>> results = new HashMap<>();
-            JSONObject json = new JSONObject(jsonContent.toString());
-            JSONArray tracks = json.getJSONArray("tracks");
-
-            for (int i = 0; i < tracks.length(); i++) {
-                JSONObject trackObj = tracks.getJSONObject(i);
-                String trackId = trackObj.getString("track_id");
-                JSONArray framesArray = trackObj.getJSONArray("frames");
-
-                Map<Integer, Point> points = new HashMap<>();
-                for (int j = 0; j < framesArray.length(); j++) {
-                    JSONObject frameObj = framesArray.getJSONObject(j);
-                    int frame = frameObj.getInt("frame");
-                    int x = frameObj.getInt("x");
-                    int y = frameObj.getInt("y");
-                    points.put(frame, new Point(x, y));
-                }
-                results.put(trackId, points);
-            }
-
-            for (String trackId : trackIds) {
-                if (!results.containsKey(trackId)) {
-                    throw new Exception("Server response missing track: " + trackId);
-                }
-            }
-
-            return results;
+            return BatchTracking.parseResults(
+                new JSONObject(Files.readString(outputFile.toPath(), StandardCharsets.UTF_8)), trackIds, range);
         } finally {
-            if (tempBundleFile.exists()) {
-                tempBundleFile.delete();
+            Files.deleteIfExists(bundleFile.toPath());
+            if (outputFile != null) {
+                Files.deleteIfExists(outputFile.toPath());
             }
         }
     }
@@ -19558,7 +19505,10 @@ public class VideoAnnotationTool {
         if (imp == null) return;
 
         if (batchCoordinator.isEnabled()) {
-            saveWorkingClipSilent();
+            if (!saveWorkingClipSilent()) {
+                setStatus("Export stopped: could not save the current clip.");
+                return;
+            }
             String[] options = {"Current clip", "Merged entire video", "Cancel"};
             int choice = JOptionPane.showOptionDialog(
                 frame,
@@ -23933,7 +23883,10 @@ public class VideoAnnotationTool {
             if (VideoBatchPanel.confirmReSplit(frame) != JOptionPane.YES_OPTION) {
                 return;
             }
-            saveWorkingClipSilent();
+            if (!saveWorkingClipSilent()) {
+                setStatus("Split stopped: could not save the current clip.");
+                return;
+            }
         }
         long available = queryServerAvailableBytes();
         int width = imp.getWidth();
@@ -24228,8 +24181,7 @@ public class VideoAnnotationTool {
     }
 
     private boolean prepareSwitchToClip(int clipIndex) {
-        if (batchCoordinator.isWork() && batchCoordinator.workingClipIndex() >= 0
-            && batchCoordinator.workingClipIndex() != clipIndex) {
+        if (batchCoordinator.workingRange() != null) {
             if (!saveWorkingClipSilent()) {
                 JOptionPane.showMessageDialog(frame,
                     "Could not save the current clip before switching.",
@@ -24240,8 +24192,8 @@ public class VideoAnnotationTool {
         }
         VideoBatchStore.ClipSnapshot orig = null;
         try {
-            batchCoordinator.enterWork(clipIndex);
             loadClipIntoMemory(clipIndex);
+            batchCoordinator.enterWork(clipIndex);
             orig = snapshotFromMemory();
             syncAdjacentClipJson(clipIndex);
         } catch (Exception ex) {
@@ -24344,23 +24296,16 @@ public class VideoAnnotationTool {
     }
 
     private boolean saveWorkingClipSilent() {
-        if (!batchCoordinator.isWork() || batchCoordinator.workingRange() == null) {
+        if (batchCoordinator.workingRange() == null) {
             return true;
         }
         try {
             VideoBatchStore.ClipSnapshot snap = snapshotFromMemory();
-            VideoBatchStore.save(
-                batchCoordinator.annotationFile(batchCoordinator.workingClipIndex()),
-                snap,
-                currentVideoBaseName(),
-                batchCoordinator.workingRange(),
-                totalSlices);
             if (batchCoordinator.getManifest() != null) {
                 batchCoordinator.getManifest().trackCounter = Math.max(
                     batchCoordinator.getManifest().trackCounter, trackCounter);
-                batchCoordinator.getManifest().markSaved(batchCoordinator.workingClipIndex(), snap.hasAnnotations());
-                batchCoordinator.saveManifest();
             }
+            batchCoordinator.saveWorkingSnapshot(snap, currentVideoBaseName(), totalSlices);
             annotationsDirty = false;
             updateWindowTitle();
             return true;
@@ -24761,7 +24706,10 @@ public class VideoAnnotationTool {
     }
 
     private void exportMergedBatchAnnotations() {
-        saveWorkingClipSilent();
+        if (!saveWorkingClipSilent()) {
+            setStatus("Export stopped: could not save the current clip.");
+            return;
+        }
         Map<String, Map<Integer, Point>> backupTracks = copyTrackMap(trackAnnotations);
         Map<String, Color> backupColors = new LinkedHashMap<>(trackColors);
         Map<String, List<Anchor>> backupAnchors = copyAnchorMap(trackAnchors);
